@@ -1,0 +1,67 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+**/.pytest-tmp*/
+/.pytest_cache/
+.coverage
+.ruff_cache/
+.mypy_cache/
+
+# next.js
+/.next/
+/.vinext/
+/out/
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+next-env.d.ts
+*.tsbuildinfo
+/dist/
+/.wrangler/
+/outputs/
+/work/
+
+# local hosting/control-plane metadata
+/.openai/
+
+# local Python backend
+/.venv/
+__pycache__/
+*.py[cod]
+/server/data/
+/server/*.db
+/server/*.sqlite*
+*.db
+*.sqlite
+*.sqlite3
+
+# local runtime logs and process markers
+/runtime/
+dev-frontend*.log
