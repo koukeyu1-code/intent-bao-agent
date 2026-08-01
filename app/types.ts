@@ -1,10 +1,13 @@
+import type { PlatformTaxonomy } from "./platform-taxonomy";
+
 export type ViewKey =
   | "overview"
   | "meetings"
   | "speakers"
   | "insights"
-  | "technology"
   | "customer"
+  | "technology"
+  | "competition"
   | "history"
   | "dictionary"
   | "settings";
@@ -147,7 +150,25 @@ export interface IntentObservation {
   meetingId?: string;
   customer: string;
   technology: string;
+  technologyId?: string;
   platform: string;
+  level2ValueId?: string;
+  level3ValueId?: string;
+  platformLeafId?: string;
+  platformMappingStatus?: "mapped" | "legacy_pending" | "unmapped";
+  platformDraft?: {
+    id: string;
+    status: "pending";
+    technologyId: string;
+    technologyName?: string;
+    level2ValueId: string;
+    level2Value: string;
+    level2IsNew: boolean;
+    level3ValueId: string;
+    level3Value: string;
+    level3IsNew: boolean;
+    displayName: string;
+  } | null;
   customerProject: string;
   functionName: string;
   person: string;
@@ -169,7 +190,12 @@ export interface FormalIntentStatus {
   statusKey: string;
   customer: string;
   technology: string;
+  technologyId?: string;
   platform: string;
+  level2ValueId?: string;
+  level3ValueId?: string;
+  platformLeafId?: string;
+  platformMappingStatus?: "mapped" | "legacy_pending" | "unmapped";
   customerProject: string;
   functionName: string;
   attitude: AttitudeLevel;
@@ -185,6 +211,29 @@ export interface FormalIntentStatus {
   confirmedBy: string;
   version: number;
   isCurrent: boolean;
+}
+
+export interface CompetitiveIntentStatus {
+  id: string;
+  dataClass: "模拟数据";
+  competitor: string;
+  product: string;
+  customer: string;
+  mappedTechnology: string;
+  technologyId?: string;
+  platform: string;
+  level2ValueId?: string;
+  level3ValueId?: string;
+  platformLeafId?: string;
+  platformMappingStatus?: "mapped" | "legacy_pending" | "unmapped";
+  customerProject: string;
+  functionName: string;
+  attitude: AttitudeLevel;
+  adoptionStage: AdoptionStage;
+  blocker: string;
+  evidenceSummary: string;
+  evidenceCount: number;
+  updatedAt: string;
 }
 
 export interface HistoryEvent {
@@ -205,6 +254,7 @@ export interface DictionaryItem {
   name: string;
   code: string;
   aliases: string[];
+  parentIds?: string[];
   status: "启用" | "停用";
   updatedAt: string;
   note: string;
@@ -223,9 +273,11 @@ export interface MvpDataset {
   speakers: SpeakerSegment[];
   intents: IntentObservation[];
   formalIntents: FormalIntentStatus[];
+  competitiveIntents: CompetitiveIntentStatus[];
   evidence: Evidence[];
   history: HistoryEvent[];
   dictionaries: DictionaryCollection;
+  platformTaxonomy: PlatformTaxonomy;
 }
 
 export const attitudeMeta: Record<

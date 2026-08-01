@@ -82,6 +82,168 @@ class GenericPlatform(Base, AuditColumns):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class PlatformMenuDefinition(Base, AuditColumns):
+    """Administrator-managed names for the dynamic platform dimensions.
+
+    The first release supports exactly two dimensions beneath a technology,
+    but stores their labels as data (for example ``尺寸`` and ``分辨率``)
+    instead of hard-coding them into the UI.
+    """
+
+    __tablename__ = "platform_menu_definitions"
+    __table_args__ = (
+        UniqueConstraint(
+            "technology_id", "level", name="uq_platform_menu_definition"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    technology_id: Mapped[str] = mapped_column(
+        ForeignKey("technologies.id", ondelete="CASCADE"), index=True
+    )
+    level: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(String(100))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    taxonomy_revision: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class PlatformMenuValue(Base, AuditColumns):
+    """A value under an existing administrator-defined platform dimension."""
+
+    __tablename__ = "platform_menu_values"
+    __table_args__ = (
+        UniqueConstraint(
+            "definition_id", "normalized_value", name="uq_platform_menu_value"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    definition_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_menu_definitions.id", ondelete="CASCADE"),
+        index=True,
+    )
+    value: Mapped[str] = mapped_column(String(200))
+    normalized_value: Mapped[str] = mapped_column(String(200))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    source: Mapped[str] = mapped_column(String(32), default="excel")
+    created_by: Mapped[str] = mapped_column(String(100))
+    activated_by: Mapped[str | None] = mapped_column(String(100))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    taxonomy_revision: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class PlatformVariant(Base, AuditColumns):
+    """A materialized concrete leaf produced by level-2 x level-3 values.
+
+    ``GenericPlatform`` remains the stable foreign-key target used by the
+    existing intent tables.  This table adds the strict technology ownership
+    and menu path without rewriting historical foreign keys.
+    """
+
+    __tablename__ = "platform_variants"
+    __table_args__ = (
+        UniqueConstraint(
+            "technology_id",
+            "level2_value_id",
+            "level3_value_id",
+            name="uq_platform_variant_path",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    technology_id: Mapped[str] = mapped_column(
+        ForeignKey("technologies.id", ondelete="CASCADE"), index=True
+    )
+    level2_value_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_menu_values.id"), index=True
+    )
+    level3_value_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_menu_values.id"), index=True
+    )
+    generic_platform_id: Mapped[str] = mapped_column(
+        ForeignKey("generic_platforms.id"), unique=True, index=True
+    )
+    display_name: Mapped[str] = mapped_column(String(300))
+    path_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON)
+    taxonomy_revision: Mapped[int] = mapped_column(Integer, default=1)
+    mapping_status: Mapped[str] = mapped_column(String(32), default="mapped")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[str] = mapped_column(String(100))
+
+
+class TaxonomyImportBatch(Base):
+    """Audit record written only when an administrator publishes a preview."""
+
+    __tablename__ = "taxonomy_import_batches"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    file_name: Mapped[str] = mapped_column(String(500))
+    file_sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="committed")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    diff: Mapped[dict[str, Any]] = mapped_column(JSON)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    committed_by: Mapped[str] = mapped_column(String(100))
+    committed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+
+class ObservationPlatformDraft(Base, AuditColumns):
+    """A reviewed platform path waiting for the intent's formal confirmation."""
+
+    __tablename__ = "observation_platform_drafts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    observation_id: Mapped[str] = mapped_column(
+        ForeignKey("raw_intent_observations.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    technology_id: Mapped[str] = mapped_column(
+        ForeignKey("technologies.id"), index=True
+    )
+    level2_value_id: Mapped[str | None] = mapped_column(
+        ForeignKey("platform_menu_values.id")
+    )
+    level3_value_id: Mapped[str | None] = mapped_column(
+        ForeignKey("platform_menu_values.id")
+    )
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    proposed_by: Mapped[str] = mapped_column(String(100))
+
+
+class IntentPlatformPathSnapshot(Base):
+    """Immutable display path retained even if the live taxonomy is renamed."""
+
+    __tablename__ = "intent_platform_path_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "target_type",
+            "target_id",
+            "version_no",
+            name="uq_intent_platform_path_snapshot",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    target_type: Mapped[str] = mapped_column(String(64), index=True)
+    target_id: Mapped[str] = mapped_column(String(64), index=True)
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    technology_id: Mapped[str | None] = mapped_column(String(64))
+    generic_platform_id: Mapped[str | None] = mapped_column(String(64))
+    platform_variant_id: Mapped[str | None] = mapped_column(String(64))
+    taxonomy_revision: Mapped[int | None] = mapped_column(Integer)
+    mapping_status: Mapped[str] = mapped_column(String(32), default="legacy_pending")
+    path: Mapped[dict[str, Any]] = mapped_column(JSON)
+    captured_by: Mapped[str] = mapped_column(String(100))
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+
 class CustomerProject(Base, AuditColumns):
     __tablename__ = "customer_projects"
 

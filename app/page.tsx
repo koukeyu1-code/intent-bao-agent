@@ -1,5 +1,10 @@
 import IntentBaoApp from "./intent-bao-app";
+import LoginGate from "./login-gate";
 
 export default function Home() {
-  return <IntentBaoApp />;
+  return (
+    <LoginGate>
+      <IntentBaoApp />
+    </LoginGate>
+  );
 }

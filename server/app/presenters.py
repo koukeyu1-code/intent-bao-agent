@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from . import models as m
 from .domain import ATTITUDE_LABELS, adoption_status_key, formal_status_key
+from .taxonomy_service import intent_path
 
 
 def iso(value: date | datetime | None) -> str | None:
@@ -23,6 +24,39 @@ def entity_ref(item: Any | None) -> dict[str, Any] | None:
     if hasattr(item, "display_name"):
         result["display_name"] = item.display_name
     return result
+
+
+def public_platform_draft(
+    session: Session, observation_id: str
+) -> dict[str, Any] | None:
+    """Expose a pending reviewed path without publishing it as live taxonomy."""
+
+    draft = session.scalar(
+        select(m.ObservationPlatformDraft).where(
+            m.ObservationPlatformDraft.observation_id == observation_id,
+            m.ObservationPlatformDraft.status == "pending",
+        )
+    )
+    if draft is None:
+        return None
+    technology = session.get(m.Technology, draft.technology_id)
+    level2 = session.get(m.PlatformMenuValue, draft.level2_value_id)
+    level3 = session.get(m.PlatformMenuValue, draft.level3_value_id)
+    if level2 is None or level3 is None:
+        return None
+    return {
+        "id": draft.id,
+        "status": draft.status,
+        "technologyId": draft.technology_id,
+        "technologyName": technology.name if technology else None,
+        "level2ValueId": level2.id,
+        "level2Value": level2.value,
+        "level2IsNew": level2.status == "pending",
+        "level3ValueId": level3.id,
+        "level3Value": level3.value,
+        "level3IsNew": level3.status == "pending",
+        "displayName": f"{level2.value} {level3.value}",
+    }
 
 
 def _ai_original(observation: m.RawIntentObservation) -> dict[str, Any]:
@@ -506,6 +540,12 @@ def public_observation(
         else None
     )
     conflict_reasons = observation_conflicts(session, observation)
+    platform_path = intent_path(
+        session,
+        target_type="raw_intent_observation",
+        target_id=observation.id,
+    )
+    platform_draft = public_platform_draft(session, observation.id)
     return {
         "id": observation.id,
         "package_id": observation.package_id,
@@ -517,6 +557,8 @@ def public_observation(
         "generic_platform": entity_ref(
             maps["platforms"].get(observation.generic_platform_id)
         ),
+        "platform_path": platform_path,
+        "platform_draft": platform_draft,
         "customer_project": entity_ref(
             maps["projects"].get(observation.customer_project_id)
         ),
@@ -590,6 +632,11 @@ def public_formal_status(
             evidence = session.get(m.EvidenceFragment, observation.evidence_id)
             if evidence:
                 evidence_items.append(public_evidence(session, evidence))
+    platform_path = intent_path(
+        session,
+        target_type="formal_intent_status",
+        target_id=item.id,
+    )
     return {
         "id": item.id,
         "status_key": item.status_key,
@@ -600,6 +647,7 @@ def public_formal_status(
         "generic_platform": entity_ref(
             maps["platforms"].get(item.generic_platform_id)
         ),
+        "platform_path": platform_path,
         "customer_project": entity_ref(
             maps["projects"].get(item.customer_project_id)
         ),
@@ -956,6 +1004,15 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
         )
         function = maps["functions"].get(observation.function_id)
         platform = maps["platforms"].get(observation.generic_platform_id)
+        platform_path = intent_path(
+            session,
+            target_type="raw_intent_observation",
+            target_id=observation.id,
+        )
+        live_path = (platform_path or {}).get("path") or {}
+        level2_path = live_path.get("level2") or {}
+        level3_path = live_path.get("level3") or {}
+        platform_draft = public_platform_draft(session, observation.id)
         customer_project = maps["projects"].get(observation.customer_project_id)
         intent_status_map = {
             "已被后续版本取代": "已确认",
@@ -964,7 +1021,33 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
             "id": observation.id,
             "customer": maps["customers"][observation.customer_id].display_name,
             "technology": maps["technologies"][observation.technology_id].name,
-            "platform": platform.name if platform else "平台待确认",
+            "technologyId": observation.technology_id,
+            "platform": (
+                f"{platform_draft['displayName']}（待确认）"
+                if platform_draft
+                else platform.name if platform else "平台待确认"
+            ),
+            "platformDraft": platform_draft,
+            "platformMappingStatus": (
+                platform_path.get("mappingStatus")
+                if platform_path
+                else "unmapped"
+            ),
+            **(
+                {"platformLeafId": platform_path["platformVariantId"]}
+                if platform_path and platform_path.get("platformVariantId")
+                else {}
+            ),
+            **(
+                {"level2ValueId": level2_path["valueId"]}
+                if level2_path.get("valueId")
+                else {}
+            ),
+            **(
+                {"level3ValueId": level3_path["valueId"]}
+                if level3_path.get("valueId")
+                else {}
+            ),
             "customerProject": customer_project.name
             if customer_project
             else "客户项目待确认",
@@ -1116,6 +1199,32 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
             }
         )
 
+    platform_parent_ids: dict[str, set[str]] = {}
+    function_parent_ids: dict[str, set[str]] = {}
+    relation_items = [
+        *session.scalars(select(m.RawIntentObservation)).all(),
+        *session.scalars(
+            select(m.FormalIntentStatus).where(
+                m.FormalIntentStatus.is_current.is_(True)
+            )
+        ).all(),
+    ]
+    for relation in relation_items:
+        if relation.generic_platform_id and relation.technology_id:
+            platform_parent_ids.setdefault(
+                relation.generic_platform_id, set()
+            ).add(relation.technology_id)
+        if relation.function_id and relation.customer_id:
+            function_parent_ids.setdefault(relation.function_id, set()).add(
+                relation.customer_id
+            )
+    for variant in session.scalars(
+        select(m.PlatformVariant).where(m.PlatformVariant.active.is_(True))
+    ).all():
+        platform_parent_ids.setdefault(
+            variant.generic_platform_id, set()
+        ).add(variant.technology_id)
+
     alias_items = session.scalars(
         select(m.Alias).where(m.Alias.active.is_(True))
     ).all()
@@ -1126,7 +1235,10 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
         ).append(alias.alias)
 
     def dictionary_item(
-        item: Any, entity_type: str, note: str
+        item: Any,
+        entity_type: str,
+        note: str,
+        parent_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "id": item.id,
@@ -1135,6 +1247,7 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
             else item.name,
             "code": item.code,
             "aliases": aliases_by_entity.get((entity_type, item.id), []),
+            "parentIds": parent_ids or [],
             "status": "启用" if item.active else "停用",
             "updatedAt": iso(item.updated_at),
             "note": note,
@@ -1152,15 +1265,30 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
             for item in maps["customers"].values()
         ],
         "platforms": [
-            dictionary_item(item, "platform", "通用产品平台")
+            dictionary_item(
+                item,
+                "platform",
+                "产品平台",
+                sorted(platform_parent_ids.get(item.id, set())),
+            )
             for item in maps["platforms"].values()
         ],
         "projects": [
-            dictionary_item(item, "customer_project", "客户内部项目")
+            dictionary_item(
+                item,
+                "customer_project",
+                "客户内部项目",
+                [item.customer_id],
+            )
             for item in maps["projects"].values()
         ],
         "functions": [
-            dictionary_item(item, "function", "客户职能")
+            dictionary_item(
+                item,
+                "function",
+                "客户职能",
+                sorted(function_parent_ids.get(item.id, set())),
+            )
             for item in maps["functions"].values()
         ],
     }

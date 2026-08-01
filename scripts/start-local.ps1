@@ -151,6 +151,74 @@ function Write-ServiceMarker {
     } | ConvertTo-Json | Set-Content -LiteralPath $MetaFile -Encoding UTF8
 }
 
+function Show-InitialLoginCredentials {
+    param(
+        [Parameter(Mandatory = $true)][string]$CredentialsDirectory,
+        [switch]$OpenFolder
+    )
+    if (-not (Test-Path -LiteralPath $CredentialsDirectory)) { return }
+    $credentialFiles = @(
+        Get-ChildItem -LiteralPath $CredentialsDirectory -Filter "*.txt" -File -ErrorAction SilentlyContinue
+    )
+    if ($credentialFiles.Count -eq 0) { return }
+
+    # Best-effort NTFS hardening: remove inherited access and grant only the
+    # desktop owner plus the effective process identity. Sandboxed launchers
+    # can use a different process SID while retaining USERDOMAIN/USERNAME.
+    # Python also creates each file with mode 0600.
+    try {
+        $effectiveIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $ownerIdentity = $effectiveIdentity
+        $allowedIdentities = @($effectiveIdentity)
+        if (-not [string]::IsNullOrWhiteSpace($env:USERNAME)) {
+            $configuredAccount = if ([string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
+                $env:USERNAME
+            } else {
+                "$($env:USERDOMAIN)\$($env:USERNAME)"
+            }
+            try {
+                $configuredIdentity = ([System.Security.Principal.NTAccount]$configuredAccount).Translate(
+                    [System.Security.Principal.SecurityIdentifier]
+                )
+                $ownerIdentity = $configuredIdentity
+                if ($allowedIdentities.Value -notcontains $configuredIdentity.Value) {
+                    $allowedIdentities += $configuredIdentity
+                }
+            }
+            catch {
+                Write-Warning "无法解析桌面用户身份，将仅保留当前进程访问初始凭据。"
+            }
+        }
+        foreach ($file in $credentialFiles) {
+            $acl = [System.Security.AccessControl.FileSecurity]::new()
+            $acl.SetOwner($ownerIdentity)
+            $acl.SetAccessRuleProtection($true, $false)
+            foreach ($identity in $allowedIdentities) {
+                $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                    $identity,
+                    [System.Security.AccessControl.FileSystemRights]::FullControl,
+                    [System.Security.AccessControl.AccessControlType]::Allow
+                )
+                $acl.AddAccessRule($rule)
+            }
+            Set-Acl -LiteralPath $file.FullName -AclObject $acl
+        }
+    }
+    catch {
+        Write-Warning "无法自动收紧初始凭据文件权限，请确保该目录仅当前用户可访问。"
+    }
+
+    Write-Host ""
+    Write-Host "首次登录凭据已在本机生成：" -ForegroundColor Yellow
+    foreach ($file in $credentialFiles) {
+        Write-Host "  $($file.FullName)"
+    }
+    Write-Host "请保存到个人密码管理器后删除以上文件。启动脚本不会在屏幕上打印密码。" -ForegroundColor Yellow
+    if ($OpenFolder) {
+        Start-Process -FilePath "explorer.exe" -ArgumentList $CredentialsDirectory
+    }
+}
+
 if (-not (Test-Path -LiteralPath $venvPython) -or -not (Test-Path -LiteralPath $frontendCli)) {
     & (Join-Path $PSScriptRoot "setup-local.ps1")
 }
@@ -166,6 +234,7 @@ $backendPidFile = Join-Path $RuntimeDir "backend.pid"
 $frontendPidFile = Join-Path $RuntimeDir "frontend.pid"
 $backendMetaFile = Join-Path $RuntimeDir "backend.meta.json"
 $frontendMetaFile = Join-Path $RuntimeDir "frontend.meta.json"
+$initialCredentialsDir = Join-Path $DataDir "config\initial-login-credentials"
 $backendUrl = "http://127.0.0.1:$BackendPort/api/health"
 $frontendUrl = "http://127.0.0.1:$FrontendPort"
 
@@ -181,6 +250,7 @@ if ($backendHealthy -and $frontendHealthy) {
     else {
         Write-Host "检测到可用的本地服务（非当前运行目录托管），未改动已有进程。" -ForegroundColor Yellow
     }
+    Show-InitialLoginCredentials -CredentialsDirectory $initialCredentialsDir -OpenFolder:(-not $NoBrowser)
     if (-not $NoBrowser) { Start-Process "http://localhost:$FrontendPort" }
     exit 0
 }
@@ -213,6 +283,8 @@ app = create_app(data_dir='$escapedDataDir')
         Write-Host "正在启动前端服务（端口 $FrontendPort）..." -ForegroundColor Cyan
         $previousApiBase = $env:NEXT_PUBLIC_INTENT_BAO_API_BASE
         try {
+            # Use one explicit loopback API origin. Authentication and
+            # business requests both carry the browser-session Bearer token.
             $env:NEXT_PUBLIC_INTENT_BAO_API_BASE = "http://127.0.0.1:$BackendPort/api"
             $frontendProcess = Start-HiddenProcess `
                 -FilePath $node `
@@ -264,5 +336,6 @@ Write-Host ""
 Write-Host "意向宝已启动：" -ForegroundColor Green
 Write-Host "  应用：http://localhost:$FrontendPort"
 Write-Host "  后端：http://127.0.0.1:$BackendPort/docs"
+Show-InitialLoginCredentials -CredentialsDirectory $initialCredentialsDir -OpenFolder:(-not $NoBrowser)
 Write-Host ""
 Write-Host "默认使用模拟分析；如需调用本地Ollama，请在页面“模型设置”中测试并保存。"

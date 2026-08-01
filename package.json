@@ -9,7 +9,7 @@
     "dev": "node ./node_modules/vinext/dist/cli.js dev --host 127.0.0.1",
     "build": "node ./node_modules/vinext/dist/cli.js build",
     "start": "node ./node_modules/vinext/dist/cli.js start --host 127.0.0.1",
-    "test": "node ./node_modules/vinext/dist/cli.js build && node --test tests/rendered-html.test.mjs",
+    "test": "node ./node_modules/vinext/dist/cli.js build && node --test tests/rendered-html.test.mjs tests/auth-api.test.mjs tests/api-client-auth.test.mjs tests/platform-taxonomy.test.mjs tests/view-permissions.test.mjs tests/workflow-guards.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },

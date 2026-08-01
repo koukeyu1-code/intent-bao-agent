@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .filesystem_security import harden_data_directory
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -28,6 +30,7 @@ class Settings:
         resolved_data_dir.mkdir(parents=True, exist_ok=True)
         for child in ("database", "projects", "logs", "temp"):
             (resolved_data_dir / child).mkdir(parents=True, exist_ok=True)
+        harden_data_directory(resolved_data_dir)
 
         resolved_database_url = database_url or os.getenv(
             "INTENT_BAO_DATABASE_URL",

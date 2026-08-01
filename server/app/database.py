@@ -38,7 +38,10 @@ class Database:
         cursor.close()
 
     def create_all(self) -> None:
-        from . import models  # noqa: F401
+        # Import every module that declares a table before creating metadata.
+        # Authentication lives separately from the business-domain models to
+        # keep its password/session handling isolated.
+        from . import auth, models  # noqa: F401
 
         Base.metadata.create_all(self.engine)
         self._upgrade_legacy_schema()

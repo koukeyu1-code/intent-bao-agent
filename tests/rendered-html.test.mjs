@@ -34,7 +34,7 @@ async function render() {
   );
 }
 
-test("server-renders the intent-bao application shell", async () => {
+test("server-renders the authenticated application gate", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
@@ -42,12 +42,14 @@ test("server-renders the intent-bao application shell", async () => {
   const html = await response.text();
   assert.match(html, /<title>意向宝｜让客户声音照进产品规划<\/title>/i);
   assert.match(html, /让客户声音照进产品规划/);
-  assert.match(html, /数据加载中/);
-  assert.match(html, /连接结果明确前不展示内置演示业务数据/);
-  assert.match(html, /技术视角/);
-  assert.match(html, /客户视角/);
-  assert.match(html, /AI洞察确认/);
-  assert.match(html, /模型设置/);
+  assert.match(html, /正在检查登录状态/);
+  assert.match(html, /role="status"/);
+  assert.doesNotMatch(
+    html,
+    /连接结果明确前不展示内置演示业务数据/,
+    "protected application content must not be server-rendered before authentication",
+  );
+  assert.doesNotMatch(html, /关键意向结构化准确率 85%/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
   assert.doesNotMatch(html, /Your site is taking shape|Building your site/i);
 });
@@ -67,6 +69,186 @@ test("removes starter assets and keeps product metadata", async () => {
   await assert.rejects(access(new URL("../app/_sites-preview", projectRoot)));
 });
 
+test("keeps the login card free of the redundant English brand line", async () => {
+  const loginGateSource = await readFile(
+    new URL("../app/login-gate.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(loginGateSource, /INTENT BAO|INTENT 包/);
+  assert.match(loginGateSource, /登录意向宝/);
+});
+
+test("serializes model-setting operations and locks the form while one request is active", async () => {
+  const source = await readFile(
+    new URL("../app/model-settings-page.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(source, /activeOperationRef = useRef<ModelOperation \| undefined>/);
+  assert.equal(
+    source.match(/if \(!beginOperation\("(?:models|test|save|clear-key)"\)\) return;/g)
+      ?.length,
+    4,
+    "model list, connection test, save, and key clearing must share one synchronous operation lock",
+  );
+  assert.equal(
+    source.match(/finishOperation\("(?:models|test|save|clear-key)"\)/g)?.length,
+    4,
+    "every model operation must release the shared lock in its finally block",
+  );
+  assert.match(source, /<Form[\s\S]{0,180}disabled=\{loading \|\| operationBusy\}/);
+  assert.match(source, /loading=\{activeOperation === "clear-key"\}/);
+  assert.match(
+    source,
+    /disabled=\{[\s\S]{0,100}operationBusy[\s\S]{0,100}!settings\.apiKeyConfigured/,
+    "clearing the key must be unavailable while another operation is active",
+  );
+});
+
+test("groups navigation and keeps competitive intelligence separate from formal states", async () => {
+  const [appSource, apiSource, mockSource, typesSource, stylesSource] = await Promise.all([
+    readFile(new URL("../app/intent-bao-app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/api-client.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/mock-data.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/types.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(typesSource, /\| "competition"/);
+  assert.match(appSource, /label: "业务流程"[\s\S]*label: "视角模块"[\s\S]*label: "基础配置"/);
+  assert.match(appSource, /navigationSections\s*\.map\(\(section\) =>/);
+  assert.match(
+    appSource,
+    /items: section\.items\.filter\(\(item\) =>[\s\S]{0,100}canAccessView\(user\.role, item\.key\)/,
+    "desktop and mobile navigation must derive visibility from the authenticated role",
+  );
+  assert.match(appSource, /items=\{navItems\}/);
+  assert.match(appSource, /visibleNavigationSections\.map\(\(section\) =>/);
+  assert.match(
+    appSource,
+    /const currentView = resolveAuthorizedView\(user\.role, activeView\)/,
+    "rendering must sanitize stale administrator-only selections",
+  );
+  assert.match(appSource, /switch \(currentView\)/);
+  assert.doesNotMatch(
+    appSource,
+    /switch \(activeView\)/,
+    "protected content must never render directly from unchecked navigation state",
+  );
+  assert.doesNotMatch(appSource, /className="mobile-nav__group-label"/);
+  assert.match(stylesSource, /\.app-menu \.ant-menu-item-group-title \{\s*display: none;/);
+  assert.match(appSource, /aria-current=\{currentView === item\.key \? "page" : undefined\}/);
+  assert.match(appSource, /case "competition":/);
+  assert.match(appSource, /competitiveIntents=\{dataset\.competitiveIntents\}/);
+
+  assert.match(typesSource, /mappedTechnology:\s*string/);
+  assert.match(mockSource, /dataClass: "模拟数据"/);
+  assert.match(mockSource, /mockCompetitiveIntents/);
+  assert.match(apiSource, /data\.competitiveIntents \?\? mockCompetitiveIntents/);
+  assert.match(
+    appSource,
+    /const key = `\$\{customer\}\|\$\{platform\}\|\$\{customerProject\}`/,
+    "competitive rows must align on customer, platform, and project",
+  );
+  assert.match(
+    appSource,
+    /const mappedTechnologyCompetitors = useMemo[\s\S]{0,900}requireConcretePlatform: true/,
+    "competition statistics must first exclude records without a concrete leaf mapping",
+  );
+  assert.match(
+    appSource,
+    /const competitorScoped = useMemo[\s\S]{0,500}cascadeModel\.selection[\s\S]{0,160}requireConcretePlatform: true/,
+    "competition results must use the same three-level cascade selection as the technology view",
+  );
+  assert.match(
+    appSource,
+    /technologyCompetitorCount - mappedTechnologyCompetitors\.length/,
+    "the unmapped count must be calculated at technology scope rather than from the active leaf filter",
+  );
+  assert.ok(
+    (appSource.match(/`\$\{item\.customer\}\|\$\{item\.platformLeafId\}`/g) ?? [])
+      .length >= 2,
+    "own and competitor records must associate by stable platform leaf id",
+  );
+  assert.match(appSource, /竞品区为脱敏模拟情报/);
+  assert.match(appSource, /item\?\.attitude \?\? null/);
+  assert.doesNotMatch(
+    appSource,
+    /竞品[^\n]{0,40}(平均分|总评分)/,
+    "competitive view must compare function signals instead of scoring a customer",
+  );
+});
+
+test("keeps the overview promise and navigation actions aligned", async () => {
+  const [appSource, stylesSource] = await Promise.all([
+    readFile(new URL("../app/intent-bao-app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(appSource, /把客户会议自动整理成/);
+  assert.match(appSource, /“客户 × 技术 × 产品 × 职能”/);
+  assert.match(appSource, /助力业务突破与产品规划/);
+  assert.match(appSource, /待确认意向\{pendingCount\}条/);
+  assert.match(
+    appSource,
+    /onClick=\{\(\) => onNavigate\("customer"\)\}[\s\S]*查看意向地图/,
+  );
+  assert.match(stylesSource, /\.hero-kicker \{[\s\S]*font-size: 15px;/);
+});
+
+test("orders dictionary categories and exposes parent relationship selectors", async () => {
+  const [appSource, mockSource, typesSource] = await Promise.all([
+    readFile(new URL("../app/intent-bao-app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/mock-data.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/types.ts", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(
+    appSource,
+    /统一技术、产品平台、客户、项目、职能内容与别名，减少语义抽取结果歧义。/,
+  );
+  assert.match(
+    appSource,
+    /const DICTIONARY_TABS:[\s\S]*"technologies",[\s\S]*"platforms",[\s\S]*"customers",[\s\S]*"projects",[\s\S]*"functions"/,
+  );
+  assert.match(appSource, /platforms: \{ source: "technologies", label: "所属技术"/);
+  assert.match(appSource, /projects: \{ source: "customers", label: "所属客户"/);
+  assert.match(appSource, /functions: \{ source: "customers", label: "所属客户"/);
+  assert.match(appSource, /className="dictionary-parent-filter"/);
+  assert.match(appSource, /name="parentIds"/);
+  assert.match(typesSource, /parentIds\?: string\[\]/);
+  assert.match(mockSource, /parentIds: string\[\] = \[\]/);
+  assert.doesNotMatch(appSource, /关键意向结构化准确率 85%/);
+});
+
+test("keeps speaker labels and intent actions inside their responsive containers", async () => {
+  const [appSource, stylesSource] = await Promise.all([
+    readFile(new URL("../app/intent-bao-app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(appSource, /className="speaker-list-item__meta"/);
+  assert.match(appSource, /aria-pressed=\{activeSpeaker\?\.id === speaker\.id\}/);
+  assert.match(
+    stylesSource,
+    /\.speaker-list-item__meta strong,[\s\S]{0,180}white-space: nowrap;/,
+  );
+
+  assert.match(appSource, /className="intent-row-actions"/);
+  assert.match(appSource, /tableLayout="fixed"/);
+  assert.match(appSource, /columnWidth: 48/);
+  assert.match(appSource, /scroll=\{\{ x: 1220 \}\}/);
+  assert.match(
+    stylesSource,
+    /\.intent-row-actions \{[\s\S]{0,180}grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/,
+  );
+  assert.match(
+    stylesSource,
+    /\.intent-row-actions \.ant-btn \{[\s\S]{0,180}padding-inline: 5px;/,
+  );
+});
+
 test("keeps P0 planning views on formal statuses and persists workflow actions", async () => {
   const [appSource, apiSource, typesSource] = await Promise.all([
     readFile(new URL("../app/intent-bao-app.tsx", import.meta.url), "utf8"),
@@ -75,6 +257,10 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
   ]);
 
   assert.match(typesSource, /formalIntents:\s*FormalIntentStatus\[\]/);
+  assert.match(
+    typesSource,
+    /competitiveIntents:\s*CompetitiveIntentStatus\[\]/,
+  );
   assert.match(
     apiSource,
     /\/formal-intent-statuses\?current_only=true/,
@@ -85,8 +271,8 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
     appSource.match(/intents=\{dataset\.formalIntents\}/g) ?? [];
   assert.equal(
     formalViewBindings.length,
-    3,
-    "technology, customer, and history views must use formal statuses",
+    4,
+    "technology, competition, customer, and history views must use formal statuses",
   );
   assert.doesNotMatch(
     appSource,
@@ -98,21 +284,35 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
   );
   assert.doesNotMatch(
     appSource,
+    /<CompetitionPage[\s\S]{0,220}intents=\{dataset\.intents\}/,
+  );
+  assert.doesNotMatch(
+    appSource,
     /平均职能态度/,
     "planning views must not turn function-level evidence into a customer score",
   );
   assert.match(appSource, /不做客户平均分，也不形成客户总分/);
+  assert.match(
+    appSource,
+    /未映射具体平台的竞品记录未计入/,
+    "formal competitor comparisons must exclude records without a concrete platform mapping",
+  );
 
   const createIndex = appSource.indexOf("createMeetingPackage(values)");
   const uploadIndex = appSource.indexOf(
-    "uploadMeetingMaterial(created.id, selected as File)",
+    "uploadMeetingMaterial(createdId, selected as File)",
   );
   const analyzeIndex = appSource.indexOf(
-    "analyzeMeetingPackage(created.id)",
+    "analyzeMeetingPackage(createdId)",
   );
   assert.ok(
     createIndex >= 0 && uploadIndex > createIndex && analyzeIndex > uploadIndex,
     "meeting workflow must create, upload with the returned id, then analyze",
+  );
+  assert.match(
+    appSource,
+    /createdPackageId[\s\S]{0,1200}pendingUploadIds/,
+    "meeting retry must reuse the created package and skip uploaded files",
   );
   assert.doesNotMatch(appSource, /MTG-DEMO/);
   assert.match(
@@ -159,7 +359,10 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
   );
   assert.match(appSource, /materialTypeForFile\(file\.name\).*sizeLabel/s);
 
-  assert.match(appSource, /updateIntentSuggestion\(editing\)/);
+  assert.match(
+    appSource,
+    /updateIntentReviewDraft\(editing, preparedPlatformDraft\)/,
+  );
   assert.match(
     appSource,
     /const refreshed = await reloadDataset\(\)[\s\S]{0,220}persisted\.adoptionStage !== expectedStage/,
@@ -179,6 +382,43 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
     "history must resolve stable formal status keys",
   );
   assert.match(appSource, /item\.statusKey === intentId/);
+});
+
+test("wires human review and client guards before workflow persistence", async () => {
+  const appSource = await readFile(
+    new URL("../app/intent-bao-app.tsx", import.meta.url),
+    "utf8",
+  );
+
+  const identityValidationIndex = appSource.indexOf(
+    "const identity = prepareSpeakerIdentity",
+  );
+  const identityWriteIndex = appSource.indexOf(
+    "await confirmSpeakerIdentity(speaker.id, speaker.version, identity)",
+  );
+  assert.ok(
+    identityValidationIndex >= 0 && identityWriteIndex > identityValidationIndex,
+    "speaker fields must be validated and normalized before confirmation",
+  );
+  assert.match(appSource, /reviewedSpeakerIds\.has\(activeSpeaker\.id\)/);
+
+  const platformValidationIndex = appSource.indexOf(
+    "const preparedPlatformDraft = platformDraftDirty",
+  );
+  const suggestionWriteIndex = appSource.indexOf(
+    "await updateIntentReviewDraft(editing, preparedPlatformDraft)",
+  );
+  const reviewValidationIndex = appSource.indexOf(
+    "assertIntentReadyForSave(editing)",
+  );
+  assert.ok(
+    reviewValidationIndex >= 0 &&
+      platformValidationIndex > reviewValidationIndex &&
+      suggestionWriteIndex > platformValidationIndex,
+    "review fields and the full platform path must be validated before the atomic edit request",
+  );
+  assert.match(appSource, /resolveRequestedItems\(scopedIntents, ids\)/);
+  assert.match(appSource, /summarizeSettledWrites\(persistenceResults\)/);
 });
 
 const formalStatus = (overrides = {}) => ({
@@ -322,9 +562,10 @@ test("keeps unknown actions from overwriting adoption stage and validates confir
 });
 
 test("keeps package scope, stable evidence keys, safe empty states, and loading shell in source contract", async () => {
-  const [appSource, apiSource] = await Promise.all([
+  const [appSource, apiSource, loginGateSource] = await Promise.all([
     readFile(new URL("../app/intent-bao-app.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api-client.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/login-gate.tsx", import.meta.url), "utf8"),
   ]);
 
   assert.match(
@@ -361,6 +602,35 @@ test("keeps package scope, stable evidence keys, safe empty states, and loading 
   assert.doesNotMatch(
     appSource,
     /useState<MvpDataset>\(mockDataset\)/,
+  );
+  assert.doesNotMatch(
+    appSource,
+    /setDataset\(mockDataset\)/,
+    "expired sessions and API failures must not silently expose fallback data",
+  );
+  assert.match(
+    apiSource,
+    /export const updateIntentReviewDraft[\s\S]{0,700}version: intent\.version \?\? 1,[\s\S]{0,900}platform:/,
+    "the atomic review request must carry the observation optimistic-lock version with its platform draft",
+  );
+  assert.doesNotMatch(
+    appSource,
+    /saveObservationPlatformDraft\(/,
+    "the UI must not split one review into a second platform write",
+  );
+  assert.match(
+    appSource,
+    /新增内容将在本条意向正式确认后生效/,
+    "pending menu content must state its publication boundary",
+  );
+  assert.match(
+    apiSource,
+    /dispatchEvent\(new Event\("intent-bao:auth-expired"\)\)/,
+  );
+  assert.match(
+    loginGateSource,
+    /addEventListener\("intent-bao:auth-expired"/,
+    "any protected API 401 must return the UI to the login gate",
   );
   assert.match(
     apiSource,

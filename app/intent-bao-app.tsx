@@ -16,6 +16,7 @@ import {
   FilterOutlined,
   HistoryOutlined,
   InboxOutlined,
+  LogoutOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   PlayCircleOutlined,
@@ -68,14 +69,18 @@ import React, {
 } from "react";
 import {
   API_BASE,
+  ApiClientError,
   analyzeMeetingPackage,
   confirmSpeakerIdentity,
+  commitTaxonomyImport,
   createMeetingPackage,
   loadBootstrapDataset,
   materialTypeForFile,
-  updateIntentSuggestion,
+  preflightTaxonomyExcel,
+  updateIntentReviewDraft,
   updateIntentStatus,
   uploadMeetingMaterial,
+  type TaxonomyImportPreview,
 } from "./api-client";
 import {
   ADOPTION_STAGE_ORDER,
@@ -84,11 +89,33 @@ import {
   latestFormalStatus,
 } from "./intent-view-models";
 import ModelSettingsPage from "./model-settings-page";
-import { mockDataset } from "./mock-data";
+import { useAuth } from "./login-gate";
+import {
+  PlatformCascadeSelect,
+  type PlatformContentRequest,
+} from "./platform-cascade-select";
+import {
+  getPlatformCascadeModel,
+  matchesPlatformSelection,
+  type PlatformCascadeSelection,
+  type PlatformPathRecord,
+  type PlatformTaxonomy,
+} from "./platform-taxonomy";
+import { canAccessView, resolveAuthorizedView } from "./view-permissions";
+import {
+  assertIntentReadyForSave,
+  pendingUploadIds,
+  preparePlatformDraftForSave,
+  prepareSpeakerIdentity,
+  resolveRequestedItems,
+  summarizeSettledWrites,
+  type UploadState,
+} from "./workflow-guards";
 import {
   adoptionStageColor,
   attitudeMeta,
   type AttitudeLevel,
+  type CompetitiveIntentStatus,
   type DataSourceMode,
   type DictionaryCollection,
   type DictionaryItem,
@@ -110,6 +137,68 @@ const ATTITUDE_LEVELS: AttitudeLevel[] = [5, 4, 3, 2, 1, null];
 type ReloadDataset = () => Promise<MvpDataset>;
 type NavigateTo = (key: ViewKey, packageId?: string) => void;
 type OpenEvidence = (id: string, statusKey?: string) => void;
+type NavigationItem = {
+  key: ViewKey;
+  icon: React.ReactNode;
+  label: string;
+};
+type NavigationSection = {
+  key: string;
+  label: string;
+  items: NavigationItem[];
+};
+type CompetitorProductGroup = {
+  key: string;
+  competitor: string;
+  product: string;
+  customerProject: string;
+  items: CompetitiveIntentStatus[];
+};
+type CompetitionComparisonRow = {
+  key: string;
+  customer: string;
+  platform: string;
+  customerProject: string;
+  ownItems: FormalIntentStatus[];
+  competitorProducts: CompetitorProductGroup[];
+  competitorLeadFunctions: string[];
+  ownLeadFunctions: string[];
+};
+type DictionaryKey = keyof DictionaryCollection;
+type DictionaryFormValues = {
+  name: string;
+  code: string;
+  aliases?: string;
+  note?: string;
+  parentIds?: string | string[];
+};
+type DictionaryParentConfig = {
+  source: "technologies" | "customers";
+  label: "所属技术" | "所属客户";
+  multiple: boolean;
+};
+
+const DICTIONARY_LABELS: Record<DictionaryKey, string> = {
+  technologies: "技术",
+  platforms: "产品平台",
+  customers: "客户",
+  projects: "项目",
+  functions: "职能",
+};
+const DICTIONARY_TABS: DictionaryKey[] = [
+  "technologies",
+  "platforms",
+  "customers",
+  "projects",
+  "functions",
+];
+const DICTIONARY_PARENT_CONFIG: Partial<
+  Record<DictionaryKey, DictionaryParentConfig>
+> = {
+  platforms: { source: "technologies", label: "所属技术", multiple: true },
+  projects: { source: "customers", label: "所属客户", multiple: false },
+  functions: { source: "customers", label: "所属客户", multiple: false },
+};
 
 const compactDateTime = (value?: string) => {
   if (!value) return "暂无正式状态";
@@ -117,23 +206,74 @@ const compactDateTime = (value?: string) => {
   return normalized.length >= 16 ? normalized.slice(5, 16) : normalized;
 };
 
+const todayForDateInput = () => {
+  const now = new Date();
+  const localTime = new Date(now.getTime() - now.getTimezoneOffset() * 60_000);
+  return localTime.toISOString().slice(0, 10);
+};
+
+const normalizeComparisonScope = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/产品平台|显示项目|英寸|项目/g, "")
+    .replace(/[^a-z0-9\u4e00-\u9fff]/g, "");
+
+const platformPathFor = (
+  item: {
+    technologyId?: string;
+    technology?: string;
+    mappedTechnology?: string;
+    level2ValueId?: string;
+    level3ValueId?: string;
+    platformLeafId?: string;
+  },
+  taxonomy: PlatformTaxonomy,
+): PlatformPathRecord => ({
+  technologyId:
+    item.technologyId ??
+    taxonomy.technologies.find(
+      (technology) =>
+        technology.name === (item.technology ?? item.mappedTechnology),
+    )?.id,
+  level2ValueId: item.level2ValueId,
+  level3ValueId: item.level3ValueId,
+  platformLeafId: item.platformLeafId,
+});
+
 const formatFileSize = (sizeBytes: number) =>
   sizeBytes >= 1024 * 1024
     ? `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`
     : `${Math.max(1, Math.round(sizeBytes / 1024))} KB`;
 
-const navItems: MenuProps["items"] = [
-  { key: "overview", icon: <RadarChartOutlined />, label: "总览" },
-  { key: "meetings", icon: <InboxOutlined />, label: "会议资料包" },
-  { key: "speakers", icon: <UserSwitchOutlined />, label: "说话人校验" },
-  { key: "insights", icon: <AuditOutlined />, label: "AI洞察确认" },
-  { type: "divider" },
-  { key: "technology", icon: <AppstoreOutlined />, label: "技术视角" },
-  { key: "customer", icon: <ApartmentOutlined />, label: "客户视角" },
-  { key: "history", icon: <HistoryOutlined />, label: "历史证据" },
-  { key: "dictionary", icon: <DatabaseOutlined />, label: "基础字典" },
-  { type: "divider" },
-  { key: "settings", icon: <SettingOutlined />, label: "模型设置" },
+const navigationSections: NavigationSection[] = [
+  {
+    key: "workflow",
+    label: "业务流程",
+    items: [
+      { key: "overview", icon: <RadarChartOutlined />, label: "客情总览" },
+      { key: "meetings", icon: <InboxOutlined />, label: "资料上传" },
+      { key: "speakers", icon: <UserSwitchOutlined />, label: "身份校验" },
+      { key: "insights", icon: <AuditOutlined />, label: "意向确认" },
+    ],
+  },
+  {
+    key: "perspectives",
+    label: "视角模块",
+    items: [
+      { key: "customer", icon: <ApartmentOutlined />, label: "客户视角" },
+      { key: "technology", icon: <AppstoreOutlined />, label: "技术视角" },
+      { key: "competition", icon: <AppstoreOutlined />, label: "竞争视角" },
+    ],
+  },
+  {
+    key: "configuration",
+    label: "基础配置",
+    items: [
+      { key: "history", icon: <HistoryOutlined />, label: "历史证据" },
+      { key: "dictionary", icon: <DatabaseOutlined />, label: "数据字典" },
+      { key: "settings", icon: <SettingOutlined />, label: "模型设置" },
+    ],
+  },
 ];
 
 const pageMeta: Record<
@@ -148,19 +288,19 @@ const pageMeta: Record<
   },
   meetings: {
     eyebrow: "MEETING PACKAGE",
-    title: "会议资料包",
+    title: "资料上传",
     description:
       "把录音、录屏、转写稿、人工纪要与PDF组织成一次可追溯的客户交流。",
   },
   speakers: {
     eyebrow: "SPEAKER VERIFICATION",
-    title: "说话人校验",
+    title: "身份校验",
     description:
       "AI先分离与推荐，人工再确认姓名、角色、组织和客户职能。",
   },
   insights: {
     eyebrow: "HUMAN-IN-THE-LOOP",
-    title: "AI洞察确认",
+    title: "意向确认",
     description:
       "逐条核对原文、证据和建议；正式结论始终由产品规划负责人确认。",
   },
@@ -176,6 +316,12 @@ const pageMeta: Record<
     description:
       "以客户为入口，识别不同技术的内部支持者、阻力方和推进卡点。",
   },
+  competition: {
+    eyebrow: "COMPETITIVE VIEW",
+    title: "竞争视角",
+    description:
+      "按客户、平台与职能观察竞品产品意向，并与我方技术正式状态逐项对照。",
+  },
   history: {
     eyebrow: "EVIDENCE & VERSION",
     title: "历史证据",
@@ -184,9 +330,9 @@ const pageMeta: Record<
   },
   dictionary: {
     eyebrow: "MASTER DATA",
-    title: "基础字典",
+    title: "数据字典",
     description:
-      "统一技术、客户、平台、项目、职能与别名，减少抽取结果歧义。",
+      "统一技术、产品平台、客户、项目、职能内容与别名，减少语义抽取结果歧义。",
   },
   settings: {
     eyebrow: "MODEL SETTINGS",
@@ -361,7 +507,7 @@ function EvidenceDrawer({
     <Drawer
       open={open}
       onClose={onClose}
-      width={560}
+      size={560}
       title={
         <div className="drawer-title">
           <FileSearchOutlined />
@@ -598,9 +744,9 @@ function OverviewPage({
           </div>
           <h1>让客户声音照进产品规划</h1>
           <p>
-            把会议纪要、录音、录屏与PDF整理成
-            <strong>“技术 × 客户 × 产品平台 × 客户职能”</strong>
-            的证据化意向地图。
+            把客户会议自动整理成
+            <strong>“客户 × 技术 × 产品 × 职能”</strong>
+            的证据化意向地图，助力业务突破与产品规划。
           </p>
           <Space wrap size={12} className="hero-actions">
             <Button
@@ -609,12 +755,12 @@ function OverviewPage({
               icon={<AuditOutlined />}
               onClick={() => onNavigate("insights")}
             >
-              处理 {pendingCount} 条待确认洞察
+              待确认意向{pendingCount}条
             </Button>
             <Button
               size="large"
               icon={<RadarChartOutlined />}
-              onClick={() => onNavigate("technology")}
+              onClick={() => onNavigate("customer")}
             >
               查看意向地图
             </Button>
@@ -826,13 +972,23 @@ function MeetingsPage({
   const [detail, setDetail] = useState<MeetingPackage | undefined>();
   const [fileList, setFileList] = useState<UploadFile[]>([]);
   const [uploadStatuses, setUploadStatuses] = useState<
-    Record<string, "待上传" | "上传中" | "已上传" | "失败">
+    Record<string, UploadState>
   >({});
+  const [createdPackageId, setCreatedPackageId] = useState<string>();
   const [submitting, setSubmitting] = useState(false);
   const [submitStage, setSubmitStage] = useState("");
   const [analysisBusyId, setAnalysisBusyId] = useState<string>();
   const [supplementBusyId, setSupplementBusyId] = useState<string>();
   const [form] = Form.useForm();
+
+  const resetCreateDialog = () => {
+    setCreateOpen(false);
+    setCreatedPackageId(undefined);
+    setFileList([]);
+    setUploadStatuses({});
+    setSubmitStage("");
+    form.resetFields();
+  };
 
   const handleCreate = async (values: {
     title: string;
@@ -849,48 +1005,56 @@ function MeetingsPage({
       return;
     }
     setSubmitting(true);
-    let createdId = "";
+    let createdId = createdPackageId ?? "";
     try {
-      setSubmitStage("正在创建资料包…");
-      const created = await createMeetingPackage(values);
-      createdId = created.id;
+      if (!createdId) {
+        setSubmitStage("正在创建资料包…");
+        const created = await createMeetingPackage(values);
+        createdId = created.id;
+        setCreatedPackageId(created.id);
+      }
 
-      for (let index = 0; index < fileList.length; index += 1) {
-        const selected = fileList[index].originFileObj;
+      const pendingIds = new Set(
+        pendingUploadIds(
+          fileList.map((item) => item.uid),
+          uploadStatuses,
+        ),
+      );
+      const pendingFiles = fileList.filter((item) => pendingIds.has(item.uid));
+      for (let index = 0; index < pendingFiles.length; index += 1) {
+        const currentFile = pendingFiles[index];
+        const selected = currentFile.originFileObj;
         if (!selected) {
-          throw new Error(`无法读取文件：${fileList[index].name}`);
+          throw new Error(`无法读取文件：${currentFile.name}`);
         }
         setUploadStatuses((current) => ({
           ...current,
-          [fileList[index].uid]: "上传中",
+          [currentFile.uid]: "上传中",
         }));
-        setSubmitStage(`正在上传材料 ${index + 1}/${fileList.length}…`);
+        setSubmitStage(`正在上传待处理材料 ${index + 1}/${pendingFiles.length}…`);
         try {
-          await uploadMeetingMaterial(created.id, selected as File);
+          await uploadMeetingMaterial(createdId, selected as File);
           setUploadStatuses((current) => ({
             ...current,
-            [fileList[index].uid]: "已上传",
+            [currentFile.uid]: "已上传",
           }));
         } catch (error) {
           setUploadStatuses((current) => ({
             ...current,
-            [fileList[index].uid]: "失败",
+            [currentFile.uid]: "失败",
           }));
           throw error;
         }
       }
 
       setSubmitStage("正在启动AI分析任务…");
-      const analysis = await analyzeMeetingPackage(created.id);
+      const analysis = await analyzeMeetingPackage(createdId);
       await reloadDataset();
       message.success(
-        `${analysis.message} 资料包编号：${created.id}`,
+        `${analysis.message} 资料包编号：${createdId}`,
         5,
       );
-      setCreateOpen(false);
-      form.resetFields();
-      setFileList([]);
-      setUploadStatuses({});
+      resetCreateDialog();
     } catch (error) {
       await reloadDataset().catch(() => undefined);
       const reason =
@@ -1014,7 +1178,12 @@ function MeetingsPage({
       });
     },
     onRemove: (file) => {
+      if (uploadStatuses[file.uid] === "已上传") {
+        message.warning("该材料已写入资料包，不能从重试列表移除");
+        return false;
+      }
       setFileList((current) => current.filter((item) => item.uid !== file.uid));
+      return true;
     },
     accept: ".mp3,.wav,.m4a,.mp4,.txt,.md,.docx,.srt,.vtt,.pdf",
     itemRender: (_originNode, file, _files, actions) => {
@@ -1047,7 +1216,7 @@ function MeetingsPage({
           <Button
             type="text"
             size="small"
-            disabled={submitting}
+            disabled={submitting || status === "已上传"}
             onClick={actions.remove}
           >
             移除
@@ -1159,7 +1328,13 @@ function MeetingsPage({
       <Modal
         open={createOpen}
         title="创建会议资料包"
-        okText={submitting ? submitStage : "创建并处理资料包"}
+        okText={
+          submitting
+            ? submitStage
+            : createdPackageId
+              ? "继续上传并处理"
+              : "创建并处理资料包"
+        }
         cancelText="取消"
         width={680}
         confirmLoading={submitting}
@@ -1167,14 +1342,14 @@ function MeetingsPage({
         closable={!submitting}
         maskClosable={!submitting}
         onCancel={() => {
-          if (!submitting) setCreateOpen(false);
+          if (!submitting) resetCreateDialog();
         }}
         onOk={() => form.submit()}
       >
         <Form
           form={form}
           layout="vertical"
-          initialValues={{ dataClass: "模拟数据", date: "2026-07-30" }}
+          initialValues={{ dataClass: "模拟数据", date: todayForDateInput() }}
           onFinish={(values) => void handleCreate(values)}
         >
           <div className="form-grid">
@@ -1183,7 +1358,10 @@ function MeetingsPage({
               label="会议名称"
               rules={[{ required: true, message: "请输入会议名称" }]}
             >
-              <Input placeholder="例如：客户A 27英寸新技术规划交流" />
+              <Input
+                disabled={Boolean(createdPackageId)}
+                placeholder="例如：客户A 27英寸新技术规划交流"
+              />
             </Form.Item>
             <Form.Item
               name="customer"
@@ -1191,6 +1369,7 @@ function MeetingsPage({
               rules={[{ required: true, message: "请选择客户" }]}
             >
               <Select
+                disabled={Boolean(createdPackageId)}
                 options={["客户A", "客户B", "客户C", "客户D", "客户E"].map(
                   (item) => ({ value: item, label: item }),
                 )}
@@ -1201,7 +1380,7 @@ function MeetingsPage({
               label="会议日期"
               rules={[{ required: true }]}
             >
-              <Input type="date" />
+              <Input disabled={Boolean(createdPackageId)} type="date" />
             </Form.Item>
             <Form.Item
               name="dataClass"
@@ -1209,6 +1388,7 @@ function MeetingsPage({
               rules={[{ required: true }]}
             >
               <Select
+                disabled={Boolean(createdPackageId)}
                 options={[
                   "模拟数据",
                   "授权脱敏数据",
@@ -1225,17 +1405,27 @@ function MeetingsPage({
           </div>
           <div className="form-grid">
             <Form.Item name="attendeeName" label="姓名／脱敏称呼">
-              <Input placeholder="例如：赵总" />
+              <Input
+                disabled={Boolean(createdPackageId)}
+                placeholder="例如：赵总"
+              />
             </Form.Item>
             <Form.Item name="attendeeRole" label="角色／职务">
-              <Input placeholder="例如：产品规划负责人" />
+              <Input
+                disabled={Boolean(createdPackageId)}
+                placeholder="例如：产品规划负责人"
+              />
             </Form.Item>
             <Form.Item name="attendeeOrganization" label="组织">
-              <Input placeholder="例如：客户A 产品中心" />
+              <Input
+                disabled={Boolean(createdPackageId)}
+                placeholder="例如：客户A 产品中心"
+              />
             </Form.Item>
             <Form.Item name="attendeeFunction" label="客户职能">
               <Select
                 allowClear
+                disabled={Boolean(createdPackageId)}
                 placeholder="请选择"
                 options={FUNCTION_ORDER.map((value) => ({
                   value,
@@ -1259,7 +1449,9 @@ function MeetingsPage({
           </Form.Item>
           <div className="modal-note">
             <SafetyCertificateOutlined />
-            当前为{source === "api" ? "本地API连接" : "前端演示"}模式。企业真实敏感数据只能在本地或企业内网处理。
+            {createdPackageId
+              ? `资料包 ${createdPackageId} 已创建；再次提交只重试失败或待上传材料，不会重复建包。`
+              : `当前为${source === "api" ? "本地API连接" : "前端演示"}模式。企业真实敏感数据只能在本地或企业内网处理。`}
           </div>
         </Form>
       </Modal>
@@ -1268,7 +1460,7 @@ function MeetingsPage({
         title="会议资料包详情"
         open={Boolean(detail)}
         onClose={() => setDetail(undefined)}
-        width={520}
+        size={520}
       >
         {detail ? (
           <div className="meeting-detail">
@@ -1403,6 +1595,10 @@ function SpeakersPage({
     [meetings, speakers],
   );
   const [activeSpeakerId, setActiveSpeakerId] = useState<string>();
+  const [confirmBusyId, setConfirmBusyId] = useState<string>();
+  const [reviewedSpeakerIds, setReviewedSpeakerIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const activeSpeaker =
     scopedSpeakers.find((item) => item.id === activeSpeakerId) ??
     scopedSpeakers.find((item) => !item.confirmed) ??
@@ -1414,25 +1610,47 @@ function SpeakersPage({
     field: keyof SpeakerSegment,
     value: string,
   ) => {
+    setReviewedSpeakerIds((current) => {
+      if (!current.has(id)) return current;
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
     setSpeakers((current) =>
       current.map((item) => (item.id === id ? { ...item, [field]: value } : item)),
     );
   };
 
   const confirmIdentity = async (speaker: SpeakerSegment) => {
+    if (confirmBusyId) return;
     try {
-      await confirmSpeakerIdentity(speaker.id, speaker.version ?? 1, {
+      if (!reviewedSpeakerIds.has(speaker.id)) {
+        throw new Error("请先勾选已核对参会名单、称呼与发言内容");
+      }
+      const identity = prepareSpeakerIdentity({
         alias: speaker.alias,
         role: speaker.role,
         organization: speaker.organization,
         functionName: speaker.functionName,
       });
+      if (!Number.isInteger(speaker.version) || speaker.version < 1) {
+        throw new Error("说话人版本无效，请刷新后重试");
+      }
+      setConfirmBusyId(speaker.id);
+      await confirmSpeakerIdentity(speaker.id, speaker.version, identity);
       await reloadDataset();
+      setReviewedSpeakerIds((current) => {
+        const next = new Set(current);
+        next.delete(speaker.id);
+        return next;
+      });
       message.success(`${speaker.speakerCode} 身份已确认`);
     } catch (error) {
       const reason =
         error instanceof Error ? error.message : "本地API暂不可用";
       message.error(`身份确认失败：${reason}。页面未伪造确认结果`);
+    } finally {
+      setConfirmBusyId(undefined);
     }
   };
 
@@ -1481,12 +1699,15 @@ function SpeakersPage({
                 className={`speaker-list-item ${
                   activeSpeaker?.id === speaker.id ? "is-active" : ""
                 }`}
+                aria-label={`选择${speaker.speakerCode}片段`}
+                aria-pressed={activeSpeaker?.id === speaker.id}
+                title={speaker.speakerCode}
                 onClick={() => setActiveSpeakerId(speaker.id)}
               >
                 <div className="speaker-avatar">
                   {speaker.speakerCode.replace("Speaker ", "")}
                 </div>
-                <div>
+                <div className="speaker-list-item__meta">
                   <strong>{speaker.speakerCode}</strong>
                   <span>{speaker.timeRange}</span>
                 </div>
@@ -1554,6 +1775,7 @@ function SpeakersPage({
                 <label>
                   姓名／脱敏称呼
                   <Input
+                    disabled={activeSpeaker.confirmed || confirmBusyId === activeSpeaker.id}
                     value={activeSpeaker.alias}
                     onChange={(event) =>
                       updateField(activeSpeaker.id, "alias", event.target.value)
@@ -1563,6 +1785,7 @@ function SpeakersPage({
                 <label>
                   角色／职务
                   <Input
+                    disabled={activeSpeaker.confirmed || confirmBusyId === activeSpeaker.id}
                     value={activeSpeaker.role}
                     onChange={(event) =>
                       updateField(activeSpeaker.id, "role", event.target.value)
@@ -1572,6 +1795,7 @@ function SpeakersPage({
                 <label>
                   组织
                   <Input
+                    disabled={activeSpeaker.confirmed || confirmBusyId === activeSpeaker.id}
                     value={activeSpeaker.organization}
                     onChange={(event) =>
                       updateField(
@@ -1585,6 +1809,7 @@ function SpeakersPage({
                 <label>
                   客户职能
                   <Select
+                    disabled={activeSpeaker.confirmed || confirmBusyId === activeSpeaker.id}
                     value={activeSpeaker.functionName}
                     onChange={(value) =>
                       updateField(activeSpeaker.id, "functionName", value)
@@ -1593,7 +1818,19 @@ function SpeakersPage({
                   />
                 </label>
               </div>
-              <Checkbox className="identity-checkbox">
+              <Checkbox
+                className="identity-checkbox"
+                checked={reviewedSpeakerIds.has(activeSpeaker.id)}
+                disabled={activeSpeaker.confirmed || confirmBusyId === activeSpeaker.id}
+                onChange={(event) => {
+                  setReviewedSpeakerIds((current) => {
+                    const next = new Set(current);
+                    if (event.target.checked) next.add(activeSpeaker.id);
+                    else next.delete(activeSpeaker.id);
+                    return next;
+                  });
+                }}
+              >
                 已核对参会名单、称呼与发言内容
               </Checkbox>
               <Button
@@ -1601,7 +1838,12 @@ function SpeakersPage({
                 block
                 size="large"
                 icon={<CheckCircleOutlined />}
-                disabled={activeSpeaker.confirmed}
+                loading={confirmBusyId === activeSpeaker.id}
+                disabled={
+                  activeSpeaker.confirmed ||
+                  Boolean(confirmBusyId) ||
+                  !reviewedSpeakerIds.has(activeSpeaker.id)
+                }
                 onClick={() => void confirmIdentity(activeSpeaker)}
               >
                 {activeSpeaker.confirmed ? "身份已确认" : "确认本场身份"}
@@ -1620,12 +1862,14 @@ function SpeakersPage({
 function InsightsPage({
   intents,
   evidence,
+  taxonomy,
   meetingId,
   onEvidence,
   reloadDataset,
 }: {
   intents: IntentObservation[];
   evidence: Evidence[];
+  taxonomy: PlatformTaxonomy;
   meetingId?: string;
   onEvidence: OpenEvidence;
   reloadDataset: ReloadDataset;
@@ -1635,6 +1879,37 @@ function InsightsPage({
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<IntentObservation | undefined>();
   const [savingEdit, setSavingEdit] = useState(false);
+  const [activeWriteAction, setActiveWriteAction] = useState<
+    "confirm" | "return" | "unknown"
+  >();
+  const [platformDraft, setPlatformDraft] = useState<
+    PlatformCascadeSelection & {
+      level2NewValue?: string;
+      level3NewValue?: string;
+    }
+  >({});
+  const [platformDraftDirty, setPlatformDraftDirty] = useState(false);
+  const [newPlatformRequest, setNewPlatformRequest] =
+    useState<PlatformContentRequest>();
+  const [newPlatformValue, setNewPlatformValue] = useState("");
+  const [newPlatformLevel3Id, setNewPlatformLevel3Id] = useState<string>();
+  const platformDraftSummary = useMemo(() => {
+    const technology = taxonomy.technologies.find(
+      (item) => item.id === platformDraft.technologyId,
+    );
+    if (!technology) return "";
+    const level2 =
+      platformDraft.level2NewValue ??
+      technology.levels
+        .find((item) => item.level === 2)
+        ?.values.find((item) => item.id === platformDraft.level2ValueId)?.name;
+    const level3 =
+      platformDraft.level3NewValue ??
+      technology.levels
+        .find((item) => item.level === 3)
+        ?.values.find((item) => item.id === platformDraft.level3ValueId)?.name;
+    return [technology.name, level2, level3].filter(Boolean).join(" / ");
+  }, [platformDraft, taxonomy]);
   const meetingByEvidence = useMemo(
     () => new Map(evidence.map((item) => [item.id, item.meetingId])),
     [evidence],
@@ -1649,6 +1924,13 @@ function InsightsPage({
           )
         : intents,
     [intents, meetingByEvidence, meetingId],
+  );
+  const scopedIntentIds = useMemo(
+    () => new Set(scopedIntents.map((item) => item.id)),
+    [scopedIntents],
+  );
+  const selectedScopedRowKeys = selectedRowKeys.filter((key) =>
+    scopedIntentIds.has(String(key)),
   );
 
   const filtered = scopedIntents.filter((item) => {
@@ -1671,14 +1953,20 @@ function InsightsPage({
       ids: string[],
       action: "confirm" | "return" | "unknown",
     ) => {
+      if (activeWriteAction) return;
+      const { targets, missingIds } = resolveRequestedItems(scopedIntents, ids);
+      if (!targets.length) {
+        setSelectedRowKeys([]);
+        message.warning("所选意向已不在当前资料包中，请重新选择");
+        return;
+      }
       if (action === "confirm") {
-        const blocked = scopedIntents.filter(
+        const blocked = targets.filter(
           (item) =>
-            ids.includes(item.id) &&
-            (item.conflict ||
-              item.confidence < 0.75 ||
-              item.person.includes("待确认") ||
-              item.attitude === null),
+            item.conflict ||
+            item.confidence < 0.75 ||
+            item.person.includes("待确认") ||
+            item.attitude === null,
         );
         if (blocked.length) {
           message.error(
@@ -1688,16 +1976,13 @@ function InsightsPage({
         }
       }
 
+      setActiveWriteAction(action);
       try {
         const persistenceResults = await Promise.allSettled(
-          scopedIntents
-            .filter((item) => ids.includes(item.id))
-            .map((item) => updateIntentStatus(item, action)),
+          targets.map((item) => updateIntentStatus(item, action)),
         );
-        const failedWrites = persistenceResults.filter(
-          (result) => result.status === "rejected",
-        ).length;
-        const successCount = ids.length - failedWrites;
+        const { failedCount: failedWrites, successCount } =
+          summarizeSettledWrites(persistenceResults);
         await reloadDataset();
         setSelectedRowKeys([]);
         const actionMessage =
@@ -1712,6 +1997,10 @@ function InsightsPage({
           message.warning(
             `${actionMessage}；${failedWrites} 条写入失败，已按服务端最新数据刷新`,
           );
+        } else if (missingIds.length) {
+          message.warning(
+            `${actionMessage}；另有 ${missingIds.length} 条已离开当前资料包，未执行写入`,
+          );
         } else {
           message.success(actionMessage);
         }
@@ -1719,17 +2008,23 @@ function InsightsPage({
         const reason =
           error instanceof Error ? error.message : "本地API暂不可用";
         message.error(`操作后刷新失败：${reason}。请重新加载页面核对`);
+      } finally {
+        setActiveWriteAction(undefined);
       }
     },
-    [reloadDataset, scopedIntents],
+    [activeWriteAction, reloadDataset, scopedIntents],
   );
 
   const saveEditing = async () => {
     if (!editing) return;
     setSavingEdit(true);
     try {
+      assertIntentReadyForSave(editing);
+      const preparedPlatformDraft = platformDraftDirty
+        ? preparePlatformDraftForSave(taxonomy, platformDraft)
+        : undefined;
       const expectedStage = editing.adoptionStage;
-      await updateIntentSuggestion(editing);
+      await updateIntentReviewDraft(editing, preparedPlatformDraft);
       const refreshed = await reloadDataset();
       const persisted = refreshed.intents.find(
         (item) => item.id === editing.id,
@@ -1742,7 +2037,12 @@ function InsightsPage({
         );
       }
       setEditing(undefined);
-      message.success("修改已写入服务端并校验，等待正式确认");
+      setPlatformDraftDirty(false);
+      message.success(
+        platformDraftDirty
+          ? "修改与平台路径已保存；新增内容将在本条意向正式确认后生效"
+          : "修改已写入服务端并校验，等待正式确认",
+      );
     } catch (error) {
       const reason =
         error instanceof Error ? error.message : "本地API暂不可用";
@@ -1750,6 +2050,72 @@ function InsightsPage({
     } finally {
       setSavingEdit(false);
     }
+  };
+
+  const openEditing = (item: IntentObservation) => {
+    const path = platformPathFor(item, taxonomy);
+    setEditing(item);
+    setPlatformDraft(
+      item.platformDraft
+        ? {
+            technologyId: item.platformDraft.technologyId,
+            ...(item.platformDraft.level2IsNew
+              ? { level2NewValue: item.platformDraft.level2Value }
+              : { level2ValueId: item.platformDraft.level2ValueId }),
+            ...(item.platformDraft.level3IsNew
+              ? { level3NewValue: item.platformDraft.level3Value }
+              : { level3ValueId: item.platformDraft.level3ValueId }),
+          }
+        : {
+            technologyId: path.technologyId ?? undefined,
+            level2ValueId: path.level2ValueId ?? undefined,
+            level3ValueId: path.level3ValueId ?? undefined,
+          },
+    );
+    setPlatformDraftDirty(false);
+    setNewPlatformRequest(undefined);
+    setNewPlatformValue("");
+    setNewPlatformLevel3Id(undefined);
+  };
+
+  const requestNewPlatformContent = (request: PlatformContentRequest) => {
+    setNewPlatformRequest(request);
+    setNewPlatformValue("");
+    setNewPlatformLevel3Id(
+      request.menu.level === 2 ? platformDraft.level3ValueId : undefined,
+    );
+  };
+
+  const acceptNewPlatformContent = () => {
+    if (!newPlatformRequest) return;
+    const value = newPlatformValue.trim();
+    if (!value) {
+      message.error("请输入要新增的平台内容");
+      return;
+    }
+    if (newPlatformRequest.menu.level === 2) {
+      if (!newPlatformLevel3Id) {
+        message.error("新增二级内容时，需要选择一个现有三级内容形成当前平台");
+        return;
+      }
+      setPlatformDraft({
+        technologyId: newPlatformRequest.technology.id,
+        level2NewValue: value,
+        level3ValueId: newPlatformLevel3Id,
+      });
+    } else {
+      if (!newPlatformRequest.parentLevel2ValueId) {
+        message.error("请先选择二级平台内容");
+        return;
+      }
+      setPlatformDraft({
+        technologyId: newPlatformRequest.technology.id,
+        level2ValueId: newPlatformRequest.parentLevel2ValueId,
+        level3NewValue: value,
+      });
+    }
+    setPlatformDraftDirty(true);
+    setNewPlatformRequest(undefined);
   };
 
   const columns: TableColumnsType<IntentObservation> = [
@@ -1795,6 +2161,7 @@ function InsightsPage({
     },
     {
       title: "支持／卡点",
+      width: 280,
       render: (_, item) => (
         <div className="reason-cell">
           <span><CheckCircleOutlined /> {item.supportReason}</span>
@@ -1811,27 +2178,32 @@ function InsightsPage({
     {
       title: "操作",
       fixed: "right",
-      width: 178,
+      width: 174,
+      align: "center",
+      className: "intent-action-column",
       render: (_, item) => (
-        <Space size={2}>
+        <div className="intent-row-actions" aria-label="数据操作">
           <Button
             type="link"
+            size="small"
             disabled={!item.evidenceId}
             onClick={() => onEvidence(item.evidenceId)}
           >
             证据
           </Button>
-          <Button type="link" onClick={() => setEditing(item)}>
+          <Button type="link" size="small" onClick={() => openEditing(item)}>
             修改
           </Button>
           <Button
             type="link"
-            disabled={item.status === "已确认"}
+            size="small"
+            className="intent-row-actions__confirm"
+            disabled={item.status === "已确认" || Boolean(activeWriteAction)}
             onClick={() => void applyAction([item.id], "confirm")}
           >
             确认
           </Button>
-        </Space>
+        </div>
       ),
     },
   ];
@@ -1849,8 +2221,8 @@ function InsightsPage({
         {meetingId ? <Tag color="blue">当前资料包：{meetingId}</Tag> : null}
       </div>
 
-      <Card className="content-card table-card">
-        <div className="table-toolbar">
+      <Card className="content-card table-card insights-table-card">
+        <div className="table-toolbar insights-toolbar">
           <Space wrap>
             <Input
               prefix={<SearchOutlined />}
@@ -1871,12 +2243,15 @@ function InsightsPage({
             />
           </Space>
           <Space wrap>
-            <span className="selected-count">已选 {selectedRowKeys.length} 条</span>
+            <span className="selected-count">
+              已选 {selectedScopedRowKeys.length} 条
+            </span>
             <Button
-              disabled={!selectedRowKeys.length}
+              loading={activeWriteAction === "return"}
+              disabled={!selectedScopedRowKeys.length || Boolean(activeWriteAction)}
               onClick={() =>
                 void applyAction(
-                  selectedRowKeys.map(String),
+                  selectedScopedRowKeys.map(String),
                   "return",
                 )
               }
@@ -1884,10 +2259,11 @@ function InsightsPage({
               退回补充
             </Button>
             <Button
-              disabled={!selectedRowKeys.length}
+              loading={activeWriteAction === "unknown"}
+              disabled={!selectedScopedRowKeys.length || Boolean(activeWriteAction)}
               onClick={() =>
                 void applyAction(
-                  selectedRowKeys.map(String),
+                  selectedScopedRowKeys.map(String),
                   "unknown",
                 )
               }
@@ -1896,11 +2272,12 @@ function InsightsPage({
             </Button>
             <Button
               type="primary"
-              disabled={!selectedRowKeys.length}
+              loading={activeWriteAction === "confirm"}
+              disabled={!selectedScopedRowKeys.length || Boolean(activeWriteAction)}
               icon={<CheckCircleOutlined />}
               onClick={() =>
                 void applyAction(
-                  selectedRowKeys.map(String),
+                  selectedScopedRowKeys.map(String),
                   "confirm",
                 )
               }
@@ -1911,17 +2288,20 @@ function InsightsPage({
         </div>
         <Table
           rowKey="id"
+          tableLayout="fixed"
           rowSelection={{
-            selectedRowKeys,
+            selectedRowKeys: selectedScopedRowKeys,
             onChange: setSelectedRowKeys,
             getCheckboxProps: (record) => ({
-              disabled: record.status === "已确认",
+              disabled:
+                record.status === "已确认" || Boolean(activeWriteAction),
             }),
+            columnWidth: 48,
           }}
           columns={columns}
           dataSource={filtered}
           pagination={{ pageSize: 7 }}
-          scroll={{ x: 1180 }}
+          scroll={{ x: 1220 }}
         />
       </Card>
 
@@ -1946,6 +2326,23 @@ function InsightsPage({
       >
         {editing ? (
           <div className="edit-intent-form">
+            <div className="platform-draft-field">
+              <strong>产品平台路径</strong>
+              <PlatformCascadeSelect
+                taxonomy={taxonomy}
+                value={platformDraft}
+                onChange={(selection) => {
+                  setPlatformDraft(selection);
+                  setPlatformDraftDirty(true);
+                }}
+                onRequestNewContent={requestNewPlatformContent}
+              />
+              {platformDraft.level2NewValue || platformDraft.level3NewValue ? (
+                <span className="platform-draft-note">
+                  待确认平台：{platformDraftSummary}。其中新增内容将在本条意向正式确认后生效；确认前不会进入数据字典和看板统计。
+                </span>
+              ) : null}
+            </div>
             <label>
               职能态度
               <Select
@@ -1991,6 +2388,54 @@ function InsightsPage({
           </div>
         ) : null}
       </Modal>
+
+      <Modal
+        open={Boolean(newPlatformRequest)}
+        title={
+          newPlatformRequest
+            ? `新增${newPlatformRequest.menu.name}内容`
+            : "新增平台内容"
+        }
+        okText="加入本条待确认意向"
+        cancelText="取消"
+        onCancel={() => setNewPlatformRequest(undefined)}
+        onOk={acceptNewPlatformContent}
+      >
+        {newPlatformRequest ? (
+          <div className="edit-intent-form">
+            <p>
+              菜单名称由管理员Excel定义。普通用户只能在“
+              {newPlatformRequest.menu.name}”下补充具体内容。
+            </p>
+            <label>
+              {newPlatformRequest.menu.name}内容
+              <Input
+                autoFocus
+                value={newPlatformValue}
+                maxLength={200}
+                onChange={(event) => setNewPlatformValue(event.target.value)}
+                placeholder={`例如：${newPlatformRequest.menu.level === 2 ? "34" : "UHD"}`}
+              />
+            </label>
+            {newPlatformRequest.menu.level === 2 ? (
+              <label>
+                当前意向对应的三级内容
+                <Select
+                  value={newPlatformLevel3Id}
+                  onChange={setNewPlatformLevel3Id}
+                  placeholder="请选择现有三级内容"
+                  options={
+                    newPlatformRequest.technology.levels
+                      .find((item) => item.level === 3)
+                      ?.values.filter((item) => item.status !== "inactive")
+                      .map((item) => ({ value: item.id, label: item.name })) ?? []
+                  }
+                />
+              </label>
+            ) : null}
+          </div>
+        ) : null}
+      </Modal>
     </div>
   );
 }
@@ -1998,20 +2443,14 @@ function InsightsPage({
 function TechnologyPage({
   intents,
   dictionaries,
+  taxonomy,
   onEvidence,
 }: {
   intents: FormalIntentStatus[];
   dictionaries: DictionaryCollection;
+  taxonomy: PlatformTaxonomy;
   onEvidence: OpenEvidence;
 }) {
-  const technologies = useMemo(() => {
-    const active = dictionaries.technologies
-      .filter((item) => item.status === "启用")
-      .map((item) => item.name);
-    return active.length
-      ? active
-      : Array.from(new Set(intents.map((item) => item.technology)));
-  }, [dictionaries.technologies, intents]);
   const customers = useMemo(() => {
     const active = dictionaries.customers
       .filter((item) => item.status === "启用")
@@ -2020,24 +2459,38 @@ function TechnologyPage({
       ? active
       : Array.from(new Set(intents.map((item) => item.customer)));
   }, [dictionaries.customers, intents]);
-  const [requestedTechnology, setRequestedTechnology] = useState("Mini LED");
-  const technology = technologies.includes(requestedTechnology)
-    ? requestedTechnology
-    : technologies[0] ?? "";
+  const [platformSelection, setPlatformSelection] =
+    useState<PlatformCascadeSelection>(() => ({
+      technologyId:
+        taxonomy.technologies.find((item) => item.name === "Mini LED")?.id ??
+        taxonomy.technologies[0]?.id,
+    }));
+  const cascadeModel = useMemo(
+    () => getPlatformCascadeModel(taxonomy, platformSelection),
+    [platformSelection, taxonomy],
+  );
+  const technology = cascadeModel.technology?.name ?? "";
   const scoped = useMemo(
-    () => intents.filter((item) => item.technology === technology),
-    [intents, technology],
+    () =>
+      intents.filter((item) =>
+        matchesPlatformSelection(
+          platformPathFor(item, taxonomy),
+          taxonomy,
+          cascadeModel.selection,
+        ),
+      ),
+    [cascadeModel.selection, intents, taxonomy],
   );
   const scopeRows = useMemo(
     () =>
       technology
-        ? groupFormalIntentsByScope(intents, {
+        ? groupFormalIntentsByScope(scoped, {
             technology,
             customerOrder: customers,
             includeEmptyCustomers: true,
           })
         : [],
-    [customers, intents, technology],
+    [customers, scoped, technology],
   );
 
   const overviewOption = useMemo<EChartsOption>(
@@ -2140,15 +2593,11 @@ function TechnologyPage({
   return (
     <div className="page-stack">
       <div className="view-filter-bar">
-        <div>
-          <span>选择技术</span>
-          <Select
-            value={technology || undefined}
-            placeholder="暂无启用技术"
-            onChange={setRequestedTechnology}
-            options={technologies.map((value) => ({ value, label: value }))}
-          />
-        </div>
+        <PlatformCascadeSelect
+          taxonomy={taxonomy}
+          value={cascadeModel.selection}
+          onChange={setPlatformSelection}
+        />
         <div className="filter-summary">
           <Tag color="success" icon={<CheckCircleOutlined />}>
             仅人工确认正式状态
@@ -2267,6 +2716,452 @@ function TechnologyPage({
           ))}
           {!actions.length ? <Empty description="暂无可生成提示的正式状态" /> : null}
         </div>
+      </Card>
+    </div>
+  );
+}
+
+function CompetitionPage({
+  intents,
+  competitiveIntents,
+  dictionaries,
+  taxonomy,
+  onEvidence,
+}: {
+  intents: FormalIntentStatus[];
+  competitiveIntents: CompetitiveIntentStatus[];
+  dictionaries: DictionaryCollection;
+  taxonomy: PlatformTaxonomy;
+  onEvidence: OpenEvidence;
+}) {
+  const customerOrder = useMemo(
+    () =>
+      dictionaries.customers
+        .filter((item) => item.status === "启用")
+        .map((item) => item.name),
+    [dictionaries.customers],
+  );
+  const [platformSelection, setPlatformSelection] =
+    useState<PlatformCascadeSelection>(() => ({
+      technologyId:
+        taxonomy.technologies.find((item) => item.name === "Mini LED")?.id ??
+        taxonomy.technologies[0]?.id,
+    }));
+  const cascadeModel = useMemo(
+    () => getPlatformCascadeModel(taxonomy, platformSelection),
+    [platformSelection, taxonomy],
+  );
+  const technology = cascadeModel.technology?.name ?? "";
+  const technologyId = cascadeModel.selection.technologyId;
+  const ownScoped = useMemo(
+    () =>
+      intents.filter((item) =>
+        matchesPlatformSelection(
+          platformPathFor(item, taxonomy),
+          taxonomy,
+          cascadeModel.selection,
+        ),
+      ),
+    [cascadeModel.selection, intents, taxonomy],
+  );
+  const mappedTechnologyCompetitors = useMemo(() => {
+    if (!technologyId) return [];
+    return competitiveIntents.filter((item) => {
+      if (
+        item.platformMappingStatus === "legacy_pending" ||
+        item.platformMappingStatus === "unmapped"
+      ) {
+        return false;
+      }
+      return matchesPlatformSelection(
+        platformPathFor(item, taxonomy),
+        taxonomy,
+        { technologyId },
+        { requireConcretePlatform: true },
+      );
+    });
+  }, [competitiveIntents, taxonomy, technologyId]);
+  const competitorScoped = useMemo(
+    () =>
+      mappedTechnologyCompetitors.filter((item) =>
+        matchesPlatformSelection(
+          platformPathFor(item, taxonomy),
+          taxonomy,
+          cascadeModel.selection,
+          { requireConcretePlatform: true },
+        ),
+      ),
+    [cascadeModel.selection, mappedTechnologyCompetitors, taxonomy],
+  );
+  const excludedCompetitorCount = useMemo(
+    () => {
+      if (!technologyId) return 0;
+      const technologyCompetitorCount = competitiveIntents.filter(
+        (item) => platformPathFor(item, taxonomy).technologyId === technologyId,
+      ).length;
+      return technologyCompetitorCount - mappedTechnologyCompetitors.length;
+    },
+    [competitiveIntents, mappedTechnologyCompetitors.length, taxonomy, technologyId],
+  );
+
+  const comparisonRows = useMemo<CompetitionComparisonRow[]>(() => {
+    type DraftRow = {
+      key: string;
+      customer: string;
+      platform: string;
+      customerProject: string;
+      ownItems: FormalIntentStatus[];
+      productMap: Map<string, CompetitorProductGroup>;
+    };
+    const rows = new Map<string, DraftRow>();
+    const ownByCustomerPlatform = new Map<string, FormalIntentStatus[]>();
+    for (const item of ownScoped) {
+      if (!item.platformLeafId) continue;
+      const lookupKey = `${item.customer}|${item.platformLeafId}`;
+      const matches = ownByCustomerPlatform.get(lookupKey) ?? [];
+      matches.push(item);
+      ownByCustomerPlatform.set(lookupKey, matches);
+    }
+    const ensureRow = (
+      customer: string,
+      platform: string,
+      customerProject: string,
+    ) => {
+      const key = `${customer}|${platform}|${customerProject}`;
+      const existing = rows.get(key);
+      if (existing) return existing;
+      const created: DraftRow = {
+        key,
+        customer,
+        platform,
+        customerProject,
+        ownItems: [],
+        productMap: new Map(),
+      };
+      rows.set(key, created);
+      return created;
+    };
+
+    for (const item of ownScoped) {
+      ensureRow(
+        item.customer,
+        item.platform,
+        item.customerProject,
+      ).ownItems.push(item);
+    }
+    for (const item of competitorScoped) {
+      const lookupKey = `${item.customer}|${item.platformLeafId}`;
+      const candidates = ownByCustomerPlatform.get(lookupKey) ?? [];
+      const exactProject = candidates.find(
+        (candidate) =>
+          normalizeComparisonScope(candidate.customerProject) ===
+          normalizeComparisonScope(item.customerProject),
+      );
+      const candidateProjects = new Set(
+        candidates.map((candidate) => candidate.customerProject),
+      );
+      const mappedOwnScope =
+        exactProject ??
+        (candidateProjects.size === 1 ? candidates[0] : undefined);
+      const row = ensureRow(
+        item.customer,
+        mappedOwnScope?.platform ?? item.platform,
+        mappedOwnScope?.customerProject ?? item.customerProject,
+      );
+      const productKey = `${item.competitor}|${item.product}`;
+      const product = row.productMap.get(productKey) ?? {
+        key: productKey,
+        competitor: item.competitor,
+        product: item.product,
+        customerProject: item.customerProject,
+        items: [],
+      };
+      product.items.push(item);
+      row.productMap.set(productKey, product);
+    }
+
+    return Array.from(rows.values())
+      .map((row) => {
+        const competitorProducts = Array.from(row.productMap.values());
+        const ownByFunction = new Map(
+          row.ownItems.map((item) => [item.functionName, item]),
+        );
+        const competitorByFunction = new Map<string, number>();
+        for (const product of competitorProducts) {
+          for (const item of product.items) {
+            competitorByFunction.set(
+              item.functionName,
+              Math.max(
+                competitorByFunction.get(item.functionName) ?? 0,
+                item.attitude ?? 0,
+              ),
+            );
+          }
+        }
+        const competitorLeadFunctions = FUNCTION_ORDER.filter(
+          (functionName) => {
+            const competitorAttitude =
+              competitorByFunction.get(functionName) ?? 0;
+            const ownAttitude =
+              ownByFunction.get(functionName)?.attitude ?? 0;
+            return competitorAttitude >= 4 && competitorAttitude > ownAttitude;
+          },
+        );
+        const ownLeadFunctions = FUNCTION_ORDER.filter((functionName) => {
+          const competitorAttitude =
+            competitorByFunction.get(functionName) ?? 0;
+          const ownAttitude =
+            ownByFunction.get(functionName)?.attitude ?? 0;
+          return ownAttitude >= 4 && ownAttitude > competitorAttitude;
+        });
+        return {
+          key: row.key,
+          customer: row.customer,
+          platform: row.platform,
+          customerProject: row.customerProject,
+          ownItems: row.ownItems,
+          competitorProducts,
+          competitorLeadFunctions,
+          ownLeadFunctions,
+        };
+      })
+      .sort((left, right) => {
+        const leftCustomer = customerOrder.indexOf(left.customer);
+        const rightCustomer = customerOrder.indexOf(right.customer);
+        const leftOrder = leftCustomer < 0 ? Number.MAX_SAFE_INTEGER : leftCustomer;
+        const rightOrder = rightCustomer < 0 ? Number.MAX_SAFE_INTEGER : rightCustomer;
+        return leftOrder - rightOrder || left.platform.localeCompare(right.platform);
+      });
+  }, [competitorScoped, customerOrder, ownScoped]);
+
+  const competitorProductCount = useMemo(
+    () =>
+      new Set(
+        competitorScoped.map(
+          (item) => `${item.competitor}|${item.product}`,
+        ),
+      ).size,
+    [competitorScoped],
+  );
+  const competitorLeadCount = comparisonRows.reduce(
+    (total, row) => total + row.competitorLeadFunctions.length,
+    0,
+  );
+  const ownLeadCount = comparisonRows.reduce(
+    (total, row) => total + row.ownLeadFunctions.length,
+    0,
+  );
+
+  return (
+    <div className="page-stack">
+      <div className="view-filter-bar competition-filter-bar">
+        <PlatformCascadeSelect
+          taxonomy={taxonomy}
+          value={cascadeModel.selection}
+          onChange={setPlatformSelection}
+          technologyLabel="选择对标技术"
+        />
+        <div className="filter-summary">
+          <Tag color="gold" icon={<WarningOutlined />}>
+            模拟竞品情报
+          </Tag>
+          <strong>{technology || "暂无技术"}</strong>
+          <span>
+            按客户职能逐项对照；{excludedCompetitorCount} 条未映射具体平台的竞品记录未计入
+          </span>
+        </div>
+      </div>
+
+      <div className="competition-summary-strip">
+        <div>
+          <span>竞品产品</span>
+          <strong>{competitorProductCount}</strong>
+        </div>
+        <div>
+          <span>覆盖客户／平台</span>
+          <strong>{comparisonRows.length}</strong>
+        </div>
+        <div>
+          <span>竞品较强职能点</span>
+          <strong>{competitorLeadCount}</strong>
+        </div>
+        <div>
+          <span>我方较强职能点</span>
+          <strong>{ownLeadCount}</strong>
+        </div>
+      </div>
+
+      <Card className="content-card competition-card">
+        <SectionHeading
+          eyebrow="CLIENT FUNCTION COMPARISON"
+          title={`${technology} · 我方技术与竞品产品意向对照`}
+        />
+        <div className="competition-principle">
+          <SafetyCertificateOutlined />
+          <span>
+            我方仅使用人工确认正式状态；竞品区为脱敏模拟情报，用于验证对比结构，后续需接入授权来源并保留出处。
+          </span>
+        </div>
+        {comparisonRows.length ? (
+          <div className="competition-table-wrap">
+            <table className="competition-table">
+              <thead>
+                <tr>
+                  <th>客户／平台</th>
+                  <th>我方技术 · 客户职能意向</th>
+                  <th>竞品产品 · 客户职能意向</th>
+                  <th>职能级对比提示</th>
+                </tr>
+              </thead>
+              <tbody>
+                {comparisonRows.map((row) => {
+                  const ownByFunction = new Map(
+                    row.ownItems.map((item) => [item.functionName, item]),
+                  );
+                  return (
+                    <tr key={row.key}>
+                      <th>
+                        <div className="table-stack competition-scope">
+                          <strong>{row.customer}</strong>
+                          <span>{row.platform}</span>
+                          <small>{row.customerProject}</small>
+                        </div>
+                      </th>
+                      <td>
+                        <div className="comparison-side comparison-side--own">
+                          <div className="comparison-side__head">
+                            <Tag color="blue">我方</Tag>
+                            <strong>{technology}</strong>
+                          </div>
+                          <div className="function-attitude-grid">
+                            {FUNCTION_ORDER.map((functionName) => {
+                              const item = ownByFunction.get(functionName);
+                              return (
+                                <button
+                                  type="button"
+                                  key={functionName}
+                                  className="function-attitude-item"
+                                  disabled={!item?.evidenceId}
+                                  onClick={() =>
+                                    item &&
+                                    onEvidence(item.evidenceId, item.statusKey)
+                                  }
+                                  title={
+                                    item?.evidenceId
+                                      ? `查看我方${functionName}正式证据`
+                                      : "尚无我方正式状态"
+                                  }
+                                >
+                                  <span>{functionName}</span>
+                                  <AttitudeBadge
+                                    value={item?.attitude ?? null}
+                                    compact
+                                  />
+                                  <small>
+                                    {item?.adoptionStage ?? "尚无正式状态"}
+                                  </small>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </td>
+                      <td>
+                        {row.competitorProducts.length ? (
+                          <div className="competitor-product-list">
+                            {row.competitorProducts.map((product) => {
+                              const byFunction = new Map(
+                                product.items.map((item) => [
+                                  item.functionName,
+                                  item,
+                                ]),
+                              );
+                              const anchor = product.items[0];
+                              return (
+                                <article
+                                  className="comparison-side comparison-side--competitor"
+                                  key={product.key}
+                                >
+                                  <div className="comparison-side__head">
+                                    <Tag color="volcano">
+                                      {product.competitor}
+                                    </Tag>
+                                    <strong>{product.product}</strong>
+                                  </div>
+                                  <div className="function-attitude-grid">
+                                    {FUNCTION_ORDER.map((functionName) => {
+                                      const item = byFunction.get(functionName);
+                                      return (
+                                        <div
+                                          className="function-attitude-item"
+                                          key={functionName}
+                                          title={
+                                            item?.evidenceSummary ??
+                                            "模拟情报尚未覆盖该职能"
+                                          }
+                                        >
+                                          <span>{functionName}</span>
+                                          <AttitudeBadge
+                                            value={item?.attitude ?? null}
+                                            compact
+                                          />
+                                          <small>
+                                            {item?.adoptionStage ?? "尚未覆盖"}
+                                          </small>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                  <p>
+                                    <WarningOutlined /> {anchor?.blocker}
+                                  </p>
+                                </article>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <Empty
+                            image={Empty.PRESENTED_IMAGE_SIMPLE}
+                            description="暂无竞品模拟情报"
+                          />
+                        )}
+                      </td>
+                      <td>
+                        <div className="competition-insight">
+                          {row.competitorLeadFunctions.length ? (
+                            <div>
+                              <Tag color="red">竞品较强</Tag>
+                              <span>
+                                {row.competitorLeadFunctions.join("、")}职能出现更强支持信号
+                              </span>
+                            </div>
+                          ) : null}
+                          {row.ownLeadFunctions.length ? (
+                            <div>
+                              <Tag color="green">我方较强</Tag>
+                              <span>
+                                {row.ownLeadFunctions.join("、")}职能保持更强支持信号
+                              </span>
+                            </div>
+                          ) : null}
+                          {!row.competitorLeadFunctions.length &&
+                          !row.ownLeadFunctions.length ? (
+                            <div>
+                              <Tag>信号接近</Tag>
+                              <span>继续补齐职能证据与最新变化</span>
+                            </div>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <Empty description="该技术暂无我方正式状态或竞品模拟情报" />
+        )}
       </Card>
     </div>
   );
@@ -2615,70 +3510,145 @@ function HistoryPage({
 function DictionaryPage({
   dictionaries,
   setDictionaries,
+  taxonomy,
+  reloadDataset,
 }: {
   dictionaries: DictionaryCollection;
   setDictionaries: React.Dispatch<React.SetStateAction<DictionaryCollection>>;
+  taxonomy: PlatformTaxonomy;
+  reloadDataset: ReloadDataset;
 }) {
-  const [activeKey, setActiveKey] = useState<keyof DictionaryCollection>(
-    "technologies",
-  );
+  const { user } = useAuth();
+  const [activeKey, setActiveKey] = useState<DictionaryKey>("technologies");
+  const [parentFilter, setParentFilter] = useState<string>();
   const [addOpen, setAddOpen] = useState(false);
-  const [form] = Form.useForm();
+  const [importPreview, setImportPreview] =
+    useState<TaxonomyImportPreview | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [preflighting, setPreflighting] = useState(false);
+  const [committingImport, setCommittingImport] = useState(false);
+  const [form] = Form.useForm<DictionaryFormValues>();
+  const parentConfig = DICTIONARY_PARENT_CONFIG[activeKey];
+  const parentOptions = useMemo(
+    () =>
+      parentConfig
+        ? dictionaries[parentConfig.source].filter(
+            (item) => item.status === "启用",
+          )
+        : [],
+    [dictionaries, parentConfig],
+  );
+  const parentNameById = useMemo(
+    () => new Map(parentOptions.map((item) => [item.id, item.name])),
+    [parentOptions],
+  );
+  const visibleItems = useMemo(
+    () =>
+      parentFilter
+        ? dictionaries[activeKey].filter((item) =>
+            item.parentIds?.includes(parentFilter),
+          )
+        : dictionaries[activeKey],
+    [activeKey, dictionaries, parentFilter],
+  );
+  const columns = useMemo<TableColumnsType<DictionaryItem>>(() => {
+    const relationshipColumn: TableColumnsType<DictionaryItem> = parentConfig
+      ? [
+          {
+            title: parentConfig.label,
+            dataIndex: "parentIds",
+            width: 190,
+            render: (parentIds: string[] | undefined) =>
+              parentIds?.length ? (
+                <Space wrap size={[4, 4]}>
+                  {parentIds.map((parentId) => (
+                    <Tag color="blue" key={parentId}>
+                      {parentNameById.get(parentId) ?? parentId}
+                    </Tag>
+                  ))}
+                </Space>
+              ) : (
+                <Tag>待关联</Tag>
+              ),
+          },
+        ]
+      : [];
 
-  const labels: Record<keyof DictionaryCollection, string> = {
-    technologies: "技术",
-    customers: "客户",
-    platforms: "通用平台",
-    projects: "客户项目",
-    functions: "客户职能",
+    return [
+      {
+        title: DICTIONARY_LABELS[activeKey],
+        dataIndex: "name",
+        width: 220,
+        render: (value, item) => (
+          <div className="table-stack">
+            <strong>{value}</strong>
+            <span>{item.code}</span>
+          </div>
+        ),
+      },
+      ...relationshipColumn,
+      {
+        title: "别名／会议用语",
+        dataIndex: "aliases",
+        render: (values: string[]) => (
+          <Space wrap size={[4, 4]}>
+            {values.map((value) => (
+              <Tag key={value}>{value}</Tag>
+            ))}
+          </Space>
+        ),
+      },
+      { title: "说明／映射", dataIndex: "note", width: 260 },
+      {
+        title: "状态",
+        dataIndex: "status",
+        width: 90,
+        render: (value) => (
+          <Tag color={value === "启用" ? "success" : "default"}>{value}</Tag>
+        ),
+      },
+      {
+        title: "更新时间",
+        dataIndex: "updatedAt",
+        width: 150,
+        render: (value: string) => (
+          <span className="table-date" title={value}>
+            {compactDateTime(value)}
+          </span>
+        ),
+      },
+    ];
+  }, [activeKey, parentConfig, parentNameById]);
+
+  const handleActiveKeyChange = (key: string) => {
+    setActiveKey(key as DictionaryKey);
+    setParentFilter(undefined);
+    setAddOpen(false);
+    form.resetFields();
   };
 
-  const columns: TableColumnsType<DictionaryItem> = [
-    {
-      title: labels[activeKey],
-      dataIndex: "name",
-      width: 220,
-      render: (value, item) => (
-        <div className="table-stack">
-          <strong>{value}</strong>
-          <span>{item.code}</span>
-        </div>
-      ),
-    },
-    {
-      title: "别名／会议用语",
-      dataIndex: "aliases",
-      render: (values: string[]) => (
-        <Space wrap size={[4, 4]}>
-          {values.map((value) => <Tag key={value}>{value}</Tag>)}
-        </Space>
-      ),
-    },
-    { title: "说明／映射", dataIndex: "note", width: 260 },
-    {
-      title: "状态",
-      dataIndex: "status",
-      width: 90,
-      render: (value) => <Tag color={value === "启用" ? "success" : "default"}>{value}</Tag>,
-    },
-    {
-      title: "更新时间",
-      dataIndex: "updatedAt",
-      width: 150,
-      render: (value: string) => (
-        <span className="table-date" title={value}>
-          {compactDateTime(value)}
-        </span>
-      ),
-    },
-  ];
+  const openAddModal = () => {
+    form.resetFields();
+    if (parentConfig && parentFilter) {
+      form.setFieldValue(
+        "parentIds",
+        parentConfig.multiple ? [parentFilter] : parentFilter,
+      );
+    }
+    setAddOpen(true);
+  };
 
-  const handleAdd = (values: {
-    name: string;
-    code: string;
-    aliases?: string;
-    note?: string;
-  }) => {
+  const closeAddModal = () => {
+    setAddOpen(false);
+    form.resetFields();
+  };
+
+  const handleAdd = (values: DictionaryFormValues) => {
+    const parentIds = Array.isArray(values.parentIds)
+      ? values.parentIds
+      : values.parentIds
+        ? [values.parentIds]
+        : [];
     setDictionaries((current) => ({
       ...current,
       [activeKey]: [
@@ -2689,6 +3659,7 @@ function DictionaryPage({
           aliases: values.aliases
             ? values.aliases.split(/[,，]/).map((item) => item.trim())
             : [],
+          parentIds,
           note: values.note ?? "",
           status: "启用",
           updatedAt: "刚刚",
@@ -2696,9 +3667,59 @@ function DictionaryPage({
         ...current[activeKey],
       ],
     }));
-    setAddOpen(false);
-    form.resetFields();
+    closeAddModal();
     message.success("演示字典项已加入当前页面");
+  };
+
+  const handleTaxonomyUpload: UploadProps["beforeUpload"] = (file) => {
+    if (user.role !== "admin") {
+      message.error("只有管理员可以上传并发布产品平台菜单");
+      return false;
+    }
+    setPreflighting(true);
+    setImportPreview(null);
+    void preflightTaxonomyExcel(file)
+      .then((result) => {
+        setImportPreview(result);
+        setImportOpen(true);
+        if (result.valid) {
+          message.success("Excel预检完成，尚未写入数据库");
+        }
+      })
+      .catch((error: unknown) => {
+        message.error(
+          error instanceof Error ? error.message : "Excel预检失败",
+        );
+      })
+      .finally(() => setPreflighting(false));
+    return false;
+  };
+
+  const publishTaxonomyImport = async () => {
+    if (
+      !importPreview?.valid ||
+      !importPreview.previewToken ||
+      !importPreview.file.sha256
+    ) {
+      return;
+    }
+    setCommittingImport(true);
+    try {
+      const result = await commitTaxonomyImport(
+        importPreview.previewToken,
+        importPreview.file.sha256,
+      );
+      message.success(result.message);
+      await reloadDataset();
+      setImportOpen(false);
+      setImportPreview(null);
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : "数据字典发布失败",
+      );
+    } finally {
+      setCommittingImport(false);
+    }
   };
 
   return (
@@ -2730,58 +3751,251 @@ function DictionaryPage({
         <div className="table-toolbar">
           <Tabs
             activeKey={activeKey}
-            onChange={(key) =>
-              setActiveKey(key as keyof DictionaryCollection)
-            }
-            items={Object.entries(labels).map(([key, label]) => ({
+            onChange={handleActiveKeyChange}
+            items={DICTIONARY_TABS.map((key) => ({
               key,
-              label: `${label} ${dictionaries[key as keyof DictionaryCollection].length}`,
+              label: `${DICTIONARY_LABELS[key]} ${dictionaries[key].length}`,
             }))}
           />
-          <Space>
+          <Space wrap className="dictionary-toolbar-actions">
+            {parentConfig ? (
+              <Select
+                allowClear
+                aria-label={`${parentConfig.label}筛选`}
+                className="dictionary-parent-filter"
+                onChange={setParentFilter}
+                optionFilterProp="label"
+                options={parentOptions.map((item) => ({
+                  label: item.name,
+                  value: item.id,
+                }))}
+                placeholder={`按${parentConfig.label}筛选`}
+                showSearch
+                value={parentFilter}
+              />
+            ) : null}
             <Upload
-              beforeUpload={() => {
-                message.info("演示模式：已完成XLSX字段预检，未写入服务端");
-                return false;
-              }}
+              beforeUpload={handleTaxonomyUpload}
               showUploadList={false}
               accept=".xlsx"
+              disabled={user.role !== "admin" || preflighting}
             >
-              <Button icon={<CloudUploadOutlined />}>导入Excel</Button>
+              <Button
+                loading={preflighting}
+                disabled={user.role !== "admin"}
+                icon={<CloudUploadOutlined />}
+              >
+                预检并导入Excel
+              </Button>
             </Upload>
+            {user.role !== "admin" ? <Tag>仅管理员可导入</Tag> : null}
             <Button
               type="primary"
               icon={<PlusOutlined />}
-              onClick={() => setAddOpen(true)}
+              onClick={openAddModal}
+              disabled={user.role !== "admin" || activeKey === "platforms"}
+              title={
+                activeKey === "platforms"
+                  ? "产品平台菜单名称及初始内容仅通过管理员Excel维护"
+                  : user.role !== "admin"
+                    ? "只有管理员可维护数据字典"
+                    : undefined
+              }
             >
-              新增{labels[activeKey]}
+              新增{DICTIONARY_LABELS[activeKey]}
             </Button>
           </Space>
         </div>
+        {activeKey === "platforms" ? (
+          <div className="taxonomy-schema-grid">
+            {taxonomy.technologies.map((technology) => {
+              const level2 = technology.levels.find(
+                (item) => item.level === 2,
+              );
+              const level3 = technology.levels.find(
+                (item) => item.level === 3,
+              );
+              return (
+                <article key={technology.id}>
+                  <div className="taxonomy-schema-grid__head">
+                    <strong>{technology.name}</strong>
+                    <Tag color={level2 && level3 ? "blue" : "default"}>
+                      {technology.leaves?.length ?? 0} 个具体平台
+                    </Tag>
+                  </div>
+                  {level2 && level3 ? (
+                    <>
+                      <div>
+                        <span>二级 · {level2.name}</span>
+                        <Space wrap size={[4, 4]}>
+                          {level2.values.map((value) => (
+                            <Tag key={value.id}>{value.name}</Tag>
+                          ))}
+                        </Space>
+                      </div>
+                      <div>
+                        <span>三级 · {level3.name}</span>
+                        <Space wrap size={[4, 4]}>
+                          {level3.values.map((value) => (
+                            <Tag key={value.id}>{value.name}</Tag>
+                          ))}
+                        </Space>
+                      </div>
+                    </>
+                  ) : (
+                    <span className="muted">尚未通过Excel配置平台层级</span>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        ) : null}
         <Table
           rowKey="id"
           columns={columns}
-          dataSource={dictionaries[activeKey]}
+          dataSource={visibleItems}
           pagination={false}
-          scroll={{ x: 820 }}
+          scroll={{ x: parentConfig ? 1010 : 820 }}
         />
       </Card>
 
       <div className="dictionary-rules">
         <div><strong>标准名优先</strong><span>会议原文通过别名映射到统一主数据</span></div>
-        <div><strong>平台分层</strong><span>通用产品平台与客户内部项目分别建模</span></div>
+        <div><strong>层级归属</strong><span>产品平台关联技术，项目与职能关联客户</span></div>
         <div><strong>人工治理</strong><span>模型无法覆盖正式字典，停用项保留历史引用</span></div>
       </div>
 
       <Modal
+        open={importOpen}
+        title="产品平台Excel预检与发布"
+        okText="确认发布"
+        cancelText="取消"
+        width={760}
+        confirmLoading={committingImport}
+        okButtonProps={{
+          disabled:
+            !importPreview?.valid || !importPreview.previewToken,
+        }}
+        onCancel={() => {
+          if (!committingImport) setImportOpen(false);
+        }}
+        onOk={() => void publishTaxonomyImport()}
+      >
+        {importPreview ? (
+          <div className="taxonomy-import-preview">
+            <div className="taxonomy-import-preview__status">
+              <Tag color={importPreview.valid ? "success" : "error"}>
+                {importPreview.valid ? "预检通过 · 尚未写入" : "预检未通过"}
+              </Tag>
+              <strong>{importPreview.file.name}</strong>
+              <span>{formatFileSize(importPreview.file.sizeBytes)}</span>
+            </div>
+            {importPreview.preview ? (
+              <>
+                <div className="taxonomy-import-counts">
+                  <Statistic
+                    title="技术"
+                    value={importPreview.preview.counts.technologies}
+                  />
+                  <Statistic
+                    title="二级内容"
+                    value={importPreview.preview.counts.level2Values}
+                  />
+                  <Statistic
+                    title="三级内容"
+                    value={importPreview.preview.counts.level3Values}
+                  />
+                  <Statistic
+                    title="具体平台"
+                    value={importPreview.preview.counts.platforms}
+                  />
+                </div>
+                <div className="taxonomy-import-list">
+                  {importPreview.preview.technologies.map((technology) => (
+                    <div key={technology.name}>
+                      <strong>{technology.name}</strong>
+                      <span>
+                        {technology.level2?.name ?? "未配置二级"}：
+                        {technology.level2?.values
+                          .map((item) => item.name)
+                          .join("、") || "—"}
+                      </span>
+                      <span>
+                        {technology.level3?.name ?? "未配置三级"}：
+                        {technology.level3?.values
+                          .map((item) => item.name)
+                          .join("、") || "—"}
+                      </span>
+                      {technology.platforms.length ? (
+                        <small>
+                          生成：
+                          {technology.platforms
+                            .map((item) => item.name)
+                            .join("、")}
+                        </small>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : null}
+            {importPreview.errors.length ? (
+              <div className="taxonomy-import-issues" role="alert">
+                {importPreview.errors.map((item, index) => (
+                  <p key={`${item.code}-${index}`}>
+                    <strong>{item.code}</strong> · {item.message}
+                    {item.row ? `（第${item.row}行）` : ""}
+                  </p>
+                ))}
+              </div>
+            ) : null}
+            {importPreview.warnings.length ? (
+              <div className="taxonomy-import-warnings">
+                {importPreview.warnings.map((item, index) => (
+                  <p key={`${item.code}-${index}`}>{item.message}</p>
+                ))}
+              </div>
+            ) : null}
+            <p className="muted">
+              发布采用安全合并：新增与更新本次内容，不删除附件中未列出的旧值；相同文件重复发布不会重复写入。
+            </p>
+          </div>
+        ) : null}
+      </Modal>
+
+      <Modal
+        forceRender
         open={addOpen}
-        title={`新增${labels[activeKey]}`}
+        title={`新增${DICTIONARY_LABELS[activeKey]}`}
         okText="保存"
         cancelText="取消"
-        onCancel={() => setAddOpen(false)}
+        onCancel={closeAddModal}
         onOk={() => form.submit()}
       >
         <Form form={form} layout="vertical" onFinish={handleAdd}>
+          {parentConfig ? (
+            <Form.Item
+              name="parentIds"
+              label={parentConfig.label}
+              rules={[
+                {
+                  required: true,
+                  message: `请选择${parentConfig.label}`,
+                },
+              ]}
+            >
+              <Select
+                mode={parentConfig.multiple ? "multiple" : undefined}
+                optionFilterProp="label"
+                options={parentOptions.map((item) => ({
+                  label: item.name,
+                  value: item.id,
+                }))}
+                placeholder={`请选择${parentConfig.label}`}
+                showSearch
+              />
+            </Form.Item>
+          ) : null}
           <Form.Item name="name" label="标准名称" rules={[{ required: true }]}>
             <Input />
           </Form.Item>
@@ -2801,20 +4015,42 @@ function DictionaryPage({
 }
 
 function IntentBaoShell() {
+  const { user, logout } = useAuth();
   const [activeView, setActiveView] = useState<ViewKey>("overview");
   const [collapsed, setCollapsed] = useState(false);
   const [dataset, setDataset] = useState<MvpDataset | null>(null);
   const [source, setSource] = useState<DataSourceMode>("loading");
+  const [loadError, setLoadError] = useState("");
   const [evidenceId, setEvidenceId] = useState<string | undefined>();
   const [evidenceStatusKey, setEvidenceStatusKey] = useState<
     string | undefined
   >();
   const [activePackageId, setActivePackageId] = useState<string>();
 
-  const navigateTo = useCallback<NavigateTo>((key, packageId) => {
-    setActiveView(key);
-    setActivePackageId(packageId);
-  }, []);
+  const currentView = resolveAuthorizedView(user.role, activeView);
+  const visibleNavigationSections = navigationSections
+    .map((section) => ({
+      ...section,
+      items: section.items.filter((item) =>
+        canAccessView(user.role, item.key),
+      ),
+    }))
+    .filter((section) => section.items.length > 0);
+  const navItems: MenuProps["items"] = visibleNavigationSections.map(
+    (section) => ({
+      type: "group",
+      children: section.items,
+    }),
+  );
+
+  const navigateTo = useCallback<NavigateTo>(
+    (key, packageId) => {
+      const authorizedView = resolveAuthorizedView(user.role, key);
+      setActiveView(authorizedView);
+      setActivePackageId(authorizedView === key ? packageId : undefined);
+    },
+    [user.role],
+  );
 
   const openEvidence = useCallback<OpenEvidence>((id, statusKey) => {
     if (!id) return;
@@ -2826,8 +4062,25 @@ function IntentBaoShell() {
     const data = await loadBootstrapDataset();
     setDataset(data);
     setSource("api");
+    setLoadError("");
     return data;
   }, []);
+
+  const handleDatasetLoadError = useCallback(
+    (error: unknown) => {
+      if (error instanceof ApiClientError && error.status === 401) {
+        return;
+      }
+      setDataset(null);
+      setSource("loading");
+      setLoadError(
+        error instanceof Error
+          ? `本地API数据加载失败：${error.message}`
+          : "本地API数据加载失败，请确认后端已启动。",
+      );
+    },
+    [],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -2837,15 +4090,14 @@ function IntentBaoShell() {
         setDataset(data);
         setSource("api");
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!alive) return;
-        setDataset(mockDataset);
-        setSource("mock");
+        void handleDatasetLoadError(error);
       });
     return () => {
       alive = false;
     };
-  }, []);
+  }, [handleDatasetLoadError]);
 
   const updateDataset = <K extends keyof MvpDataset>(
     key: K,
@@ -2877,7 +4129,7 @@ function IntentBaoShell() {
         formalEvidenceIntent?.statusKey ??
         evidenceIntent?.id),
   );
-  const currentMeta = pageMeta[activeView];
+  const currentMeta = pageMeta[currentView];
   const latestFormalUpdate = [...(dataset?.formalIntents ?? [])]
     .map((item) => item.confirmedAt)
     .filter(Boolean)
@@ -2890,9 +4142,24 @@ function IntentBaoShell() {
         <Card className="content-card">
           <Empty
             image={Empty.PRESENTED_IMAGE_SIMPLE}
-            description="正在连接本地API并加载意向数据…"
+            description={
+              loadError || "正在连接本地API并加载意向数据…"
+            }
           />
-          <Progress percent={35} showInfo={false} status="active" />
+          {loadError ? (
+            <div className="empty-action">
+              <Button
+                type="primary"
+                onClick={() =>
+                  void reloadDataset().catch(handleDatasetLoadError)
+                }
+              >
+                重新加载
+              </Button>
+            </div>
+          ) : (
+            <Progress percent={35} showInfo={false} status="active" />
+          )}
         </Card>
       );
     }
@@ -2909,7 +4176,7 @@ function IntentBaoShell() {
           speakerMeetingIds.has(meeting.id),
       )?.id ??
       dataset.speakers[0]?.meetingId;
-    switch (activeView) {
+    switch (currentView) {
       case "meetings":
         return (
           <MeetingsPage
@@ -2936,6 +4203,7 @@ function IntentBaoShell() {
           <InsightsPage
             intents={dataset.intents}
             evidence={dataset.evidence}
+            taxonomy={dataset.platformTaxonomy}
             meetingId={activePackageId}
             onEvidence={openEvidence}
             reloadDataset={reloadDataset}
@@ -2946,6 +4214,17 @@ function IntentBaoShell() {
           <TechnologyPage
             intents={dataset.formalIntents}
             dictionaries={dataset.dictionaries}
+            taxonomy={dataset.platformTaxonomy}
+            onEvidence={openEvidence}
+          />
+        );
+      case "competition":
+        return (
+          <CompetitionPage
+            intents={dataset.formalIntents}
+            competitiveIntents={dataset.competitiveIntents}
+            dictionaries={dataset.dictionaries}
+            taxonomy={dataset.platformTaxonomy}
             onEvidence={openEvidence}
           />
         );
@@ -2971,6 +4250,8 @@ function IntentBaoShell() {
           <DictionaryPage
             dictionaries={dataset.dictionaries}
             setDictionaries={(value) => updateDataset("dictionaries", value)}
+            taxonomy={dataset.platformTaxonomy}
+            reloadDataset={reloadDataset}
           />
         );
       case "settings":
@@ -3010,7 +4291,7 @@ function IntentBaoShell() {
         </div>
         <Menu
           mode="inline"
-          selectedKeys={[activeView]}
+          selectedKeys={[currentView]}
           items={navItems}
           onClick={({ key }) => navigateTo(key as ViewKey)}
           className="app-menu"
@@ -3061,50 +4342,63 @@ function IntentBaoShell() {
                     : "演示回退"}
               </Tag>
             </Tooltip>
-            <div className="operator-avatar">企</div>
-            <div className="operator-copy">
-              <strong>产品规划负责人</strong>
-              <span>本地单用户模式</span>
+            <div className="operator-avatar">
+              {user.displayName.slice(0, 1)}
             </div>
+            <div className="operator-copy">
+              <strong>{user.displayName}</strong>
+              <span>{user.role === "admin" ? "管理员" : "普通用户"}</span>
+            </div>
+            <Tooltip title="退出登录">
+              <Button
+                type="text"
+                aria-label="退出登录"
+                icon={<LogoutOutlined />}
+                onClick={() => {
+                  void logout().catch(() => message.error("退出登录失败"));
+                }}
+              />
+            </Tooltip>
           </div>
         </header>
 
         <nav className="mobile-nav" aria-label="移动端主导航">
-          {navItems
-            ?.filter((item) => item && "key" in item && item.key)
-            .map((item) => {
-              if (!item || !("key" in item) || !item.key) return null;
-              const menuItem = item as {
-                key: React.Key;
-                icon?: React.ReactNode;
-                label?: React.ReactNode;
-              };
-              const key = String(menuItem.key) as ViewKey;
-              return (
-                <button
-                  type="button"
-                  key={key}
-                  className={activeView === key ? "is-active" : ""}
-                  onClick={() => navigateTo(key)}
-                >
-                  {menuItem.icon}
-                  <span>{menuItem.label}</span>
-                </button>
-              );
-            })}
+          {visibleNavigationSections.map((section) => (
+            <div
+              className="mobile-nav__group"
+              role="group"
+              aria-label={section.label}
+              key={section.key}
+            >
+              <div className="mobile-nav__items">
+                {section.items.map((item) => (
+                  <button
+                    type="button"
+                    key={item.key}
+                    className={currentView === item.key ? "is-active" : ""}
+                    aria-current={currentView === item.key ? "page" : undefined}
+                    onClick={() => navigateTo(item.key)}
+                  >
+                    {item.icon}
+                    <span>{item.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
         </nav>
 
         <DataScopeBanner source={source} />
 
         <Content className="app-content">
-          {activeView !== "overview" ? (
+          {currentView !== "overview" ? (
             <div className="page-intro">
               <div>
                 <span>{currentMeta.eyebrow}</span>
                 <Title level={1}>{currentMeta.title}</Title>
                 <Paragraph>{currentMeta.description}</Paragraph>
               </div>
-              {activeView !== "settings" ? (
+              {currentView !== "settings" ? (
                 <div className="page-intro__status">
                   <ClockCircleOutlined />
                   <span>最新正式状态</span>
@@ -3116,11 +4410,6 @@ function IntentBaoShell() {
           {content}
           <footer className="app-footer">
             <span>意向宝 · 初版流程验证</span>
-            <span>
-              {source === "loading"
-                ? "正在读取本地数据；尚未展示内置演示业务记录"
-                : "当前使用模拟数据；关键意向结构化准确率 85% 是后续授权样本验证目标，并非已实现成绩"}
-            </span>
           </footer>
         </Content>
       </Layout>

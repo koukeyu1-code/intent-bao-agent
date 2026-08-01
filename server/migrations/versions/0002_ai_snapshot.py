@@ -16,6 +16,14 @@ depends_on = None
 
 
 def upgrade() -> None:
+    columns = {
+        column["name"]
+        for column in sa.inspect(op.get_bind()).get_columns(
+            "raw_intent_observations"
+        )
+    }
+    if "ai_snapshot" in columns:
+        return
     op.add_column(
         "raw_intent_observations",
         sa.Column("ai_snapshot", sa.JSON(), nullable=True),

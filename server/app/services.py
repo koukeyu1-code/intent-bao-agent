@@ -3,9 +3,10 @@ from __future__ import annotations
 import codecs
 import hashlib
 import re
+import shutil
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from xml.etree import ElementTree
 
@@ -23,6 +24,10 @@ from .domain import (
 from .model_adapters import IntentModelAdapter, ModelContext, get_model_adapter
 from .schemas import IntentConfirmRequest, SpeakerConfirmRequest
 from .seed import TASK_STAGES
+from .taxonomy_service import (
+    capture_path_snapshot,
+    confirm_observation_platform,
+)
 
 
 class DomainError(Exception):
@@ -32,8 +37,46 @@ class DomainError(Exception):
         self.message = message
 
 
+def _human_size(size_bytes: int) -> str:
+    if size_bytes % (1024 * 1024 * 1024) == 0:
+        return f"{size_bytes // (1024 * 1024 * 1024)}GB"
+    if size_bytes % (1024 * 1024) == 0:
+        return f"{size_bytes // (1024 * 1024)}MB"
+    if size_bytes % 1024 == 0:
+        return f"{size_bytes // 1024}KB"
+    return f"{size_bytes}字节"
+
+
 _DIRECT_TEXT_EXTENSIONS = {".txt", ".md", ".srt", ".vtt"}
 _MODEL_INPUT_LIMIT = 80_000
+_MODEL_TEXT_READ_LIMIT_BYTES = 512 * 1024
+
+# Upload limits reflect the first-stage usage profile: a screen recording may
+# be large, while audio, slide decks and text documents should be bounded much
+# more tightly.  Package-wide quotas prevent many individually valid uploads
+# from exhausting the local workstation.
+MATERIAL_FILE_LIMITS_BYTES = {
+    "录屏": 2 * 1024 * 1024 * 1024,
+    "录音": 1024 * 1024 * 1024,
+    "会议资料": 100 * 1024 * 1024,
+    "转写稿": 50 * 1024 * 1024,
+    "人工纪要": 50 * 1024 * 1024,
+}
+MAX_FILES_PER_PACKAGE = 40
+MAX_BYTES_PER_PACKAGE = 4 * 1024 * 1024 * 1024
+MIN_FREE_DISK_BYTES = 512 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+# DOCX is a ZIP container.  These limits are checked before any member is
+# decompressed, then the members we consume are also read through bounded
+# streams so a forged central directory cannot make the parser allocate an
+# unbounded amount of memory.
+MAX_DOCX_ARCHIVE_MEMBERS = 1_000
+MAX_DOCX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+MAX_DOCX_DOCUMENT_XML_BYTES = 20 * 1024 * 1024
+MAX_DOCX_CONTENT_TYPES_BYTES = 1024 * 1024
+MAX_DOCX_COMPRESSION_RATIO = 200
+MIN_DOCX_RATIO_CHECK_BYTES = 1024 * 1024
 _ADOPTION_STAGES = {
     "未明确／未进入",
     "初步了解",
@@ -45,10 +88,17 @@ _ADOPTION_STAGES = {
 }
 
 
-def _decode_customer_text(raw: bytes) -> str:
+def _decode_customer_text(
+    raw: bytes, *, allow_truncated_tail: bool = False
+) -> str:
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
-            return raw.decode(encoding)
+            if not allow_truncated_tail:
+                return raw.decode(encoding)
+            decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+            # final=False deliberately permits an incomplete multibyte code
+            # point at the byte-limit boundary to remain buffered and omitted.
+            return decoder.decode(raw, final=False)
         except UnicodeDecodeError:
             continue
     raise DomainError(
@@ -57,17 +107,120 @@ def _decode_customer_text(raw: bytes) -> str:
     )
 
 
-def _read_model_text(path: Path) -> str | None:
+def _read_zip_member_limited(
+    archive: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+    *,
+    max_bytes: int,
+    label: str,
+) -> bytes:
+    if member.file_size > max_bytes:
+        raise DomainError(
+            422,
+            f"DOCX安全检查失败：{label}展开后不得超过"
+            f"{_human_size(max_bytes)}",
+        )
+    with archive.open(member, "r") as source:
+        content = source.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise DomainError(
+            422,
+            f"DOCX安全检查失败：{label}实际展开大小超过"
+            f"{_human_size(max_bytes)}",
+        )
+    return content
+
+
+def _validate_docx_archive(
+    archive: zipfile.ZipFile,
+) -> tuple[zipfile.ZipInfo, zipfile.ZipInfo]:
+    infos = archive.infolist()
+    if len(infos) > MAX_DOCX_ARCHIVE_MEMBERS:
+        raise DomainError(
+            422,
+            "DOCX安全检查失败：压缩包成员数量过多"
+            f"（最多{MAX_DOCX_ARCHIVE_MEMBERS}个）",
+        )
+
+    total_uncompressed = 0
+    by_name: dict[str, zipfile.ZipInfo] = {}
+    for info in infos:
+        normalized_name = info.filename.replace("\\", "/")
+        path = PurePosixPath(normalized_name)
+        if path.is_absolute() or ".." in path.parts:
+            raise DomainError(
+                422, "DOCX安全检查失败：压缩包包含非法成员路径"
+            )
+        if info.flag_bits & 0x1:
+            raise DomainError(422, "DOCX安全检查失败：不支持加密成员")
+        if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+            raise DomainError(
+                422, "DOCX安全检查失败：包含不支持的压缩算法"
+            )
+        if info.is_dir():
+            continue
+        total_uncompressed += info.file_size
+        if total_uncompressed > MAX_DOCX_UNCOMPRESSED_BYTES:
+            raise DomainError(
+                422,
+                "DOCX安全检查失败：压缩包总展开大小不得超过"
+                f"{_human_size(MAX_DOCX_UNCOMPRESSED_BYTES)}",
+            )
+        if info.file_size >= MIN_DOCX_RATIO_CHECK_BYTES:
+            ratio = info.file_size / max(info.compress_size, 1)
+            if ratio > MAX_DOCX_COMPRESSION_RATIO:
+                raise DomainError(
+                    422,
+                    "DOCX安全检查失败：检测到异常压缩比，文件可能是压缩炸弹",
+                )
+        by_name[normalized_name] = info
+
+    content_types = by_name.get("[Content_Types].xml")
+    document_xml = by_name.get("word/document.xml")
+    if content_types is None or document_xml is None:
+        raise DomainError(
+            422,
+            "DOCX安全检查失败：缺少[Content_Types].xml或word/document.xml",
+        )
+    if document_xml.file_size > MAX_DOCX_DOCUMENT_XML_BYTES:
+        raise DomainError(
+            422,
+            "DOCX安全检查失败：word/document.xml展开后不得超过"
+            f"{_human_size(MAX_DOCX_DOCUMENT_XML_BYTES)}",
+        )
+    return content_types, document_xml
+
+
+def _read_model_text(
+    path: Path, *, max_text_bytes: int = _MODEL_TEXT_READ_LIMIT_BYTES
+) -> str | None:
     suffix = path.suffix.lower()
     if suffix in _DIRECT_TEXT_EXTENSIONS:
-        return _decode_customer_text(path.read_bytes())
+        with path.open("rb") as source:
+            raw = source.read(max_text_bytes)
+        return _decode_customer_text(raw, allow_truncated_tail=True)
     if suffix != ".docx":
         return None
     try:
         with zipfile.ZipFile(path) as archive:
-            document_xml = archive.read("word/document.xml")
+            _content_types, document_info = _validate_docx_archive(archive)
+            document_xml = _read_zip_member_limited(
+                archive,
+                document_info,
+                max_bytes=MAX_DOCX_DOCUMENT_XML_BYTES,
+                label="word/document.xml",
+            )
         root = ElementTree.fromstring(document_xml)
-    except (KeyError, OSError, ValueError, zipfile.BadZipFile, ElementTree.ParseError):
+    except DomainError:
+        raise
+    except (
+        KeyError,
+        OSError,
+        ValueError,
+        RuntimeError,
+        zipfile.BadZipFile,
+        ElementTree.ParseError,
+    ):
         raise DomainError(422, f"无法读取Word正文：{path.name}") from None
     text_nodes = [
         node.text or ""
@@ -677,11 +830,21 @@ def _preflight_uploaded_file(path: Path, suffix: str, size: int) -> None:
     if suffix == ".docx":
         try:
             with zipfile.ZipFile(path) as archive:
-                content_types = archive.read("[Content_Types].xml")
+                content_info, _document_info = _validate_docx_archive(archive)
+                content_types = _read_zip_member_limited(
+                    archive,
+                    content_info,
+                    max_bytes=MAX_DOCX_CONTENT_TYPES_BYTES,
+                    label="[Content_Types].xml",
+                )
+        except DomainError as exc:
+            raise DomainError(
+                exc.status_code, f"文件内容预检失败：{exc.message}"
+            ) from None
         except (KeyError, OSError, zipfile.BadZipFile, RuntimeError):
             raise DomainError(
                 422,
-                "文件内容预检失败：DOCX不是可读取ZIP或缺少[Content_Types].xml",
+                "文件内容预检失败：DOCX不是可读取的ZIP容器",
             ) from None
         if not content_types.strip():
             raise DomainError(
@@ -723,6 +886,57 @@ def _preflight_uploaded_file(path: Path, suffix: str, size: int) -> None:
             raise DomainError(422, "文件内容预检失败：未检测到MP3文件签名")
 
 
+def _package_upload_usage(session: Session, package_id: str) -> tuple[int, int]:
+    count, total_bytes = session.execute(
+        select(
+            func.count(m.MaterialFile.id),
+            func.coalesce(func.sum(m.MaterialFile.size_bytes), 0),
+        ).where(
+            m.MaterialFile.package_id == package_id,
+            m.MaterialFile.is_deleted.is_(False),
+        )
+    ).one()
+    return int(count or 0), int(total_bytes or 0)
+
+
+def _disk_free_bytes(path: Path) -> int:
+    return int(shutil.disk_usage(path).free)
+
+
+def _ensure_upload_disk_space(
+    path: Path, *, incoming_bytes: int, phase: str
+) -> None:
+    required = MIN_FREE_DISK_BYTES + max(0, incoming_bytes)
+    available = _disk_free_bytes(path)
+    if available < required:
+        raise DomainError(
+            507,
+            f"{phase}磁盘可用空间不足：需至少保留"
+            f"{_human_size(MIN_FREE_DISK_BYTES)}安全空间；"
+            "上传已停止，请清理磁盘后重试。",
+        )
+
+
+def _enforce_upload_size(
+    *,
+    material_type: str,
+    upload_size: int,
+    existing_package_bytes: int,
+) -> None:
+    file_limit = MATERIAL_FILE_LIMITS_BYTES[material_type]
+    if upload_size > file_limit:
+        raise DomainError(
+            413,
+            f"{material_type}单文件不得超过{_human_size(file_limit)}",
+        )
+    if existing_package_bytes + upload_size > MAX_BYTES_PER_PACKAGE:
+        raise DomainError(
+            413,
+            "单个资料包文件累计容量不得超过"
+            f"{_human_size(MAX_BYTES_PER_PACKAGE)}",
+        )
+
+
 async def save_uploaded_file(
     session: Session,
     settings: Settings,
@@ -743,26 +957,54 @@ async def save_uploaded_file(
     if suffix not in allowed_extensions[resolved_type]:
         raise DomainError(415, f"{resolved_type}不支持扩展名{suffix}")
 
+    existing_count, existing_bytes = _package_upload_usage(session, package.id)
+    if existing_count >= MAX_FILES_PER_PACKAGE:
+        raise DomainError(
+            413, f"单个资料包最多允许上传{MAX_FILES_PER_PACKAGE}个文件"
+        )
+
+    declared_size = getattr(upload, "size", None)
+    if isinstance(declared_size, int) and declared_size >= 0:
+        _enforce_upload_size(
+            material_type=resolved_type,
+            upload_size=declared_size,
+            existing_package_bytes=existing_bytes,
+        )
+
     package_dir = (
         settings.projects_dir / package.project_id / package.id / "source"
     ).resolve()
-    package_dir.mkdir(parents=True, exist_ok=True)
     if settings.projects_dir.resolve() not in package_dir.parents:
         raise DomainError(400, "文件保存路径非法")
+    package_dir.mkdir(parents=True, exist_ok=True)
+
+    _ensure_upload_disk_space(
+        package_dir,
+        incoming_bytes=(declared_size if isinstance(declared_size, int) else 0),
+        phase="开始上传前",
+    )
 
     file_id = m.new_id()
     target = package_dir / f"{file_id}__{safe_name}"
     hasher = hashlib.sha256()
     size = 0
-    max_size = 2 * 1024 * 1024 * 1024
     try:
         with target.open("wb") as output:
-            while chunk := await upload.read(1024 * 1024):
-                size += len(chunk)
-                if size > max_size:
-                    raise DomainError(413, "单个音频或录屏不得超过2GB")
+            while chunk := await upload.read(UPLOAD_CHUNK_BYTES):
+                next_size = size + len(chunk)
+                _enforce_upload_size(
+                    material_type=resolved_type,
+                    upload_size=next_size,
+                    existing_package_bytes=existing_bytes,
+                )
+                _ensure_upload_disk_space(
+                    package_dir,
+                    incoming_bytes=len(chunk),
+                    phase="上传过程中",
+                )
                 hasher.update(chunk)
                 output.write(chunk)
+                size = next_size
         _preflight_uploaded_file(target, suffix, size)
     except Exception:
         target.unlink(missing_ok=True)
@@ -1137,6 +1379,22 @@ def confirm_observation(
     ) is None:
         raise DomainError(422, "缺少可追溯证据，不能形成正式意向状态")
 
+    # A reviewed platform proposal remains pending until this exact formal
+    # confirmation.  Activating it here keeps the dictionary publication,
+    # concrete platform FK and formal status in one database transaction.
+    platform_draft = session.scalar(
+        select(m.ObservationPlatformDraft).where(
+            m.ObservationPlatformDraft.observation_id == observation.id,
+            m.ObservationPlatformDraft.status == "pending",
+        )
+    )
+    if platform_draft is not None:
+        confirm_observation_platform(
+            session,
+            observation_id=observation.id,
+            actor=payload.actor,
+        )
+
     package = session.get(m.MeetingPackage, observation.package_id)
     if package is None:
         raise DomainError(404, "会议资料包不存在")
@@ -1288,6 +1546,16 @@ def confirm_observation(
     )
     session.add(formal)
     session.flush()
+    if formal.generic_platform_id:
+        capture_path_snapshot(
+            session,
+            target_type="formal_intent_status",
+            target_id=formal.id,
+            technology_id=formal.technology_id,
+            generic_platform_id=formal.generic_platform_id,
+            actor=payload.actor,
+            version_no=formal.version_no,
+        )
     after = {
         "attitude_level": payload.attitude_level,
         "is_supporter": payload.is_supporter,

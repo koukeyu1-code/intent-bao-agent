@@ -24,7 +24,7 @@ import {
   Typography,
   message,
 } from "antd";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   listAvailableModels,
   loadModelSettings,
@@ -42,6 +42,8 @@ const { Paragraph, Title } = Typography;
 
 const OLLAMA_DEFAULT_URL = "http://127.0.0.1:11434";
 const MOCK_MODEL_NAME = "mock-intent-v1";
+
+type ModelOperation = "models" | "test" | "save" | "clear-key";
 
 const defaultSettings: ModelSettings = {
   provider: "mock",
@@ -90,14 +92,28 @@ export default function ModelSettingsPage() {
   const [settings, setSettings] =
     useState<ModelSettings>(defaultSettings);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [loadingModels, setLoadingModels] = useState(false);
+  const activeOperationRef = useRef<ModelOperation | undefined>(undefined);
+  const [activeOperation, setActiveOperation] =
+    useState<ModelOperation>();
   const [modelOptions, setModelOptions] = useState<string[]>([
     MOCK_MODEL_NAME,
   ]);
   const [testResult, setTestResult] =
     useState<ModelConnectionResult>();
+  const operationBusy = activeOperation !== undefined;
+
+  const beginOperation = (operation: ModelOperation) => {
+    if (activeOperationRef.current) return false;
+    activeOperationRef.current = operation;
+    setActiveOperation(operation);
+    return true;
+  };
+
+  const finishOperation = (operation: ModelOperation) => {
+    if (activeOperationRef.current !== operation) return;
+    activeOperationRef.current = undefined;
+    setActiveOperation(undefined);
+  };
 
   const applySettingsToForm = useCallback(
     (next: ModelSettings) => {
@@ -192,7 +208,7 @@ export default function ModelSettingsPage() {
   };
 
   const handleLoadModels = async () => {
-    setLoadingModels(true);
+    if (!beginOperation("models")) return;
     try {
       await form.validateFields(["provider", "baseUrl"]);
       const values = form.getFieldsValue();
@@ -214,12 +230,12 @@ export default function ModelSettingsPage() {
         error instanceof Error ? error.message : "模型服务暂不可用";
       message.error(`读取模型列表失败：${reason}`);
     } finally {
-      setLoadingModels(false);
+      finishOperation("models");
     }
   };
 
   const handleTest = async () => {
-    setTesting(true);
+    if (!beginOperation("test")) return;
     setTestResult(undefined);
     setSettings((current) => ({
       ...current,
@@ -256,12 +272,12 @@ export default function ModelSettingsPage() {
       }));
       message.error(`模型连接测试失败：${reason}`);
     } finally {
-      setTesting(false);
+      finishOperation("test");
     }
   };
 
   const handleSave = async () => {
-    setSaving(true);
+    if (!beginOperation("save")) return;
     try {
       const input = await currentInput();
       const next = await saveModelSettings(input);
@@ -274,12 +290,12 @@ export default function ModelSettingsPage() {
         error instanceof Error ? error.message : "本地API暂不可用";
       message.error(`模型设置保存失败：${reason}`);
     } finally {
-      setSaving(false);
+      finishOperation("save");
     }
   };
 
   const handleClearApiKey = async () => {
-    setSaving(true);
+    if (!beginOperation("clear-key")) return;
     try {
       const input = await currentInput();
       const next = await saveModelSettings({
@@ -296,7 +312,7 @@ export default function ModelSettingsPage() {
         error instanceof Error ? error.message : "本地API暂不可用";
       message.error(`清除 API Key 失败：${reason}`);
     } finally {
-      setSaving(false);
+      finishOperation("clear-key");
     }
   };
 
@@ -330,6 +346,7 @@ export default function ModelSettingsPage() {
             <Form
               form={form}
               layout="vertical"
+              disabled={loading || operationBusy}
               requiredMark="optional"
               initialValues={{
                 provider: "mock",
@@ -422,8 +439,8 @@ export default function ModelSettingsPage() {
               <div className="model-list-action">
                 <Button
                   icon={<ReloadOutlined />}
-                  loading={loadingModels}
-                  disabled={provider !== "ollama"}
+                  loading={activeOperation === "models"}
+                  disabled={operationBusy || provider !== "ollama"}
                   onClick={() => void handleLoadModels()}
                 >
                   读取本地模型
@@ -459,7 +476,8 @@ export default function ModelSettingsPage() {
                 <Space wrap>
                   <Button
                     icon={<ApiOutlined />}
-                    loading={testing}
+                    loading={activeOperation === "test"}
+                    disabled={operationBusy}
                     onClick={() => void handleTest()}
                   >
                     测试连接
@@ -467,7 +485,8 @@ export default function ModelSettingsPage() {
                   <Button
                     type="primary"
                     icon={<SaveOutlined />}
-                    loading={saving}
+                    loading={activeOperation === "save"}
+                    disabled={operationBusy}
                     onClick={() => void handleSave()}
                   >
                     保存并应用
@@ -478,13 +497,22 @@ export default function ModelSettingsPage() {
                   description="只清除服务端保存的模型密钥，其他模型设置保持不变。"
                   okText="确认清除"
                   cancelText="取消"
-                  disabled={!settings.apiKeyConfigured || provider === "mock"}
+                  disabled={
+                    operationBusy ||
+                    !settings.apiKeyConfigured ||
+                    provider === "mock"
+                  }
                   onConfirm={() => void handleClearApiKey()}
                 >
                   <Button
                     danger
                     icon={<DeleteOutlined />}
-                    disabled={!settings.apiKeyConfigured || provider === "mock"}
+                    loading={activeOperation === "clear-key"}
+                    disabled={
+                      operationBusy ||
+                      !settings.apiKeyConfigured ||
+                      provider === "mock"
+                    }
                   >
                     清除密钥
                   </Button>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import io
 import zipfile
 from pathlib import Path
@@ -21,6 +22,17 @@ def isolated_upload_app(tmp_path: Path):
         seed=True,
     )
     with TestClient(app) as client:
+        login = client.post(
+            "/api/auth/login",
+            json={
+                "username": "planner",
+                "password": os.environ["INTENT_BAO_USER_PASSWORD"],
+            },
+        )
+        assert login.status_code == 200, login.text
+        client.headers.update(
+            {"Authorization": f"Bearer {login.json()['access_token']}"}
+        )
         package_response = client.post(
             "/api/meeting-packages",
             json={

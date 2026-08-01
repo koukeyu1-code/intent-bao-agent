@@ -10,14 +10,39 @@ import type {
   ModelSettingsInput,
   MvpDataset,
 } from "./types";
+import type {
+  PlatformCascadeSelection,
+  PlatformTaxonomy,
+} from "./platform-taxonomy";
 import {
   assertConfirmedStage,
   buildIntentConfirmPayload,
 } from "./intent-view-models";
+import { mockCompetitiveIntents } from "./mock-data";
+import {
+  bearerHeaders,
+  clearAccessToken,
+  resolveAuthApiBase,
+} from "./auth-api";
 
-export const API_BASE =
-  process.env.NEXT_PUBLIC_INTENT_BAO_API_BASE ??
-  "http://127.0.0.1:8000/api";
+export const API_BASE = resolveAuthApiBase();
+
+export class ApiClientError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiClientError";
+    this.status = status;
+  }
+}
+
+const notifyUnauthorized = (status: number) => {
+  if (status === 401 && typeof window !== "undefined") {
+    clearAccessToken();
+    window.dispatchEvent(new Event("intent-bao:auth-expired"));
+  }
+};
 
 const functionIdByName: Record<string, string> = {
   产品: "function-product",
@@ -47,17 +72,23 @@ const request = async <T>(
     const response = await fetch(`${API_BASE}${path}`, {
       ...init,
       cache: "no-store",
+      credentials: "omit",
       headers: {
         "Content-Type": "application/json",
+        ...bearerHeaders(),
         ...(init?.headers ?? {}),
       },
       signal: controller.signal,
     });
     if (!response.ok) {
+      notifyUnauthorized(response.status);
       const errorBody = (await response.json().catch(() => null)) as
         | { detail?: string }
         | null;
-      throw new Error(errorBody?.detail ?? `API ${response.status}`);
+      throw new ApiClientError(
+        errorBody?.detail ?? `API ${response.status}`,
+        response.status,
+      );
     }
     return (await response.json()) as T;
   } finally {
@@ -237,6 +268,15 @@ interface FormalStatusApiItem {
   customer: EntityRef;
   technology: EntityRef;
   generic_platform?: EntityRef | null;
+  platform_path?: {
+    mappingStatus?: "mapped" | "legacy_pending" | "unmapped";
+    platformVariantId?: string | null;
+    path?: {
+      technology?: { id?: string; name?: string } | null;
+      level2?: { valueId?: string; value?: string } | null;
+      level3?: { valueId?: string; value?: string } | null;
+    };
+  } | null;
   customer_project?: EntityRef | null;
   function: EntityRef;
   attitude: { level: 1 | 2 | 3 | 4 | 5 | null; label: string };
@@ -270,7 +310,20 @@ const normalizeFormalStatus = (
   statusKey: item.status_key,
   customer: item.customer.display_name ?? item.customer.name,
   technology: item.technology.name,
+  technologyId:
+    item.platform_path?.path?.technology?.id ?? item.technology.id,
   platform: item.generic_platform?.name ?? "平台待确认",
+  ...(item.platform_path?.path?.level2?.valueId
+    ? { level2ValueId: item.platform_path.path.level2.valueId }
+    : {}),
+  ...(item.platform_path?.path?.level3?.valueId
+    ? { level3ValueId: item.platform_path.path.level3.valueId }
+    : {}),
+  ...(item.platform_path?.platformVariantId
+    ? { platformLeafId: item.platform_path.platformVariantId }
+    : {}),
+  platformMappingStatus:
+    item.platform_path?.mappingStatus ?? "legacy_pending",
   customerProject: item.customer_project?.name ?? "客户项目待确认",
   functionName: item.function.name,
   attitude: item.attitude.level,
@@ -289,7 +342,7 @@ const normalizeFormalStatus = (
 });
 
 export const loadBootstrapDataset = async (): Promise<MvpDataset> => {
-  const [data, formalResponse] = await Promise.all([
+  const [data, formalResponse, platformTaxonomy] = await Promise.all([
     request<
       Partial<MvpDataset> & {
         meeting_packages?: { items?: MeetingPackage[] };
@@ -299,14 +352,18 @@ export const loadBootstrapDataset = async (): Promise<MvpDataset> => {
     request<{ items: FormalStatusApiItem[]; total: number }>(
       "/formal-intent-statuses?current_only=true",
     ),
+    loadPlatformTaxonomy(),
   ]);
   const normalized: Partial<MvpDataset> = {
     ...data,
     meetings: data.meetings ?? data.meeting_packages?.items,
     dictionaries: data.dictionaries ?? data.master_data,
+    competitiveIntents:
+      data.competitiveIntents ?? mockCompetitiveIntents,
     formalIntents: formalResponse.items
       .filter((item) => item.is_current)
       .map(normalizeFormalStatus),
+    platformTaxonomy,
   };
   if (Array.isArray(data.intents) && Array.isArray(data.evidence)) {
     const meetingByEvidence = new Map(
@@ -322,9 +379,11 @@ export const loadBootstrapDataset = async (): Promise<MvpDataset> => {
     !Array.isArray(normalized.speakers) ||
     !Array.isArray(normalized.intents) ||
     !Array.isArray(normalized.formalIntents) ||
+    !Array.isArray(normalized.competitiveIntents) ||
     !Array.isArray(normalized.evidence) ||
     !Array.isArray(normalized.history) ||
-    !normalized.dictionaries
+    !normalized.dictionaries ||
+    !normalized.platformTaxonomy
   ) {
     throw new Error("API数据结构不完整");
   }
@@ -376,7 +435,7 @@ export const updateIntentStatus = async (
 export const updateIntentSuggestion = async (
   intent: IntentObservation,
 ) =>
-  request(`/intent-observations/${intent.id}`, {
+  request<{ version: number }>(`/intent-observations/${intent.id}`, {
     method: "PATCH",
     body: JSON.stringify({
       version: intent.version ?? 1,
@@ -389,6 +448,48 @@ export const updateIntentSuggestion = async (
           : [],
       uncertainty_reason:
         intent.attitude === null ? "人工修改为未知，等待补充证据" : null,
+    }),
+  });
+
+export const updateIntentReviewDraft = async (
+  intent: IntentObservation,
+  selection?: PlatformCascadeSelection & {
+    level2NewValue?: string;
+    level3NewValue?: string;
+  },
+) =>
+  request<{
+    observation: { version: number };
+    platform_draft: { id: string; status: "pending" | "confirmed" } | null;
+    message: string;
+  }>(`/intent-observations/${intent.id}/review-draft`, {
+    method: "PUT",
+    body: JSON.stringify({
+      version: intent.version ?? 1,
+      suggested_attitude: intent.attitude,
+      suggested_adoption_stage: intent.adoptionStage,
+      support_reason: intent.supportReason,
+      bottlenecks:
+        intent.blocker && intent.blocker !== "暂无明确卡点"
+          ? [intent.blocker]
+          : [],
+      uncertainty_reason:
+        intent.attitude === null ? "人工修改为未知，等待补充证据" : null,
+      ...(selection
+        ? {
+            platform: {
+              technology_id: selection.technologyId,
+              ...(selection.level2NewValue
+                ? { level2_new_value: selection.level2NewValue }
+                : { level2_value_id: selection.level2ValueId }),
+              ...(selection.level3NewValue
+                ? { level3_new_value: selection.level3NewValue }
+                : selection.level3ValueId
+                  ? { level3_value_id: selection.level3ValueId }
+                  : {}),
+            },
+          }
+        : {}),
     }),
   });
 
@@ -476,10 +577,13 @@ export const uploadMeetingMaterial = async (
         method: "POST",
         body: formData,
         cache: "no-store",
+        credentials: "omit",
+        headers: bearerHeaders(),
         signal: controller.signal,
       },
     );
     if (!response.ok) {
+      notifyUnauthorized(response.status);
       const errorBody = (await response.json().catch(() => null)) as
         | { detail?: string }
         | null;
@@ -508,3 +612,125 @@ export const analyzeMeetingPackage = async (
     },
     180_000,
   );
+
+export interface TaxonomyImportIssue {
+  code: string;
+  message: string;
+  sheet?: string;
+  row?: number;
+  column?: string;
+  value?: string;
+}
+
+export interface TaxonomyImportPreview {
+  valid: boolean;
+  file: { name: string; sizeBytes: number; sha256: string };
+  preview?: {
+    sheetName: string;
+    headerRow: number;
+    counts: {
+      technologies: number;
+      level2Values: number;
+      level3Values: number;
+      platforms: number;
+    };
+    technologies: Array<{
+      name: string;
+      level2?: { name: string; values: Array<{ name: string }> } | null;
+      level3?: { name: string; values: Array<{ name: string }> } | null;
+      platforms: Array<{ name: string }>;
+    }>;
+  } | null;
+  diff?: Record<string, unknown> | null;
+  errors: TaxonomyImportIssue[];
+  warnings: TaxonomyImportIssue[];
+  previewToken?: string;
+}
+
+interface TaxonomyImportPreviewApi
+  extends Omit<TaxonomyImportPreview, "previewToken"> {
+  preview_token?: string;
+}
+
+export const loadPlatformTaxonomy = async (): Promise<PlatformTaxonomy> =>
+  request<PlatformTaxonomy>("/platform-taxonomy", undefined, 10_000);
+
+export const preflightTaxonomyExcel = async (
+  file: File,
+): Promise<TaxonomyImportPreview> => {
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(`${API_BASE}/taxonomy/import/preflight`, {
+    method: "POST",
+    body: formData,
+    cache: "no-store",
+    credentials: "omit",
+    headers: bearerHeaders(),
+  });
+  const body = (await response.json().catch(() => null)) as
+    | TaxonomyImportPreviewApi
+    | { detail?: string }
+    | null;
+  if (!response.ok) {
+    notifyUnauthorized(response.status);
+    throw new Error(
+      body && "detail" in body && typeof body.detail === "string"
+        ? body.detail
+        : `Excel预检失败（API ${response.status}）`,
+    );
+  }
+  const item = body as TaxonomyImportPreviewApi;
+  return { ...item, previewToken: item.preview_token };
+};
+
+export const commitTaxonomyImport = async (
+  previewToken: string,
+  fileSha256: string,
+) =>
+  request<{
+    message: string;
+    idempotent: boolean;
+    result: Record<string, unknown>;
+    taxonomy: PlatformTaxonomy;
+  }>(
+    "/taxonomy/import/commit",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        preview_token: previewToken,
+        file_sha256: fileSha256,
+      }),
+    },
+    30_000,
+  );
+
+export const saveObservationPlatformDraft = async (
+  observationId: string,
+  version: number,
+  selection: PlatformCascadeSelection & {
+    level2NewValue?: string;
+    level3NewValue?: string;
+  },
+) =>
+  request<{
+    observation: { version: number };
+    platform_draft: {
+      id: string;
+      status: "pending" | "confirmed";
+    };
+    message: string;
+  }>(`/intent-observations/${observationId}/platform-draft`, {
+    method: "POST",
+    body: JSON.stringify({
+      version,
+      technology_id: selection.technologyId,
+      ...(selection.level2NewValue
+        ? { level2_new_value: selection.level2NewValue }
+        : { level2_value_id: selection.level2ValueId }),
+      ...(selection.level3NewValue
+        ? { level3_new_value: selection.level3NewValue }
+        : selection.level3ValueId
+          ? { level3_value_id: selection.level3ValueId }
+          : {}),
+    }),
+  });

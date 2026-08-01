@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app import models as m
+from app.auth import AppUser, ROLE_VIEWER
 from app.main import create_app
 
 
@@ -18,6 +20,17 @@ def client(tmp_path: Path):
         seed=True,
     )
     with TestClient(app) as test_client:
+        login = test_client.post(
+            "/api/auth/login",
+            json={
+                "username": "planner",
+                "password": os.environ["INTENT_BAO_USER_PASSWORD"],
+            },
+        )
+        assert login.status_code == 200, login.text
+        test_client.headers.update(
+            {"Authorization": f"Bearer {login.json()['access_token']}"}
+        )
         yield test_client
 
 
@@ -91,6 +104,24 @@ def test_health_bootstrap_and_master_data(client: TestClient) -> None:
     assert body["evidence"]
     assert body["history"]
     assert body["dictionaries"]["technologies"]
+    platform_27_5k = next(
+        item
+        for item in body["dictionaries"]["platforms"]
+        if item["id"] == "platform-27-5k"
+    )
+    project_a = next(
+        item
+        for item in body["dictionaries"]["projects"]
+        if item["id"] == "customer-project-a-pro"
+    )
+    product_function = next(
+        item
+        for item in body["dictionaries"]["functions"]
+        if item["id"] == "function-product"
+    )
+    assert "tech-mini-led" in platform_27_5k["parentIds"]
+    assert project_a["parentIds"] == ["customer-a"]
+    assert "customer-a" in product_function["parentIds"]
     product_history = [
         item
         for item in body["history"]
@@ -219,7 +250,7 @@ def test_create_upload_analyze_validate_and_confirm_flow(
     formal = confirmed_intent.json()["formal_status"]
     assert formal["attitude"]["level"] == 4
     assert formal["evidence_count"] == 1
-    assert formal["confirmed_by"] == "产品规划负责人"
+    assert formal["confirmed_by"] == "产品规划负责人（planner）"
 
     returned_target = next(
         item
@@ -339,6 +370,51 @@ def test_dashboard_history_evidence_and_unknown_guard(client: TestClient) -> Non
         2,
         5,
     }
+
+
+def test_complete_speaker_identity_rejects_unreviewed_empty_fields(
+    client: TestClient,
+) -> None:
+    speaker = client.get("/api/speakers/speaker-b-product").json()
+    response = client.patch(
+        f"/api/speakers/{speaker['id']}/confirm",
+        json={
+            "version": speaker["version"],
+            "display_name": "   ",
+            "role": None,
+            "organization": None,
+            "function_id": "function-product",
+            "identity_granularity": "完整",
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    assert "完整身份仍缺少" in str(response.json()["detail"])
+    refreshed = client.get(f"/api/speakers/{speaker['id']}").json()
+    assert refreshed["version"] == speaker["version"]
+    assert refreshed["status"] == speaker["status"]
+
+
+def test_viewer_can_read_evidence_excerpt_but_not_download_source(
+    client: TestClient,
+) -> None:
+    with client.app.state.database.session() as session:
+        planner = session.scalar(
+            select(AppUser).where(AppUser.username == "planner")
+        )
+        assert planner is not None
+        planner.role = ROLE_VIEWER
+        session.commit()
+
+    excerpt = client.get("/api/evidence/evidence-a-product/content")
+    assert excerpt.status_code == 200, excerpt.text
+    assert excerpt.json()["excerpt"]
+
+    source = client.get(
+        "/api/evidence/evidence-a-product/content", params={"source": True}
+    )
+    assert source.status_code == 403, source.text
+    assert source.json() == {"detail": "只读账户无权下载原始会议材料"}
 
 
 def test_optimistic_lock_and_sensitive_data_mock_guard(
@@ -712,7 +788,7 @@ def test_confirmation_rules_ai_snapshot_audit_and_adoption_stage(
             assert "evidence_id" in snapshot
             assert "model_metadata" in snapshot
             assert "ai_original" in snapshot
-        assert confirm_record.actor == "产品规划负责人"
+        assert confirm_record.actor == "产品规划负责人（planner）"
         assert confirm_record.before_snapshot["reviewed_observation"][
             "evidence_id"
         ]

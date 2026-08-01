@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import secrets
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -21,6 +24,18 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from . import models as m
+from .auth import (
+    ROLE_ADMIN,
+    ROLE_USER,
+    AppUser,
+    CurrentUser,
+    audit_actor,
+    create_auth_router,
+    initial_credentials_directory,
+    require_roles,
+    seed_default_users_from_env,
+    write_generated_credentials,
+)
 from .config import Settings
 from .database import Database, get_db
 from .domain import ATTITUDE_LABELS
@@ -54,8 +69,11 @@ from .schemas import (
     ModelListResponse,
     ModelSettingsResponse,
     ModelSettingsUpdateRequest,
+    ObservationReviewDraftRequest,
     ObservationUpdateRequest,
+    PlatformDraftRequest,
     SpeakerConfirmRequest,
+    TaxonomyImportCommitRequest,
 )
 from .seed import seed_demo_data
 from .services import (
@@ -67,9 +85,25 @@ from .services import (
     run_analysis,
     save_uploaded_file,
 )
+from .taxonomy_excel import (
+    DEFAULT_MAX_XLSX_BYTES,
+    preflight_taxonomy_xlsx,
+)
+from .taxonomy_service import (
+    TaxonomyServiceError,
+    catalogue,
+    commit_import,
+    import_diff,
+    propose_observation_platform,
+)
 
 
 DbSession = Annotated[Session, Depends(get_db)]
+EditorUser = Annotated[
+    AppUser, Depends(require_roles(ROLE_ADMIN, ROLE_USER))
+]
+AdminUser = Annotated[AppUser, Depends(require_roles(ROLE_ADMIN))]
+logger = logging.getLogger(__name__)
 
 
 def _get_or_404(session: Session, model, item_id: str, label: str):
@@ -77,6 +111,64 @@ def _get_or_404(session: Session, model, item_id: str, label: str):
     if item is None:
         raise HTTPException(status_code=404, detail=f"{label}不存在")
     return item
+
+
+def _platform_taxonomy_response(session: Session) -> dict:
+    """Adapt the backend catalogue to the one shared frontend cascade shape."""
+
+    raw = catalogue(session)
+    revision = session.scalar(
+        select(func.count()).select_from(m.TaxonomyImportBatch)
+    ) or 0
+    technologies: list[dict] = []
+    for technology in raw["technologies"]:
+        levels = []
+        for key in ("level2", "level3"):
+            level = technology.get(key)
+            if level is None:
+                continue
+            levels.append(
+                {
+                    "id": level["id"],
+                    "level": level["level"],
+                    "name": level["name"],
+                    "values": [
+                        {
+                            "id": value["id"],
+                            "name": value["value"],
+                            "status": value["status"],
+                            "sortOrder": value["sortOrder"],
+                        }
+                        for value in level["values"]
+                    ],
+                }
+            )
+        technologies.append(
+            {
+                "id": technology["id"],
+                "name": technology["name"],
+                "code": technology["code"],
+                "status": "active",
+                "levels": levels,
+                "leaves": [
+                    {
+                        "id": item["id"],
+                        "genericPlatformId": item["genericPlatformId"],
+                        "displayName": item["name"],
+                        "level2ValueId": item["level2ValueId"],
+                        "level3ValueId": item["level3ValueId"],
+                        "status": "active",
+                        "mappingStatus": item["mappingStatus"],
+                    }
+                    for item in technology["platforms"]
+                ],
+            }
+        )
+    return {
+        "revision": revision,
+        "technologies": technologies,
+        "legacyPlatforms": raw["legacyPlatforms"],
+    }
 
 
 def create_app(
@@ -89,15 +181,30 @@ def create_app(
     model_settings = ModelSettingsStore(settings.data_dir)
     database = Database(settings.database_url)
     database.create_all()
-    if seed:
-        with database.session() as session:
+    with database.session() as session:
+        if seed:
             seed_demo_data(session, settings)
+        seeded_users = seed_default_users_from_env(session, commit=False)
+        try:
+            generated_credentials_dir = write_generated_credentials(
+                settings.data_dir,
+                seeded_users,
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+    if generated_credentials_dir is not None:
+        logger.warning(
+            "已生成本地初始登录凭据。请仅在本机打开：%s",
+            generated_credentials_dir,
+        )
 
     app = FastAPI(
         title="意向宝智能体 API",
         summary="把客户会议材料整理成可追溯、可确认的产品规划意向地图",
         description=(
-            "首版为本地单用户模式，默认使用清晰标识的模拟数据和 mock 分析器。"
+            "首版为本地多角色权限模式，默认使用清晰标识的模拟数据和 mock 分析器。"
             "真实模型接口已预留，但未启用，也未宣称达到85%准确率。"
         ),
         version="0.1.0",
@@ -108,6 +215,11 @@ def create_app(
     app.state.settings = settings
     app.state.model_settings = model_settings
     app.state.database = database
+    app.state.initial_credentials_directory = initial_credentials_directory(
+        settings.data_dir
+    )
+    app.state.taxonomy_previews = {}
+    app.include_router(create_auth_router())
 
     app.add_middleware(
         CORSMiddleware,
@@ -117,8 +229,7 @@ def create_app(
             "http://localhost:5173",
             "http://127.0.0.1:5173",
         ],
-        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -130,6 +241,15 @@ def create_app(
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.message},
+        )
+
+    @app.exception_handler(TaxonomyServiceError)
+    async def taxonomy_error_handler(
+        _request: Request, exc: TaxonomyServiceError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": exc.message, "code": exc.code},
         )
 
     @app.exception_handler(RequestValidationError)
@@ -159,7 +279,7 @@ def create_app(
             "version": app.version,
             "model_adapter": active_model.provider,
             "model_name": active_model.model_name,
-            "data_scope": "本地单用户",
+            "data_scope": "本地多角色权限",
             "time": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -188,7 +308,7 @@ def create_app(
         tags=["模型设置"],
         response_model=ModelSettingsResponse,
     )
-    def get_model_settings() -> dict:
+    def get_model_settings(_user: AdminUser) -> dict:
         return model_settings.public_dict()
 
     @app.put(
@@ -196,7 +316,9 @@ def create_app(
         tags=["模型设置"],
         response_model=ModelSettingsResponse,
     )
-    def update_model_settings(payload: ModelSettingsUpdateRequest) -> dict:
+    def update_model_settings(
+        payload: ModelSettingsUpdateRequest, _user: AdminUser
+    ) -> dict:
         try:
             updated = model_settings.update(
                 provider=payload.provider,
@@ -220,6 +342,7 @@ def create_app(
     )
     def test_model_connection(
         payload: ModelConnectionRequest,
+        _user: AdminUser,
     ) -> dict:
         adapter = adapter_from_probe(payload)
         if adapter.name == "mock":
@@ -239,7 +362,9 @@ def create_app(
         tags=["模型设置"],
         response_model=ModelListResponse,
     )
-    def list_model_options(payload: ModelConnectionRequest) -> dict:
+    def list_model_options(
+        payload: ModelConnectionRequest, _user: AdminUser
+    ) -> dict:
         adapter = adapter_from_probe(payload)
         if adapter.name == "mock":
             return {
@@ -258,7 +383,7 @@ def create_app(
         }
 
     @app.get("/api/bootstrap", tags=["系统"])
-    def bootstrap(session: DbSession) -> dict:
+    def bootstrap(session: DbSession, _user: CurrentUser) -> dict:
         packages = session.scalars(
             select(m.MeetingPackage)
             .order_by(m.MeetingPackage.meeting_date.desc())
@@ -269,7 +394,7 @@ def create_app(
             "project": {
                 "id": "project-mnt",
                 "name": "MNT客户意向地图试点",
-                "mode": "本地单用户",
+                "mode": "本地多角色权限",
                 "data_scope": "模拟数据",
             },
             "dashboard": dashboard_summary(session),
@@ -285,7 +410,7 @@ def create_app(
         }
 
     @app.get("/api/master-data", tags=["基础字典"])
-    def master_data(session: DbSession) -> dict:
+    def master_data(session: DbSession, _user: CurrentUser) -> dict:
         data = public_master_data(session)
         return {
             **data,
@@ -293,9 +418,91 @@ def create_app(
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
+    @app.get("/api/platform-taxonomy", tags=["数据字典"])
+    def platform_taxonomy(
+        session: DbSession, _user: CurrentUser
+    ) -> dict:
+        return _platform_taxonomy_response(session)
+
+    @app.post("/api/taxonomy/import/preflight", tags=["数据字典"])
+    async def preflight_taxonomy_import(
+        request: Request,
+        session: DbSession,
+        _admin: AdminUser,
+        file: Annotated[UploadFile, File(...)],
+    ) -> dict:
+        content = await file.read(DEFAULT_MAX_XLSX_BYTES + 1)
+        result = preflight_taxonomy_xlsx(
+            content,
+            filename=file.filename or "upload.xlsx",
+        )
+        response = dict(result)
+        response["diff"] = None
+        if not result["valid"] or result["preview"] is None:
+            return response
+
+        try:
+            diff = import_diff(session, result["preview"])
+        except TaxonomyServiceError as exc:
+            raise DomainError(422, f"{exc.code}：{exc.message}") from exc
+
+        now = time.monotonic()
+        previews: dict = request.app.state.taxonomy_previews
+        for key, item in list(previews.items()):
+            if now - item["created_at"] > 30 * 60:
+                previews.pop(key, None)
+        token = secrets.token_urlsafe(32)
+        previews[token] = {
+            "created_at": now,
+            "file": dict(result["file"]),
+            "preview": result["preview"],
+            "diff": diff,
+        }
+        return {
+            **response,
+            "diff": diff,
+            "preview_token": token,
+        }
+
+    @app.post("/api/taxonomy/import/commit", tags=["数据字典"])
+    def commit_taxonomy_import(
+        payload: TaxonomyImportCommitRequest,
+        request: Request,
+        session: DbSession,
+        admin: AdminUser,
+    ) -> dict:
+        preview = request.app.state.taxonomy_previews.get(
+            payload.preview_token
+        )
+        if preview is None or time.monotonic() - preview["created_at"] > 30 * 60:
+            raise DomainError(410, "Excel预检已过期，请重新上传预检")
+        if preview["file"]["sha256"] != payload.file_sha256:
+            raise DomainError(409, "提交文件与预检文件不一致")
+        try:
+            result = commit_import(
+                session,
+                preview["preview"],
+                file_name=preview["file"]["name"],
+                file_sha256=preview["file"]["sha256"],
+                actor=audit_actor(admin),
+            )
+        except TaxonomyServiceError as exc:
+            raise DomainError(422, f"{exc.code}：{exc.message}") from exc
+        return {
+            "message": (
+                "相同版本已发布，无需重复写入。"
+                if result["idempotent"]
+                else "数据字典已按安全合并方式发布。"
+            ),
+            "idempotent": result["idempotent"],
+            "result": result,
+            "taxonomy": _platform_taxonomy_response(session),
+        }
+
     @app.get("/api/meeting-packages", tags=["会议资料包"])
     def list_meeting_packages(
         session: DbSession,
+        _user: CurrentUser,
         status: str | None = None,
         customer_id: str | None = None,
         q: str | None = None,
@@ -336,7 +543,9 @@ def create_app(
 
     @app.post("/api/meeting-packages", tags=["会议资料包"], status_code=201)
     def create_meeting_package(
-        payload: MeetingPackageCreate, session: DbSession
+        payload: MeetingPackageCreate,
+        session: DbSession,
+        _user: EditorUser,
     ) -> dict:
         _get_or_404(session, m.Project, payload.project_id, "项目")
         _get_or_404(session, m.Customer, payload.customer_id, "客户")
@@ -375,13 +584,18 @@ def create_app(
         return public_package(session, item, include_detail=True)
 
     @app.get("/api/meeting-packages/{package_id}", tags=["会议资料包"])
-    def get_meeting_package(package_id: str, session: DbSession) -> dict:
+    def get_meeting_package(
+        package_id: str, session: DbSession, _user: CurrentUser
+    ) -> dict:
         item = _get_or_404(session, m.MeetingPackage, package_id, "会议资料包")
         return public_package(session, item, include_detail=True)
 
     @app.patch("/api/meeting-packages/{package_id}", tags=["会议资料包"])
     def update_meeting_package(
-        package_id: str, payload: MeetingPackageUpdate, session: DbSession
+        package_id: str,
+        payload: MeetingPackageUpdate,
+        session: DbSession,
+        _user: EditorUser,
     ) -> dict:
         item = _get_or_404(session, m.MeetingPackage, package_id, "会议资料包")
         if item.version != payload.version:
@@ -405,6 +619,7 @@ def create_app(
     async def upload_material(
         package_id: str,
         session: DbSession,
+        _user: EditorUser,
         file: Annotated[UploadFile, File(...)],
         material_type: Annotated[str | None, Form()] = None,
     ) -> dict:
@@ -430,7 +645,10 @@ def create_app(
         status_code=202,
     )
     def analyze_meeting_package(
-        package_id: str, payload: AnalyzeRequest, session: DbSession
+        package_id: str,
+        payload: AnalyzeRequest,
+        session: DbSession,
+        _user: EditorUser,
     ) -> dict:
         package = _get_or_404(
             session, m.MeetingPackage, package_id, "会议资料包"
@@ -495,7 +713,9 @@ def create_app(
     @app.get(
         "/api/meeting-packages/{package_id}/tasks", tags=["处理任务"]
     )
-    def list_package_tasks(package_id: str, session: DbSession) -> dict:
+    def list_package_tasks(
+        package_id: str, session: DbSession, _user: CurrentUser
+    ) -> dict:
         _get_or_404(session, m.MeetingPackage, package_id, "会议资料包")
         items = session.scalars(
             select(m.ProcessingTask)
@@ -509,6 +729,7 @@ def create_app(
     @app.get("/api/speakers", tags=["说话人校验"])
     def list_speakers(
         session: DbSession,
+        _user: CurrentUser,
         package_id: str | None = None,
         status: str | None = None,
     ) -> dict:
@@ -526,22 +747,29 @@ def create_app(
         }
 
     @app.get("/api/speakers/{speaker_id}", tags=["说话人校验"])
-    def get_speaker(speaker_id: str, session: DbSession) -> dict:
+    def get_speaker(
+        speaker_id: str, session: DbSession, _user: CurrentUser
+    ) -> dict:
         item = _get_or_404(session, m.SpeakerCluster, speaker_id, "说话人")
         return public_speaker(session, item)
 
     @app.patch("/api/speakers/{speaker_id}/confirm", tags=["说话人校验"])
     @app.post("/api/speakers/{speaker_id}/confirm", tags=["说话人校验"])
     def confirm_speaker_identity(
-        speaker_id: str, payload: SpeakerConfirmRequest, session: DbSession
+        speaker_id: str,
+        payload: SpeakerConfirmRequest,
+        session: DbSession,
+        user: EditorUser,
     ) -> dict:
         item = _get_or_404(session, m.SpeakerCluster, speaker_id, "说话人")
-        confirmed = confirm_speaker(session, item, payload)
+        trusted_payload = payload.model_copy(update={"actor": audit_actor(user)})
+        confirmed = confirm_speaker(session, item, trusted_payload)
         return public_speaker(session, confirmed)
 
     @app.get("/api/intent-observations", tags=["意向确认"])
     def list_intent_observations(
         session: DbSession,
+        _user: CurrentUser,
         package_id: str | None = None,
         status: str | None = None,
         customer_id: str | None = None,
@@ -579,7 +807,7 @@ def create_app(
 
     @app.get("/api/intent-observations/{observation_id}", tags=["意向确认"])
     def get_intent_observation(
-        observation_id: str, session: DbSession
+        observation_id: str, session: DbSession, _user: CurrentUser
     ) -> dict:
         item = _get_or_404(
             session, m.RawIntentObservation, observation_id, "原始意向观察"
@@ -591,6 +819,7 @@ def create_app(
         observation_id: str,
         payload: ObservationUpdateRequest,
         session: DbSession,
+        user: EditorUser,
     ) -> dict:
         item = _get_or_404(
             session, m.RawIntentObservation, observation_id, "原始意向观察"
@@ -633,13 +862,181 @@ def create_app(
                 action="人工整理",
                 before_snapshot=before,
                 after_snapshot=observation_review_snapshot(item),
-                actor="本地产品规划人员",
+                actor=audit_actor(user),
                 note="修改AI草稿，尚未发布正式状态",
             )
         )
         session.commit()
         session.refresh(item)
         return public_observation(session, item)
+
+    @app.put(
+        "/api/intent-observations/{observation_id}/review-draft",
+        tags=["意向确认"],
+    )
+    def update_intent_review_draft(
+        observation_id: str,
+        payload: ObservationReviewDraftRequest,
+        session: DbSession,
+        user: EditorUser,
+    ) -> dict:
+        """Save reviewed intent fields and its platform path atomically."""
+
+        item = _get_or_404(
+            session, m.RawIntentObservation, observation_id, "原始意向观察"
+        )
+        if item.version != payload.version:
+            raise HTTPException(
+                status_code=409,
+                detail=f"意向观察已更新，请刷新后重试（当前版本{item.version}）",
+            )
+        if payload.function_id:
+            _get_or_404(
+                session, m.CustomerFunction, payload.function_id, "客户职能"
+            )
+
+        ensure_ai_snapshot(item)
+        before = observation_review_snapshot(item)
+        changes = payload.model_dump(
+            exclude_unset=True,
+            exclude={"version", "platform"},
+        )
+        for field, value in changes.items():
+            setattr(item, field, value)
+        if (
+            "status" not in changes
+            and before["status"] in {"已确认", "无法判断", "已被后续版本取代"}
+        ):
+            item.status = "待确认"
+
+        draft = None
+        if payload.platform is not None:
+            selection = payload.platform
+            try:
+                draft = propose_observation_platform(
+                    session,
+                    observation_id=observation_id,
+                    technology_id=selection.technology_id,
+                    level2_value=(
+                        selection.level2_value_id
+                        or selection.level2_new_value
+                        or ""
+                    ),
+                    level3_value=(
+                        selection.level3_value_id
+                        or selection.level3_new_value
+                        or ""
+                    ),
+                    level2_value_is_id=bool(selection.level2_value_id),
+                    level3_value_is_id=bool(selection.level3_value_id),
+                    actor=audit_actor(user),
+                )
+            except TaxonomyServiceError as exc:
+                session.rollback()
+                raise DomainError(422, f"{exc.code}：{exc.message}") from exc
+
+        item.version += 1
+        package = session.get(m.MeetingPackage, item.package_id)
+        if package:
+            if item.status == "退回补充":
+                package.status = "待补资料／待标注"
+            elif item.status in {"AI草稿", "待确认"}:
+                package.status = "待意向确认"
+            package.confirmed_by = None
+            package.confirmed_at = None
+            package.version += 1
+        after = observation_review_snapshot(item)
+        if draft is not None:
+            after = {**after, "platform_draft": draft}
+        session.add(
+            m.ConfirmationRecord(
+                target_type="raw_intent_observation",
+                target_id=item.id,
+                action="人工整理（含平台路径）" if draft else "人工整理",
+                before_snapshot=before,
+                after_snapshot=after,
+                actor=audit_actor(user),
+                note=(
+                    "意向字段与平台路径在同一事务中保存；新增平台内容随正式确认激活"
+                    if draft
+                    else "修改AI草稿，尚未发布正式状态"
+                ),
+            )
+        )
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        session.refresh(item)
+        return {
+            "observation": public_observation(session, item),
+            "platform_draft": draft,
+            "message": (
+                "意向字段与平台路径已原子保存。"
+                if draft
+                else "意向字段已保存。"
+            ),
+        }
+
+    @app.post(
+        "/api/intent-observations/{observation_id}/platform-draft",
+        tags=["意向确认"],
+    )
+    def save_platform_draft(
+        observation_id: str,
+        payload: PlatformDraftRequest,
+        session: DbSession,
+        user: EditorUser,
+    ) -> dict:
+        item = _get_or_404(
+            session, m.RawIntentObservation, observation_id, "原始意向观察"
+        )
+        if item.version != payload.version:
+            raise DomainError(
+                409,
+                f"意向观察已更新，请刷新后重试（当前版本{item.version}）",
+            )
+        before = observation_review_snapshot(item)
+        try:
+            draft = propose_observation_platform(
+                session,
+                observation_id=observation_id,
+                technology_id=payload.technology_id,
+                level2_value=(
+                    payload.level2_value_id or payload.level2_new_value or ""
+                ),
+                level3_value=(
+                    payload.level3_value_id or payload.level3_new_value or ""
+                ),
+                level2_value_is_id=bool(payload.level2_value_id),
+                level3_value_is_id=bool(payload.level3_value_id),
+                actor=audit_actor(user),
+            )
+        except TaxonomyServiceError as exc:
+            raise DomainError(422, f"{exc.code}：{exc.message}") from exc
+        item.version += 1
+        session.add(
+            m.ConfirmationRecord(
+                target_type="raw_intent_observation",
+                target_id=item.id,
+                action="平台路径整理",
+                before_snapshot=before,
+                after_snapshot={
+                    **observation_review_snapshot(item),
+                    "platform_draft": draft,
+                },
+                actor=audit_actor(user),
+                note="新增内容保持待发布，随本条意向正式确认后激活",
+            )
+        )
+        session.commit()
+        session.refresh(item)
+        return {
+            "observation": public_observation(session, item),
+            "platform_draft": draft,
+            "message": "平台路径已保存；新增内容将在本条意向正式确认后启用。",
+        }
 
     @app.post(
         "/api/intent-observations/{observation_id}/confirm",
@@ -649,11 +1046,15 @@ def create_app(
         observation_id: str,
         payload: IntentConfirmRequest,
         session: DbSession,
+        user: EditorUser,
     ) -> dict:
         item = _get_or_404(
             session, m.RawIntentObservation, observation_id, "原始意向观察"
         )
-        observation, formal = confirm_observation(session, item, payload)
+        trusted_payload = payload.model_copy(update={"actor": audit_actor(user)})
+        observation, formal = confirm_observation(
+            session, item, trusted_payload
+        )
         return {
             "observation": public_observation(session, observation),
             "formal_status": public_formal_status(session, formal),
@@ -663,6 +1064,7 @@ def create_app(
     @app.get("/api/formal-intent-statuses", tags=["意向查询"])
     def list_formal_statuses(
         session: DbSession,
+        _user: CurrentUser,
         current_only: bool = True,
         customer_id: str | None = None,
         technology_id: str | None = None,
@@ -691,7 +1093,9 @@ def create_app(
         }
 
     @app.get("/api/evidence/{evidence_id}", tags=["证据"])
-    def get_evidence(evidence_id: str, session: DbSession) -> dict:
+    def get_evidence(
+        evidence_id: str, session: DbSession, _user: CurrentUser
+    ) -> dict:
         item = _get_or_404(session, m.EvidenceFragment, evidence_id, "证据")
         return public_evidence(session, item)
 
@@ -699,10 +1103,11 @@ def create_app(
     def get_evidence_content(
         evidence_id: str,
         session: DbSession,
+        user: CurrentUser,
         source: bool = Query(
             default=False, description="true时返回受控原始文件；默认只返回证据片段"
         ),
-    ):
+        ):
         item = _get_or_404(session, m.EvidenceFragment, evidence_id, "证据")
         if not source or not item.material_file_id:
             return {
@@ -714,6 +1119,11 @@ def create_app(
                 "page_no": item.page_no,
                 "frame_no": item.frame_no,
             }
+        if user.role not in {ROLE_ADMIN, ROLE_USER}:
+            raise HTTPException(
+                status_code=403,
+                detail="只读账户无权下载原始会议材料",
+            )
         material = _get_or_404(
             session, m.MaterialFile, item.material_file_id, "原始材料"
         )
@@ -727,12 +1137,15 @@ def create_app(
         )
 
     @app.get("/api/dashboard/summary", tags=["看板"])
-    def get_dashboard_summary(session: DbSession) -> dict:
+    def get_dashboard_summary(
+        session: DbSession, _user: CurrentUser
+    ) -> dict:
         return dashboard_summary(session)
 
     @app.get("/api/dashboard/technology-matrix", tags=["看板"])
     def get_technology_matrix(
         session: DbSession,
+        _user: CurrentUser,
         technology_id: str | None = None,
         customer_id: str | None = None,
     ) -> dict:
@@ -745,6 +1158,7 @@ def create_app(
     @app.get("/api/dashboard/customer-matrix", tags=["看板"])
     def get_customer_matrix(
         session: DbSession,
+        _user: CurrentUser,
         customer_id: str | None = None,
         technology_id: str | None = None,
     ) -> dict:
@@ -757,6 +1171,7 @@ def create_app(
     @app.get("/api/history", tags=["历史"])
     def history(
         session: DbSession,
+        _user: CurrentUser,
         customer_id: str | None = None,
         technology_id: str | None = None,
         function_id: str | None = None,
@@ -786,7 +1201,7 @@ def create_app(
         }
 
     @app.get("/api/meta/attitudes", tags=["系统"])
-    def attitude_dictionary() -> dict:
+    def attitude_dictionary(_user: CurrentUser) -> dict:
         return {
             "items": [
                 {"level": level, "label": label}

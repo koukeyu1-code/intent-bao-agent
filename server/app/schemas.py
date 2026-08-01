@@ -74,6 +74,41 @@ class SpeakerConfirmRequest(StrictRequestModel):
     identity_granularity: Literal["完整", "角色", "职能", "待确认"] = "职能"
     actor: str = Field(default="本地产品规划负责人", max_length=100)
 
+    @field_validator(
+        "display_name", "role", "organization", "function_id", mode="before"
+    )
+    @classmethod
+    def normalize_optional_identity_text(cls, value):
+        if value is None:
+            return None
+        cleaned = " ".join(str(value).split())
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def validate_identity_granularity(self):
+        required_fields = {
+            "职能": (("function_id", "客户职能"),),
+            "角色": (("role", "角色／职务"), ("function_id", "客户职能")),
+            "完整": (
+                ("display_name", "姓名／脱敏称呼"),
+                ("role", "角色／职务"),
+                ("organization", "组织"),
+                ("function_id", "客户职能"),
+            ),
+        }
+        missing = [
+            label
+            for field_name, label in required_fields.get(
+                self.identity_granularity, ()
+            )
+            if not getattr(self, field_name)
+        ]
+        if missing:
+            raise ValueError(
+                f"{self.identity_granularity}身份仍缺少：" + "、".join(missing)
+            )
+        return self
+
 
 class IntentConfirmRequest(StrictRequestModel):
     version: int = Field(ge=1)
@@ -134,6 +169,50 @@ class ObservationUpdateRequest(StrictRequestModel):
         if value is not None and value not in {1, 2, 3, 4, 5}:
             raise ValueError("意向档位必须是1-5，未知请传null")
         return value
+
+
+class PlatformDraftSelection(StrictRequestModel):
+    """Reviewed technology/platform path saved before formal confirmation.
+
+    Normal users may select an existing value or propose content under an
+    existing administrator-defined menu.  They cannot supply menu names.
+    """
+
+    technology_id: str = Field(min_length=1, max_length=64)
+    level2_value_id: str | None = Field(default=None, max_length=64)
+    level2_new_value: str | None = Field(default=None, max_length=200)
+    level3_value_id: str | None = Field(default=None, max_length=64)
+    level3_new_value: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_value_sources(self):
+        if bool(self.level2_value_id) == bool(self.level2_new_value):
+            raise ValueError("二级菜单必须且只能选择现有内容或新增一个内容")
+        if bool(self.level3_value_id) == bool(self.level3_new_value):
+            raise ValueError("三级菜单必须且只能选择现有内容或新增一个内容")
+        for field_name in ("level2_new_value", "level3_new_value"):
+            value = getattr(self, field_name)
+            if value is not None:
+                clean = " ".join(value.split())
+                if not clean:
+                    raise ValueError("新增菜单内容不能为空")
+                setattr(self, field_name, clean)
+        return self
+
+
+class PlatformDraftRequest(PlatformDraftSelection):
+    version: int = Field(ge=1)
+
+
+class ObservationReviewDraftRequest(ObservationUpdateRequest):
+    """Atomically save reviewed intent fields and an optional platform path."""
+
+    platform: PlatformDraftSelection | None = None
+
+
+class TaxonomyImportCommitRequest(StrictRequestModel):
+    preview_token: str = Field(min_length=16, max_length=200)
+    file_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class ModelAdapterConfig(BaseModel):

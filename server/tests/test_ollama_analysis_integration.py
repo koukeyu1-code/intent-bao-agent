@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import httpx
@@ -53,6 +54,17 @@ def client(tmp_path: Path):
         seed=True,
     )
     with TestClient(app) as test_client:
+        login = test_client.post(
+            "/api/auth/login",
+            json={
+                "username": "admin",
+                "password": os.environ["INTENT_BAO_ADMIN_PASSWORD"],
+            },
+        )
+        assert login.status_code == 200, login.text
+        test_client.headers.update(
+            {"Authorization": f"Bearer {login.json()['access_token']}"}
+        )
         yield test_client, app, tmp_path / "data"
 
 

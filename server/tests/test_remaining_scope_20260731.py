@@ -8,6 +8,7 @@ and private data directory, and never touches ``server/data`` or the demo DB.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -29,6 +30,17 @@ def isolated(tmp_path: Path):
         seed=True,
     )
     with TestClient(app) as client:
+        login = client.post(
+            "/api/auth/login",
+            json={
+                "username": "planner",
+                "password": os.environ["INTENT_BAO_USER_PASSWORD"],
+            },
+        )
+        assert login.status_code == 200, login.text
+        client.headers.update(
+            {"Authorization": f"Bearer {login.json()['access_token']}"}
+        )
         yield client, app, data_dir, db_path
 
 
@@ -228,8 +240,12 @@ def test_cors_non_mock_scope_and_path_traversal_protection(isolated) -> None:
     client, app, _data_dir, _db_path = isolated
     allowed = client.get("/api/health", headers={"Origin": "http://localhost:3000"})
     blocked = client.get("/api/health", headers={"Origin": "https://evil.example"})
+    unlisted_local_port = client.get(
+        "/api/health", headers={"Origin": "http://localhost:4173"}
+    )
     assert allowed.headers["access-control-allow-origin"] == "http://localhost:3000"
     assert "access-control-allow-origin" not in blocked.headers
+    assert "access-control-allow-origin" not in unlisted_local_port.headers
 
     protected = create_package(client, data_scope="授权脱敏数据")
     assert upload_text(client, protected["id"]).status_code == 201
@@ -280,6 +296,17 @@ def test_sqlite_copy_restore_and_small_query_latency(isolated, tmp_path: Path) -
         seed=False,
     )
     with TestClient(restored) as restored_client:
+        login = restored_client.post(
+            "/api/auth/login",
+            json={
+                "username": "planner",
+                "password": os.environ["INTENT_BAO_USER_PASSWORD"],
+            },
+        )
+        assert login.status_code == 200, login.text
+        restored_client.headers.update(
+            {"Authorization": f"Bearer {login.json()['access_token']}"}
+        )
         assert restored_client.get("/api/bootstrap").status_code == 200
         assert restored_client.get("/api/meeting-packages").json()["total"] >= 6
     assert data_dir.exists()
