@@ -1,0 +1,19 @@
+# 意向宝本地意向抽取模型（模型B：qwen3.6-27b）
+#
+# 使用方法：
+#   1. 下载 Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-Q4_K_M.gguf
+#      （约 17GB，GGUF Q4_K_M 量化版），放到本目录（models/ollama/）下；
+#   2. 在本目录执行：
+#        ollama create qwen3.6-27b -f Modelfile-qwen3.6-27b
+#   3. 启动意向宝后，在页面「模型设置」中选择 provider=本地 Ollama、
+#      模型名 qwen3.6-27b:latest 并保存。
+#
+# 说明：GGUF 文件体积过大（17GB），不宜直接提交到代码仓库；可放网盘/内网分发，
+# 或使用 Git LFS 单独托管。
+FROM ./Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-Q4_K_M.gguf
+
+# 推理参数：温度由业务代码显式传入，此处给上下文上限与批大小兜底
+PARAMETER num_ctx 16384
+PARAMETER num_batch 512
+# 该模型在严格JSON语法下可能持续生成，限制最大输出长度以保证任务必停
+PARAMETER num_predict 2048

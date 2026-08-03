@@ -13,6 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3:8b"
+ALLOWED_ASR_PROVIDERS = {"mock", "llamacpp"}
 ALLOWED_PROVIDERS = {"mock", "ollama"}
 _ALLOWED_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
@@ -20,6 +21,25 @@ _MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 
 class ModelSettingsError(ValueError):
     """Safe, user-facing validation error for local model settings."""
+
+
+@dataclass(frozen=True)
+class AsrRuntimeSettings:
+    provider: str
+    base_url: str
+    model_name: str
+
+    @property
+    def enabled(self) -> bool:
+        return self.provider != "mock"
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model_name": self.model_name,
+            "enabled": self.enabled,
+        }
 
 
 def normalize_ollama_base_url(value: str) -> str:
@@ -74,6 +94,13 @@ class RuntimeModelSettings:
     base_url: str
     model_name: str
     api_key: str | None = field(default=None, repr=False, compare=False)
+    asr: AsrRuntimeSettings = field(
+        default_factory=lambda: AsrRuntimeSettings(
+            provider="mock",
+            base_url="http://127.0.0.1:8081",
+            model_name="",
+        )
+    )
 
     def public_dict(
         self,
@@ -87,6 +114,7 @@ class RuntimeModelSettings:
             "base_url": self.base_url,
             "model_name": self.model_name,
             "api_key_configured": bool(self.api_key),
+            "asr": self.asr.public_dict(),
             "connection_status": connection_status,
             "last_checked_at": last_checked_at,
             "last_error": last_error,
@@ -127,13 +155,17 @@ class ModelSettingsStore:
             "INTENT_BAO_OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL
         )
 
+        stored: dict | None = None
         if self._config_path.exists():
             try:
-                stored = json.loads(self._config_path.read_text(encoding="utf-8"))
+                loaded = json.loads(
+                    self._config_path.read_text(encoding="utf-8")
+                )
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise ModelSettingsError("模型配置文件不可读取或格式错误") from exc
-            if not isinstance(stored, dict):
+            if not isinstance(loaded, dict):
                 raise ModelSettingsError("模型配置文件格式错误")
+            stored = loaded
             provider = str(stored.get("provider", provider)).strip().lower()
             base_url = str(stored.get("base_url", base_url))
             model_name = str(stored.get("model_name", model_name))
@@ -147,11 +179,34 @@ class ModelSettingsStore:
             or self._environ.get("OLLAMA_API_KEY")
             or None
         )
+        asr = self._load_asr(stored.get("asr") if stored else None)
         return RuntimeModelSettings(
             provider=provider,
             base_url=base_url,
             model_name=model_name,
             api_key=api_key,
+            asr=asr,
+        )
+
+    @staticmethod
+    def _load_asr(raw: Any) -> AsrRuntimeSettings:
+        provider = "mock"
+        base_url = "http://127.0.0.1:8081"
+        model_name = ""
+        if isinstance(raw, dict):
+            provider = str(raw.get("provider", provider)).strip().lower()
+            base_url = str(raw.get("base_url", base_url)).strip()
+            model_name = str(raw.get("model_name", model_name)).strip()
+        if provider not in ALLOWED_ASR_PROVIDERS:
+            provider = "mock"
+        if provider != "mock":
+            normalized_url = normalize_ollama_base_url(base_url)
+            base_url = normalized_url
+            model_name = validate_model_name(model_name)
+        return AsrRuntimeSettings(
+            provider=provider,
+            base_url=base_url,
+            model_name=model_name,
         )
 
     def snapshot(self) -> RuntimeModelSettings:
@@ -179,6 +234,9 @@ class ModelSettingsStore:
         model_name: str,
         api_key: str | None = None,
         clear_api_key: bool = False,
+        asr_provider: str | None = None,
+        asr_base_url: str | None = None,
+        asr_model_name: str | None = None,
     ) -> RuntimeModelSettings:
         normalized_provider = (provider or "").strip().lower()
         if normalized_provider not in ALLOWED_PROVIDERS:
@@ -187,6 +245,21 @@ class ModelSettingsStore:
         normalized_model = validate_model_name(model_name)
         if clear_api_key and api_key:
             raise ModelSettingsError("不能同时设置和清除API Key")
+
+        next_asr = self._settings.asr
+        if asr_provider is not None or asr_base_url is not None or asr_model_name is not None:
+            candidate_provider = (
+                (asr_provider or self._settings.asr.provider).strip().lower()
+            )
+            candidate_url = asr_base_url or self._settings.asr.base_url
+            candidate_model = asr_model_name or self._settings.asr.model_name
+            next_asr = self._load_asr(
+                {
+                    "provider": candidate_provider,
+                    "base_url": candidate_url,
+                    "model_name": candidate_model,
+                }
+            )
 
         with self._lock:
             current_key = self._settings.api_key
@@ -202,6 +275,7 @@ class ModelSettingsStore:
                 base_url=normalized_url,
                 model_name=normalized_model,
                 api_key=next_key,
+                asr=next_asr,
             )
             self._persist_non_secret(updated)
             self._settings = updated
@@ -212,6 +286,11 @@ class ModelSettingsStore:
             "provider": settings.provider,
             "base_url": settings.base_url,
             "model_name": settings.model_name,
+            "asr": {
+                "provider": settings.asr.provider,
+                "base_url": settings.asr.base_url,
+                "model_name": settings.asr.model_name,
+            },
         }
         temporary = self._config_path.with_suffix(".json.tmp")
         try:

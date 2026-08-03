@@ -7,6 +7,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from conftest import wait_for_analysis
+
 from app import main as main_module
 from app.main import create_app
 from app.model_adapters import IntentModelAdapter, OllamaIntentModelAdapter
@@ -217,8 +219,7 @@ def test_ollama_text_analysis_creates_only_traceable_ai_draft(
     run = analyzed.json()["analysis_run"]
     assert run["adapter"] == "ollama"
     assert run["model_name"] == "qwen-test:latest"
-    assert run["result_summary"]["observation_count"] == 1
-    assert "待人工确认" in analyzed.json()["message"]
+    wait_for_analysis(test_client, package["id"], run_id=run["id"])
 
     observations = test_client.get(
         "/api/intent-observations",

@@ -393,6 +393,7 @@ class ProcessingTask(Base, AuditColumns):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     output_hash: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
+    result_json: Mapped[str | None] = mapped_column(Text)
 
 
 class SpeakerCluster(Base, AuditColumns):
@@ -625,3 +626,84 @@ class StatusVersion(Base):
     changed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+
+class TranscriptSegment(Base, AuditColumns):
+    """Timed transcript segments produced by ASR or parsed from subtitles."""
+
+    __tablename__ = "transcript_segments"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    analysis_run_id: Mapped[str] = mapped_column(
+        ForeignKey("analysis_runs.id", ondelete="CASCADE"), index=True
+    )
+    package_id: Mapped[str] = mapped_column(
+        ForeignKey("meeting_packages.id", ondelete="CASCADE"), index=True
+    )
+    material_file_id: Mapped[str | None] = mapped_column(
+        ForeignKey("material_files.id", ondelete="SET NULL")
+    )
+    order_index: Mapped[int] = mapped_column(Integer)
+    start_ms: Mapped[int] = mapped_column(Integer)
+    end_ms: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    speaker_label: Mapped[str | None] = mapped_column(String(64))
+    language: Mapped[str | None] = mapped_column(String(16))
+    confidence: Mapped[float | None] = mapped_column(Float)
+    output_hash: Mapped[str | None] = mapped_column(String(64))
+
+
+class PdfPageText(Base, AuditColumns):
+    """Per-page extracted text for text-based PDF materials."""
+
+    __tablename__ = "pdf_page_texts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    material_file_id: Mapped[str] = mapped_column(
+        ForeignKey("material_files.id", ondelete="CASCADE"), index=True
+    )
+    page_no: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    char_count: Mapped[int] = mapped_column(Integer)
+    extracted_by: Mapped[str] = mapped_column(String(64))
+    hash: Mapped[str | None] = mapped_column(String(64))
+
+
+class KeyFrame(Base, AuditColumns):
+    """Key frames extracted from screen recordings."""
+
+    __tablename__ = "key_frames"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    material_file_id: Mapped[str] = mapped_column(
+        ForeignKey("material_files.id", ondelete="CASCADE"), index=True
+    )
+    time_ms: Mapped[int | None] = mapped_column(Integer)
+    image_relative_path: Mapped[str] = mapped_column(String(500))
+    image_sha256: Mapped[str | None] = mapped_column(String(64))
+    ocr_text: Mapped[str | None] = mapped_column(Text)
+    page_candidates_json: Mapped[str | None] = mapped_column(Text)
+
+
+class AlignmentLink(Base, AuditColumns):
+    """Semantic alignment between a transcript segment and a page/key frame."""
+
+    __tablename__ = "alignment_links"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    analysis_run_id: Mapped[str] = mapped_column(
+        ForeignKey("analysis_runs.id", ondelete="CASCADE"), index=True
+    )
+    package_id: Mapped[str] = mapped_column(
+        ForeignKey("meeting_packages.id", ondelete="CASCADE"), index=True
+    )
+    segment_id: Mapped[str] = mapped_column(
+        ForeignKey("transcript_segments.id", ondelete="CASCADE")
+    )
+    target_type: Mapped[str] = mapped_column(String(32))
+    target_id: Mapped[str] = mapped_column(String(64))
+    confidence: Mapped[float] = mapped_column(Float)
+    reason: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="候选")
+    confirmed_by: Mapped[str | None] = mapped_column(String(100))
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

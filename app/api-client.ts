@@ -9,6 +9,7 @@ import type {
   ModelSettings,
   ModelSettingsInput,
   MvpDataset,
+  ProcessingTask,
 } from "./types";
 import type {
   PlatformCascadeSelection,
@@ -103,6 +104,12 @@ interface ModelSettingsApiResponse {
   model_name?: string | null;
   model?: string | null;
   modelName?: string | null;
+  asr?: {
+    provider?: "mock" | "llamacpp" | string | null;
+    base_url?: string | null;
+    model_name?: string | null;
+    enabled?: boolean | null;
+  } | null;
   api_key_configured?: boolean;
   apiKeyConfigured?: boolean;
   connection_status?: ModelSettings["connectionStatus"];
@@ -133,6 +140,9 @@ const modelSettingsRequestBody = (input: ModelSettingsInput) => ({
   provider: input.provider,
   base_url: input.baseUrl.trim(),
   model_name: input.modelName.trim(),
+  asr_provider: input.asrProvider ?? "mock",
+  asr_base_url: (input.asrBaseUrl ?? "").trim(),
+  asr_model_name: (input.asrModelName ?? "").trim(),
   ...(input.apiKey ? { api_key: input.apiKey } : {}),
   ...(input.clearApiKey ? { clear_api_key: true } : {}),
 });
@@ -148,21 +158,28 @@ const modelConnectionRequestBody = (input: ModelSettingsInput) => ({
 
 const normalizeModelSettings = (
   item: ModelSettingsApiResponse,
-): ModelSettings => ({
-  provider: item.provider,
-  baseUrl: item.base_url ?? item.baseUrl ?? "",
-  modelName: item.model_name ?? item.model ?? item.modelName ?? "",
-  apiKeyConfigured:
-    item.api_key_configured ?? item.apiKeyConfigured ?? false,
-  connectionStatus:
-    item.connection_status ?? item.connectionStatus ?? "unknown",
-  ...(item.last_checked_at ?? item.lastCheckedAt
-    ? { lastCheckedAt: item.last_checked_at ?? item.lastCheckedAt ?? undefined }
-    : {}),
-  ...(item.last_error ?? item.lastError
-    ? { lastError: item.last_error ?? item.lastError ?? undefined }
-    : {}),
-});
+): ModelSettings => {
+  const asr = item.asr;
+  const asrProvider = asr?.provider === "llamacpp" ? "llamacpp" : "mock";
+  return {
+    provider: item.provider,
+    baseUrl: item.base_url ?? item.baseUrl ?? "",
+    modelName: item.model_name ?? item.model ?? item.modelName ?? "",
+    asrProvider,
+    asrBaseUrl: asr?.base_url ?? "",
+    asrModelName: asr?.model_name ?? "",
+    apiKeyConfigured:
+      item.api_key_configured ?? item.apiKeyConfigured ?? false,
+    connectionStatus:
+      item.connection_status ?? item.connectionStatus ?? "unknown",
+    ...(item.last_checked_at ?? item.lastCheckedAt
+      ? { lastCheckedAt: item.last_checked_at ?? item.lastCheckedAt ?? undefined }
+      : {}),
+    ...(item.last_error ?? item.lastError
+      ? { lastError: item.last_error ?? item.lastError ?? undefined }
+      : {}),
+  };
+};
 
 const normalizeModelConnection = (
   item: ModelConnectionApiResponse,
@@ -597,21 +614,173 @@ export const uploadMeetingMaterial = async (
   }
 };
 
+export interface AnalyzeMeetingResult {
+  task_id: string;
+  analysis_run: {
+    id: string;
+    package_id: string;
+    adapter: string;
+    model_name: string;
+    status: string;
+    result_summary?: Record<string, unknown> | null;
+    started_at?: string;
+    finished_at?: string;
+  };
+  stages: Array<{ stage: string; status: string; progress: number }>;
+  message: string;
+}
+
 export const analyzeMeetingPackage = async (
   meetingId: string,
   force = false,
-) =>
-  request<{
-    task_id: string;
-    message: string;
-  }>(
+): Promise<AnalyzeMeetingResult> =>
+  request<AnalyzeMeetingResult>(
     `/meeting-packages/${meetingId}/analyze`,
     {
       method: "POST",
       body: JSON.stringify({ force }),
     },
-    180_000,
+    30_000,
   );
+
+export const loadPackageTasks = async (
+  meetingId: string,
+): Promise<{ items: ProcessingTask[]; total: number }> =>
+  request(`/meeting-packages/${meetingId}/tasks`, undefined, 10_000);
+
+export const exportMeetingPackage = async (
+  meetingId: string,
+  format: "csv" | "xlsx" | "md",
+): Promise<Blob> => {
+  const response = await fetch(
+    `${API_BASE}/meeting-packages/${meetingId}/export?format=${format}`,
+    {
+      cache: "no-store",
+      credentials: "omit",
+      headers: { ...bearerHeaders() },
+    },
+  );
+  if (!response.ok) {
+    notifyUnauthorized(response.status);
+    const errorBody = (await response.json().catch(() => null)) as
+      | { detail?: string }
+      | null;
+    throw new ApiClientError(
+      errorBody?.detail ?? `导出失败（API ${response.status}）`,
+      response.status,
+    );
+  }
+  return response.blob();
+};
+
+export const mergeSpeakers = async (payload: {
+  packageId: string;
+  keepSpeakerId: string;
+  mergeSpeakerIds: string[];
+}) =>
+  request(
+    "/speakers/merge",
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        package_id: payload.packageId,
+        keep_speaker_id: payload.keepSpeakerId,
+        merge_speaker_ids: payload.mergeSpeakerIds,
+      }),
+    },
+    15_000,
+  );
+
+export const splitSpeaker = async (payload: {
+  packageId: string;
+  speakerId: string;
+  segmentIds: string[];
+}) =>
+  request(
+    `/speakers/${payload.speakerId}/split`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        package_id: payload.packageId,
+        segment_ids: payload.segmentIds,
+      }),
+    },
+    15_000,
+  );
+
+export interface SpeakerSegmentDetail {
+  id: string;
+  start_ms: number;
+  end_ms: number;
+  transcript: string;
+}
+
+export const loadSpeakerDetail = async (
+  speakerId: string,
+): Promise<{ segments: SpeakerSegmentDetail[] }> =>
+  request(`/speakers/${speakerId}`, undefined, 10_000);
+
+export interface GoldenIntentRecord {
+  quote: string;
+  technology_id?: string | null;
+  function_id?: string | null;
+  attitude_level?: number | null;
+  adoption_stage?: string | null;
+}
+
+export interface EvaluationReport {
+  package_id: string;
+  generated_at: string;
+  total: number;
+  correct: number;
+  structured_accuracy: number | null;
+  traceable: number;
+  traceable_rate: number | null;
+  unknown_total: number;
+  unknown_misjudged: number;
+  unknown_misjudge_rate: number | null;
+  field_accuracy: {
+    technology: number | null;
+    function: number | null;
+    attitude: number | null;
+    stage: number | null;
+  };
+  errors: Array<Record<string, unknown>>;
+  error_count: number;
+  notice: string;
+}
+
+export const runEvaluation = async (
+  packageId: string,
+  golden: GoldenIntentRecord[],
+): Promise<{ evaluation: EvaluationReport; message: string }> =>
+  request(
+    "/eval/runs",
+    {
+      method: "POST",
+      body: JSON.stringify({ package_id: packageId, golden }),
+    },
+    60_000,
+  );
+
+export interface EnvironmentCheck {
+  ffmpeg: boolean;
+  ffprobe: boolean;
+  intent_provider: string;
+  intent_model: string;
+  asr: {
+    provider: string;
+    base_url: string;
+    model_name: string;
+    enabled: boolean;
+  };
+  asr_healthy: boolean;
+  disk_free_gb: number;
+  ok: boolean;
+}
+
+export const loadEnvironmentCheck = async (): Promise<EnvironmentCheck> =>
+  request("/env-check", undefined, 10_000);
 
 export interface TaxonomyImportIssue {
   code: string;

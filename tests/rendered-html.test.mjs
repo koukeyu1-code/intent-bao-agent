@@ -335,8 +335,8 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
   );
   assert.match(
     apiSource,
-    /180_000/,
-    "real local model analysis needs a longer client timeout",
+    /loadPackageTasks/,
+    "analysis must switch to background polling (202 + task progress)",
   );
   assert.match(apiSource, /attendees:\s*payload\.attendeeName/);
   assert.match(appSource, /name="attendeeName"/);

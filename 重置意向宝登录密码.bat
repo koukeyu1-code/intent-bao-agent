@@ -2,21 +2,21 @@
 setlocal
 cd /d "%~dp0server"
 if not exist ".venv\Scripts\python.exe" (
-  echo [æ„å‘å®] è¯·å…ˆè¿è¡Œâ€œé¦–æ¬¡å®‰è£…ä¾èµ–.batâ€ã€‚
+  echo [ÒâÏò±¦] ÇëÏÈÔËĞĞ¡°Ê×´Î°²×°ÒÀÀµ.bat¡±¡£
   pause
   exit /b 1
 )
 echo.
-choice /C AP /N /M "è¯·é€‰æ‹©è¦é‡ç½®çš„è´¦å· [A=admin, P=planner]ï¼š"
+choice /C AP /N /M "ÇëÑ¡ÔñÒªÖØÖÃµÄÕËºÅ [A=admin, P=planner]£º"
 if errorlevel 2 (
   set "INTENT_BAO_RESET_USER=planner"
 ) else (
   set "INTENT_BAO_RESET_USER=admin"
 )
 echo.
-choice /C GM /N /M "è¯·é€‰æ‹©è®¾ç½®æ–¹å¼ [G=ç”Ÿæˆéšæœºå¼ºå¯†ç , M=æ‰‹åŠ¨è®¾ç½®]ï¼š"
+choice /C GM /N /M "ÇëÑ¡ÔñÉèÖÃ·½Ê½ [G=Éú³ÉËæ»úÇ¿ÃÜÂë, M=ÊÖ¶¯ÉèÖÃ]£º"
 if errorlevel 2 (
-  echo [æ„å‘å®] è¾“å…¥å¯†ç æ—¶å±å¹•ä¸ä¼šæ˜¾ç¤ºå­—ç¬¦ï¼Œè¿™æ˜¯æ­£å¸¸çš„ã€‚
+  echo [ÒâÏò±¦] ÊäÈëÃÜÂëÊ±ÆÁÄ»²»»áÏÔÊ¾×Ö·û£¬ÕâÊÇÕı³£µÄ¡£
   ".venv\Scripts\python.exe" -m app.auth_admin "%INTENT_BAO_RESET_USER%" --data-dir "%CD%\data"
 ) else (
   ".venv\Scripts\python.exe" -m app.auth_admin "%INTENT_BAO_RESET_USER%" --data-dir "%CD%\data" --generate

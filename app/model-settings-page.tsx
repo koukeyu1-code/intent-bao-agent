@@ -4,6 +4,7 @@ import {
   ApiOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
+  CloudServerOutlined,
   DeleteOutlined,
   ReloadOutlined,
   SafetyCertificateOutlined,
@@ -14,6 +15,7 @@ import {
   Button,
   Card,
   Descriptions,
+  Divider,
   Form,
   Input,
   Popconfirm,
@@ -26,10 +28,12 @@ import {
 } from "antd";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  loadEnvironmentCheck,
   listAvailableModels,
   loadModelSettings,
   saveModelSettings,
   testModelConnection,
+  type EnvironmentCheck,
 } from "./api-client";
 import type {
   ModelConnectionResult,
@@ -49,9 +53,14 @@ const defaultSettings: ModelSettings = {
   provider: "mock",
   baseUrl: OLLAMA_DEFAULT_URL,
   modelName: MOCK_MODEL_NAME,
+  asrProvider: "mock",
+  asrBaseUrl: "http://127.0.0.1:8081",
+  asrModelName: "",
   apiKeyConfigured: false,
   connectionStatus: "unknown",
 };
+
+const LLAMACPP_DEFAULT_URL = "http://127.0.0.1:8099";
 
 const providerMeta: Record<
   ModelProvider,
@@ -100,6 +109,8 @@ export default function ModelSettingsPage() {
   ]);
   const [testResult, setTestResult] =
     useState<ModelConnectionResult>();
+  const [envCheck, setEnvCheck] = useState<EnvironmentCheck>();
+  const [asrChecking, setAsrChecking] = useState(false);
   const operationBusy = activeOperation !== undefined;
 
   const beginOperation = (operation: ModelOperation) => {
@@ -123,6 +134,9 @@ export default function ModelSettingsPage() {
         modelName:
           next.modelName ||
           (next.provider === "mock" ? MOCK_MODEL_NAME : ""),
+        asrProvider: next.asrProvider || "mock",
+        asrBaseUrl: next.asrBaseUrl || LLAMACPP_DEFAULT_URL,
+        asrModelName: next.asrModelName || "",
         apiKey: "",
       });
     },
@@ -131,6 +145,11 @@ export default function ModelSettingsPage() {
 
   useEffect(() => {
     let alive = true;
+    void loadEnvironmentCheck()
+      .then((check) => {
+        if (alive) setEnvCheck(check);
+      })
+      .catch(() => undefined);
     void loadModelSettings()
       .then((next) => {
         if (!alive) return;
@@ -175,9 +194,36 @@ export default function ModelSettingsPage() {
         values.provider === "mock"
           ? values.modelName || MOCK_MODEL_NAME
           : values.modelName,
+      asrProvider: values.asrProvider ?? "mock",
+      asrBaseUrl: values.asrBaseUrl || "",
+      asrModelName: values.asrModelName || "",
       ...(values.apiKey ? { apiKey: values.apiKey } : {}),
     };
   }, [form]);
+
+  const handleCheckAsr = async () => {
+    if (asrChecking) return;
+    setAsrChecking(true);
+    try {
+      const check = await loadEnvironmentCheck();
+      setEnvCheck(check);
+      if (check.asr.enabled && check.asr_healthy) {
+        message.success("ASR 服务连接正常");
+      } else if (check.asr.enabled) {
+        message.warning(
+          `ASR 服务（${check.asr.base_url}）暂不可达，请确认已启动`,
+        );
+      } else {
+        message.info("ASR 当前为模拟模式，不调用外部服务");
+      }
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "本地API暂不可用";
+      message.error(`环境自检失败：${reason}`);
+    } finally {
+      setAsrChecking(false);
+    }
+  };
 
   const handleProviderChange = (value: ModelProvider) => {
     setTestResult(undefined);
@@ -352,6 +398,9 @@ export default function ModelSettingsPage() {
                 provider: "mock",
                 baseUrl: OLLAMA_DEFAULT_URL,
                 modelName: MOCK_MODEL_NAME,
+                asrProvider: "mock",
+                asrBaseUrl: LLAMACPP_DEFAULT_URL,
+                asrModelName: "",
               }}
               onValuesChange={() => {
                 setTestResult(undefined);
@@ -472,6 +521,86 @@ export default function ModelSettingsPage() {
                 />
               </Form.Item>
 
+              <Divider plain>语音识别（ASR）服务</Divider>
+              <Paragraph type="secondary">
+                意向宝通过本地 llama.cpp 运行 Qwen3-ASR 完成录音转写；关闭时使用模拟转写。
+              </Paragraph>
+
+              <Form.Item
+                name="asrProvider"
+                label="ASR 服务类型"
+                rules={[{ required: true, message: "请选择 ASR 服务类型" }]}
+              >
+                <Select
+                  options={[
+                    { value: "mock", label: "模拟转写" },
+                    { value: "llamacpp", label: "本地 llama.cpp" },
+                  ]}
+                />
+              </Form.Item>
+
+              <Form.Item
+                name="asrBaseUrl"
+                label="ASR 服务地址"
+                tooltip="llama-server 默认地址为 http://127.0.0.1:8099"
+                rules={[
+                  {
+                    validator: (_, value) => {
+                      if (form.getFieldValue("asrProvider") !== "llamacpp") {
+                        return Promise.resolve();
+                      }
+                      if (!value) {
+                        return Promise.reject(
+                          new Error("请输入 ASR 服务地址"),
+                        );
+                      }
+                      if (
+                        !/^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?\/?$/i.test(
+                          value.trim(),
+                        )
+                      ) {
+                        return Promise.reject(
+                          new Error("仅允许本机回环地址，例如 http://127.0.0.1:8099"),
+                        );
+                      }
+                      return Promise.resolve();
+                    },
+                  },
+                ]}
+              >
+                <Input
+                  prefix={<CloudServerOutlined />}
+                  placeholder={LLAMACPP_DEFAULT_URL}
+                  disabled={form.getFieldValue("asrProvider") !== "llamacpp"}
+                />
+              </Form.Item>
+
+              <Form.Item
+                name="asrModelName"
+                label="ASR 模型名称"
+                extra="llama-server 启动时加载的模型标识，例如 qwen3-asr"
+                rules={[
+                  {
+                    validator: (_, value) => {
+                      if (form.getFieldValue("asrProvider") !== "llamacpp") {
+                        return Promise.resolve();
+                      }
+                      if (!value) {
+                        return Promise.reject(
+                          new Error("请输入 ASR 模型名称"),
+                        );
+                      }
+                      return Promise.resolve();
+                    },
+                  },
+                ]}
+              >
+                <Input
+                  placeholder="qwen3-asr"
+                  disabled={form.getFieldValue("asrProvider") !== "llamacpp"}
+                />
+              </Form.Item>
+
               <div className="model-settings-actions">
                 <Space wrap>
                   <Button
@@ -557,6 +686,35 @@ export default function ModelSettingsPage() {
               </Descriptions.Item>
               <Descriptions.Item label="API Key">
                 {settings.apiKeyConfigured ? "已配置（内容已隐藏）" : "未配置"}
+              </Descriptions.Item>
+              <Descriptions.Item label="ASR 服务">
+                {settings.asrProvider === "llamacpp"
+                  ? `${settings.asrModelName || "未命名模型"} · ${
+                      settings.asrBaseUrl || LLAMACPP_DEFAULT_URL
+                    }`
+                  : "模拟转写（不调用外部服务）"}
+              </Descriptions.Item>
+              <Descriptions.Item label="ASR 健康状态">
+                {envCheck ? (
+                  envCheck.asr.enabled ? (
+                    <Tag color={envCheck.asr_healthy ? "success" : "error"}>
+                      {envCheck.asr_healthy ? "已连接" : "不可达"}
+                    </Tag>
+                  ) : (
+                    <Tag>模拟模式</Tag>
+                  )
+                ) : (
+                  <Tag>未检测</Tag>
+                )}
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  loading={asrChecking}
+                  onClick={() => void handleCheckAsr()}
+                >
+                  重新检测
+                </Button>
               </Descriptions.Item>
               <Descriptions.Item label="最近检测">
                 {formatCheckedAt(

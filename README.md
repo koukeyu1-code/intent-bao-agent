@@ -1,107 +1,129 @@
-# 意向宝智能体 P0a
+# 意向宝智能体（Intent-Bao Agent）
 
 > 让客户声音照进产品规划
 
-本项目依据《05-意向宝智能体软件开发方案》实现首个可运行版本。当前版本以明确标注的模拟数据跑通：
+意向宝把客户会议材料（录音、录屏、PDF、纪要）组织成可追溯、可确认的产品规划意向地图：AI 负责"听懂、看懂并建议"，业务负责人负责"确认结论"。全部模型在本地运行，企业真实敏感数据不出本机。
 
-> 会议资料包 → 预检与任务 → AI草稿 → 说话人校验 → 人工确认 → 正式职能状态 → 技术/客户双视角看板 → 证据下钻与历史版本
+## 架构与双模型分工
 
-## 直接运行（Windows）
+后端（FastAPI）按 8 个阶段编排分析任务：文件预检 → 文档解析 → 音轨与转写 → 说话人分离 → 画面与PDF解析 → 资料对齐 → 身份辅助匹配 → 意向抽取。分析任务异步执行：接口立即返回，后台单 Worker 串行处理，前端轮询进度。
 
-当前工作区已经安装依赖时：
+| 模型 | 位置 | 用途 |
+| --- | --- | --- |
+| Qwen3-ASR-1.7B（llama.cpp） | models/qwen3-asr/ + models/llama.cpp/ | 语音转写 |
+| FunASR（fsmn-vad + cam++） | models/funasr/ | 说话人分离（谁说了什么） |
+| Qwen3.6-27B（Ollama） | 自行导入（见下） | 意向抽取、资料对齐、身份推荐 |
 
-1. 双击 `启动意向宝.bat`；
-2. 浏览器会打开 <http://localhost:3000>；
-3. 用完后双击 `停止意向宝.bat`。
+## 目录结构
 
-在新电脑或依赖被清理后，先双击一次 `首次安装依赖.bat`。
+```text
+app/                前端（React / Next.js）
+server/            后端（FastAPI + SQLite），依赖清单 server/requirements.txt
+models/             本地模型与运行库（随仓库分发，建议 Git LFS）
+  qwen3-asr/       Qwen3-ASR GGUF + mmproj
+  llama.cpp/       llama-server 运行时
+  funasr/          FunASR 说话人分离模型
+  ollama/          27B 大模型导入文件 Modelfile（GGUF 需自行下载）
+samples/           演示素材（唐诗朗诵、三人会议录音、演示录屏、样例 PDF）
+scripts/           启动/停止/安装/ASR 服务脚本
+runtime/           运行期目录（后端入口、日志、pid，自动生成）
+docs/              开发方案、开题报告、开发文档、验收清单
+```
 
-也可以查看后端接口说明：<http://127.0.0.1:8000/docs>。
+## 环境要求
+
+- Windows 10/11（脚本为 PowerShell）
+- Python 3.11+（安装时勾选 Add to PATH）
+- Node.js 22+ 与 pnpm（npm install -g pnpm）
+- 推荐 NVIDIA 显卡（CUDA）；无显卡也能跑，只是慢
+- 硬盘剩余空间：约 8GB（依赖 + 内置模型）；若再导入 27B 大模型需额外约 20GB
+
+## 第一步：准备模型
+
+### 内置模型（随仓库分发）
+
+models/qwen3-asr/、models/llama.cpp/、models/funasr/ 已包含运行所需文件。注意这些文件较大（GGUF 2GB、CUDA 运行库 512MB 等），从代码仓库获取时请启用 **Git LFS**（仓库已配置 .gitattributes），或从网盘/内网下载后按目录结构放回。
+
+### 27B 意向抽取大模型（需自行下载，不在仓库内）
+
+该模型原始 GGUF 约 17GB，不适合直接进代码仓库，请单独分发：
+
+1. 下载 Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-Q4_K_M.gguf（Q4_K_M 量化版）；
+2. 放入 models/ollama/ 目录；
+3. 在该目录执行：
+
+```powershell
+ollama create qwen3.6-27b -f Modelfile-qwen3.6-27b
+```
+
+4. 启动项目后，在页面「模型设置」中选"本地 Ollama"，模型名填 qwen3.6-27b:latest 并保存。
+
+> 未导入 27B 模型也不影响体验：系统仍可用内置 ASR/说话人分离跑转写与分离；意向抽取会回退到模拟结果（明确标注）。
+
+## 第二步：安装依赖（新电脑）
+
+双击 首次安装依赖.bat，脚本会自动：
+
+1. 创建后端 Python 虚拟环境 server/.venv；
+2. 安装 PyTorch（优先 CUDA 版，失败自动回退 CPU 版）与后端依赖（server/requirements.txt）；
+3. 安装前端依赖（pnpm install）；
+4. 通过 winget 自动安装 FFmpeg（缺失时）；
+5. 检查 Tesseract OCR（中文包 chi_sim）、Ollama、内置模型，缺失时给出黄色警告与指引。
+
+也可以手动执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup-local.ps1
+```
+
+## 第三步：启动与停止
+
+```text
+启动意向宝.bat    一键启动（自动拉起 ASR 语音服务 8099、后端 8000、前端 3000）
+停止意向宝.bat    一键停止
+```
+
+启动后浏览器打开 http://localhost:3000，后端接口文档在 http://127.0.0.1:8000/docs。也可手动执行 scripts/start-local.ps1 / scripts/stop-local.ps1。
 
 ### 首次登录
 
-- 本地账号为 `admin`（管理员）和 `planner`（普通用户）。源码中不提供默认密码。
-- 如需自定初始密码，请在**首次创建数据库前**设置用户环境变量 `INTENT_BAO_ADMIN_PASSWORD` 和 `INTENT_BAO_USER_PASSWORD`。
-- 未设置时，后端会为缺失账号分别生成强随机密码。启动窗口会提示文件位置，并打开本机目录：`server/data/config/initial-login-credentials/`。
-- 启动脚本不会把密码打印到屏幕；凭据文件已被 Git 忽略，并会尽量限制为当前 Windows 用户访问。将密码保存到个人密码管理器后，请删除对应 `.txt` 文件。
-- 账号一旦创建，后续重启和环境变量变化都不会重置其密码、角色或启用状态。密码遗失或从旧版本升级时，可双击 `重置意向宝登录密码.bat`：输入 `G` 会生成随机强密码并只把它写入上述受控目录，直接回车则通过隐藏输入手动设置。两种方式都不会更改账号角色或启用状态，并会撤销旧登录会话。
+- 本地账号为 admin（管理员）与 planner（普通用户），源码不提供默认密码。
+- 可设置环境变量 INTENT_BAO_ADMIN_PASSWORD / INTENT_BAO_USER_PASSWORD 指定初始密码；未设置时后端生成强随机密码，启动窗口会提示凭据文件位置（server/data/config/initial-login-credentials/，该目录已被 Git 忽略）。
+- 凭据文件保存到个人密码管理器后请删除；账号创建后环境变量不再影响其密码。
 
-## 当前已实现
+## 使用流程
 
-- 会议资料包创建、参会人信息、资料属性和本地文件上传；
-- 材料名称、大小、类型、解析状态与录音／转写稿配套PDF预检，并限制单文件、资料包总量和磁盘余量；
-- 分阶段任务、处理进度、模型来源和错误状态；
-- 页面化配置本地 Ollama 地址、模型名称与可选 API Key；
-- Ollama 连接测试、已安装模型读取和 JSON Schema 结构化输出校验；
-- TXT、MD、SRT、VTT、DOCX 及资料包备注的本地意向抽取；
-- 说话人推荐及姓名、角色、组织、职能的人工校验；
-- 原始意向观察与人工正式状态分层；
-- 五档态度与“未知”保护；
-- 态度和客户技术采用阶段分别管理；
-- 产品规划负责人确认、退回或标记无法判断；
-- 客户、技术、通用平台、客户项目和客户职能建模；
-- 管理员 Excel 预检／发布产品平台菜单，普通用户只能在意向确认中补充菜单内容；
-- 技术 → 二级规格 → 三级规格三级联动，历史意向保留确认时的平台路径；
-- 支持者、阻力、卡点、决策影响及冲突证据；
-- 技术、客户和竞争视角看板；未映射到具体平台的竞品记录不进入正式对比；
-- 证据下钻与追加式历史版本；
-- 管理员、普通用户、只读用户的后端权限控制；模型设置和 Excel 导入仅管理员可用；
-- SQLite、本地文件目录、乐观锁、审计记录与 Windows 数据目录访问控制；
-- 桌面端与手机端响应式浏览。
+1. 模型设置：确认 Ollama 与 ASR（llama.cpp http://127.0.0.1:8099，模型名 qwen3-asr）已保存，健康检测"已连接"；
+2. 资料上传：新建会议资料包，上传录音/录屏/PDF/纪要；无 PDF 时填写例外原因；
+3. 启动分析：立即返回列表，任务后台执行，列表实时显示 8 阶段进度，完成后自动提示；
+4. 身份校验：对自动分离出的 Speaker A/B/C 逐个人工标注姓名、角色、组织、职能；
+5. 意向确认：逐条核对 AI 草稿的原文、证据、五档态度与采用阶段，确认后形成正式职能状态；
+6. 看板与导出：客情总览/技术/客户视角查看正式状态；资料包详情可导出 CSV/Excel/Markdown；
+7. 模型评测（可选）：用金标准对比 AI 原始输出，查看结构化准确率、证据可追溯率、未知误判率。
 
-## 必须注意的边界
+演示素材在 samples/：three_speakers.wav（三说话人录音，体验分离）、test_audio_tangpoems.mp3（单人唐诗朗诵）、test_screen_recording.mp4（含语音的演示录屏）、test_real_chinese_doc.pdf（中文样例 PDF）。
 
-- 页面和数据库中的演示内容均明确标注为“模拟数据”。
-- 默认模型适配器仍为 `mock`；在“模型设置”中保存本地 Ollama 后，可对可直接读取的文本材料生成待人工确认的 AI 草稿。
-- Ollama 接入不代表真实 ASR、说话人分离、OCR、PDF/录屏对齐已经完成。
-- 模型地址和模型名写入本机忽略目录；API Key 仅保存在后端进程内存，重启后清除，接口和浏览器均不回显明文。
-- “关键意向结构化准确率不低于 85%”是后续真实授权样本的目标，不是当前成绩。
-- 当前没有证明 60–90 分钟会议能在原会议时长内处理完成。
-- 企业真实敏感数据不得调用公共模型；真实材料试用前还需完成内部数据安全确认。
-- 授权脱敏或真实敏感材料当前只允许本地保存，不会调用 `mock` 生成伪结果。
-- 当前为本地账号与角色权限初版，不等同于企业级 SSO、统一身份治理、灾备和生产合规已经完成。
-
-完整边界见 [docs/P0_ACCEPTANCE.md](docs/P0_ACCEPTANCE.md)。
-
-## 项目结构
-
-```text
-app/                    React/TypeScript 前端
-server/app/             FastAPI 业务与接口
-server/tests/           后端闭环测试
-server/data/            本地数据库与上传文件（运行时生成，不提交）
-scripts/                Windows 安装、启动和停止脚本
-docs/                   P0 验收边界
-public/og.png           意向宝分享预览图
-```
-
-## 开发与验证
-
-前端：
+## 测试
 
 ```powershell
-pnpm run dev
-pnpm run lint
-pnpm run build
-node --test tests/rendered-html.test.mjs
+# 后端（在 server 目录）
+.venv\Scripts\python.exe -m pytest -q
+
+# 前端（在项目根目录，需 Node）
+node --test tests/*.test.mjs
 ```
 
-后端：
+## 上传代码仓库时的大文件说明
 
-```powershell
-cd server
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
+- models/ 内含超过 100MB 的文件（GGUF、CUDA DLL），GitHub/Gitee 直接 push 会失败；仓库已提供 .gitattributes，推荐用 Git LFS 托管（git lfs install 后 git add 会自动走 LFS）。
+- 17GB 的 27B GGUF 不在仓库内，按 models/ollama/Modelfile-qwen3.6-27b 说明单独分发。
+- server/data/（本地数据库、上传文件、凭据、模型设置）、node_modules/、.venv/、runtime/ 均已加入 .gitignore，不会提交。
 
-当前回归结果：后端 124 项测试通过，前端 35 项契约／业务守卫测试通过，前端 lint 与生产构建通过。
+## 边界与已知缺口
 
-默认数据库位于 `server/data/database/intent_bao.db`。上传材料保存于 `server/data/projects/`，API 不向前端暴露真实物理路径。
-
-## 下一步
-
-1. 获取 5–10 份授权、脱敏并人工标注的会议材料；
-2. 按独立指标测试 ASR、说话人分离、PDF/OCR、画面对齐和意向抽取；
-3. 用授权样本评测并选定 Ollama 中的本地意向模型；
-4. 用不少于 30 条人工金标准意向记录验证准确率与错例；
-5. 再推进真实数据试点、权限、审计、PostgreSQL 和正式部署。
+- 说话人分离为声纹聚类（FunASR），不建立跨会议声纹库；同一说话人被停顿切成多段可正确归组。
+- 关键帧 OCR 对演示级字号效果良好，小字号正文识别率有限。
+- 分析失败重试为全量重跑（阶段产物已落库，但断点续跑未实现）。
+- retention_days 保存期限已建模，但尚无自动清理任务。
+- 前端暂不展示转写全文与音频播放（数据在后端可查）。
+- 结构化准确率不低于85% 与 60-90 分钟会议小于等于原时长 为后续真实样本验证目标，当前未宣称达标。

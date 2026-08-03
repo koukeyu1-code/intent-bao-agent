@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import secrets
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 from fastapi import (
     Depends,
     FastAPI,
@@ -19,7 +21,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -45,6 +47,7 @@ from .model_adapters import (
     get_model_adapter,
 )
 from .model_settings import ModelSettingsError, ModelSettingsStore
+from .stage_adapters import get_stage_adapter
 from .presenters import (
     dashboard_matrix,
     dashboard_summary,
@@ -61,6 +64,7 @@ from .presenters import (
 )
 from .schemas import (
     AnalyzeRequest,
+    EvalRunRequest,
     IntentConfirmRequest,
     MeetingPackageCreate,
     MeetingPackageUpdate,
@@ -73,6 +77,8 @@ from .schemas import (
     ObservationUpdateRequest,
     PlatformDraftRequest,
     SpeakerConfirmRequest,
+    SpeakerMergeRequest,
+    SpeakerSplitRequest,
     TaxonomyImportCommitRequest,
 )
 from .seed import seed_demo_data
@@ -80,11 +86,20 @@ from .services import (
     DomainError,
     confirm_observation,
     confirm_speaker,
+    create_analysis_run,
     ensure_ai_snapshot,
+    merge_speakers,
     observation_review_snapshot,
-    run_analysis,
     save_uploaded_file,
+    split_speaker,
 )
+from .stage_orchestrator import (
+    AnalysisQueue,
+    mark_stale_analysis_runs_failed,
+)
+from .exporting import export_package
+from .evaluation import run_evaluation
+from .media_processing import ffmpeg_available, ffprobe_available
 from .taxonomy_excel import (
     DEFAULT_MAX_XLSX_BYTES,
     preflight_taxonomy_xlsx,
@@ -200,6 +215,19 @@ def create_app(
             generated_credentials_dir,
         )
 
+    analysis_queue = AnalysisQueue(database, model_settings, settings)
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        stale_count = mark_stale_analysis_runs_failed(database)
+        if stale_count:
+            logger.warning("已将 %s 个中断的分析任务标记为处理失败", stale_count)
+        analysis_queue.start()
+        try:
+            yield
+        finally:
+            analysis_queue.stop()
+
     app = FastAPI(
         title="意向宝智能体 API",
         summary="把客户会议材料整理成可追溯、可确认的产品规划意向地图",
@@ -211,10 +239,12 @@ def create_app(
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/api/openapi.json",
+        lifespan=_lifespan,
     )
     app.state.settings = settings
     app.state.model_settings = model_settings
     app.state.database = database
+    app.state.analysis_queue = analysis_queue
     app.state.initial_credentials_directory = initial_credentials_directory(
         settings.data_dir
     )
@@ -330,6 +360,9 @@ def create_app(
                     else None
                 ),
                 clear_api_key=payload.clear_api_key,
+                asr_provider=payload.asr_provider,
+                asr_base_url=payload.asr_base_url,
+                asr_model_name=payload.asr_model_name,
             )
         except ModelSettingsError as exc:
             raise DomainError(422, str(exc)) from exc
@@ -662,6 +695,7 @@ def create_app(
             )
         adapter_name = requested_adapter or active_model.provider
         adapter = None
+        stage_adapter = None
         if adapter_name != "mock":
             try:
                 adapter = get_model_adapter(
@@ -670,16 +704,35 @@ def create_app(
                     model_name=active_model.model_name,
                     api_key=active_model.api_key,
                 )
+                stage_adapter = get_stage_adapter(
+                    active_model.provider,
+                    base_url=active_model.base_url,
+                    model_name=active_model.model_name,
+                    api_key=active_model.api_key,
+                )
             except (ModelSettingsError, ValueError) as exc:
                 raise DomainError(422, str(exc)) from exc
-        run = run_analysis(
+        run = create_analysis_run(
             session,
             package,
             adapter_name=adapter_name,
             force=payload.force,
             settings=settings,
             adapter=adapter,
+            stage_adapter=stage_adapter,
+            asr_settings=active_model.asr,
         )
+        reused = (
+            run.status == "已完成"
+            or app.state.analysis_queue.contains(run.id)
+        )
+        if not reused:
+            app.state.analysis_queue.enqueue(
+                run.id,
+                adapter=adapter,
+                stage_adapter=stage_adapter,
+                asr_settings=active_model.asr,
+            )
         tasks = session.scalars(
             select(m.ProcessingTask)
             .where(m.ProcessingTask.analysis_run_id == run.id)
@@ -699,16 +752,348 @@ def create_app(
             },
             "stages": [public_task(item) for item in tasks],
             "message": (
-                "模拟分析已完成，结果仅用于流程演示。"
-                if run.status == "已完成" and run.adapter == "mock"
+                "已有分析任务正在后台处理中，请等待完成后刷新查看。"
+                if reused and run.status == "运行中"
                 else (
-                    f"Ollama分析已完成，使用模型 {run.model_name}；"
-                    "结果为待人工确认的AI草稿。"
+                    "检测到相同条件的历史已完成分析，直接复用该结果。"
+                    if reused
+                    else (
+                        "分析任务已进入后台队列；可在“会议资料包”中查看"
+                        "实时进度，完成后结果自动落库。"
+                    )
                 )
-                if run.status == "已完成" and run.adapter == "ollama"
-                else "任务已创建。"
             ),
         }
+
+    @app.get(
+        "/api/meeting-packages/{package_id}/export",
+        tags=["处理任务"],
+    )
+    def export_package_artifacts(
+        package_id: str,
+        session: DbSession,
+        _user: CurrentUser,
+        format: Annotated[str, Query()] = "csv",
+    ) -> Response:
+        _get_or_404(session, m.MeetingPackage, package_id, "会议资料包")
+        try:
+            filename, content = export_package(session, package_id, format)
+        except ValueError as exc:
+            raise DomainError(422, str(exc)) from exc
+        media_type = (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if filename.endswith(".xlsx")
+            else "text/csv; charset=utf-8"
+            if filename.endswith(".csv")
+            else "text/markdown; charset=utf-8"
+        )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.post(
+        "/api/analysis-runs/{run_id}/cancel",
+        tags=["处理任务"],
+    )
+    def cancel_analysis_run(
+        run_id: str,
+        session: DbSession,
+        _user: EditorUser,
+    ) -> dict:
+        run = _get_or_404(session, m.AnalysisRun, run_id, "分析任务")
+        if run.status in {"已完成", "已取消", "处理失败"}:
+            return {
+                "analysis_run": {
+                    "id": run.id,
+                    "status": run.status,
+                    "package_id": run.package_id,
+                },
+                "message": "任务已结束，无需取消。",
+            }
+        run.status = "已取消"
+        run.error_message = "由用户取消"
+        run.finished_at = run.finished_at or m.utcnow()
+        tasks = session.scalars(
+            select(m.ProcessingTask).where(
+                m.ProcessingTask.analysis_run_id == run.id
+            )
+        ).all()
+        for task in tasks:
+            if task.status not in {"已完成", "不适用"}:
+                task.status = "已取消"
+                task.finished_at = task.finished_at or m.utcnow()
+        session.commit()
+        return {
+            "analysis_run": {"id": run.id, "status": run.status},
+            "message": "任务已取消。",
+        }
+
+    @app.post(
+        "/api/analysis-runs/{run_id}/retry",
+        tags=["处理任务"],
+    )
+    def retry_analysis_run(
+        run_id: str,
+        session: DbSession,
+        _user: EditorUser,
+    ) -> dict:
+        original = _get_or_404(session, m.AnalysisRun, run_id, "分析任务")
+        package = _get_or_404(
+            session, m.MeetingPackage, original.package_id, "会议资料包"
+        )
+        active_model = model_settings.snapshot()
+        adapter_name = active_model.provider
+        adapter = None
+        stage_adapter = None
+        if adapter_name != "mock":
+            try:
+                adapter = get_model_adapter(
+                    adapter_name,
+                    base_url=active_model.base_url,
+                    model_name=active_model.model_name,
+                    api_key=active_model.api_key,
+                )
+                stage_adapter = get_stage_adapter(
+                    active_model.provider,
+                    base_url=active_model.base_url,
+                    model_name=active_model.model_name,
+                    api_key=active_model.api_key,
+                )
+            except (ModelSettingsError, ValueError) as exc:
+                raise DomainError(422, str(exc)) from exc
+        run = create_analysis_run(
+            session,
+            package,
+            adapter_name=adapter_name,
+            force=True,
+            settings=settings,
+            adapter=adapter,
+            stage_adapter=stage_adapter,
+            asr_settings=active_model.asr,
+        )
+        app.state.analysis_queue.enqueue(
+            run.id,
+            adapter=adapter,
+            stage_adapter=stage_adapter,
+            asr_settings=active_model.asr,
+        )
+        tasks = session.scalars(
+            select(m.ProcessingTask)
+            .where(m.ProcessingTask.analysis_run_id == run.id)
+            .order_by(m.ProcessingTask.stage_order)
+        ).all()
+        return {
+            "task_id": run.id,
+            "analysis_run": {
+                "id": run.id,
+                "package_id": run.package_id,
+                "adapter": run.adapter,
+                "model_name": run.model_name,
+                "status": run.status,
+                "result_summary": run.result_summary,
+            },
+            "stages": [public_task(item) for item in tasks],
+            "message": (
+                f"已重新创建分析任务 {run.id} 并进入后台队列；"
+                "完成后可通过任务接口查看进度。"
+            ),
+        }
+
+    @app.get(
+        "/api/analysis-runs/{run_id}/artifacts",
+        tags=["处理任务"],
+    )
+    def analysis_run_artifacts(
+        run_id: str,
+        session: DbSession,
+        _user: CurrentUser,
+    ) -> dict:
+        run = _get_or_404(session, m.AnalysisRun, run_id, "分析任务")
+        transcripts = session.scalars(
+            select(m.TranscriptSegment)
+            .where(m.TranscriptSegment.analysis_run_id == run.id)
+            .order_by(m.TranscriptSegment.order_index)
+        ).all()
+        alignments = session.scalars(
+            select(m.AlignmentLink).where(
+                m.AlignmentLink.analysis_run_id == run.id
+            )
+        ).all()
+        files = session.scalars(
+            select(m.MaterialFile).where(
+                m.MaterialFile.package_id == run.package_id,
+                m.MaterialFile.is_deleted.is_(False),
+            )
+        ).all()
+        file_ids = [item.id for item in files]
+        run_start = run.started_at
+        run_end = run.finished_at or m.utcnow()
+        pages = (
+            session.scalars(
+                select(m.PdfPageText).where(
+                    m.PdfPageText.material_file_id.in_(file_ids),
+                    m.PdfPageText.created_at >= run_start,
+                    m.PdfPageText.created_at <= run_end,
+                )
+            ).all()
+            if file_ids
+            else []
+        )
+        frames = (
+            session.scalars(
+                select(m.KeyFrame).where(
+                    m.KeyFrame.material_file_id.in_(file_ids),
+                    m.KeyFrame.created_at >= run_start,
+                    m.KeyFrame.created_at <= run_end,
+                )
+            ).all()
+            if file_ids
+            else []
+        )
+        return {
+            "transcripts": [
+                {
+                    "id": item.id,
+                    "start_ms": item.start_ms,
+                    "end_ms": item.end_ms,
+                    "text": item.text,
+                    "speaker_label": item.speaker_label,
+                    "confidence": item.confidence,
+                }
+                for item in transcripts
+            ],
+            "pages": [
+                {
+                    "id": item.id,
+                    "page_no": item.page_no,
+                    "text": item.text,
+                    "char_count": item.char_count,
+                }
+                for item in pages
+            ],
+            "frames": [
+                {
+                    "id": item.id,
+                    "time_ms": item.time_ms,
+                    "image_relative_path": item.image_relative_path,
+                    "ocr_text": item.ocr_text,
+                }
+                for item in frames
+            ],
+            "alignments": [
+                {
+                    "id": item.id,
+                    "segment_id": item.segment_id,
+                    "target_type": item.target_type,
+                    "target_id": item.target_id,
+                    "confidence": item.confidence,
+                    "reason": item.reason,
+                    "status": item.status,
+                }
+                for item in alignments
+            ],
+        }
+
+    @app.patch(
+        "/api/speakers/merge",
+        tags=["说话人校验"],
+    )
+    def merge_speaker_endpoint(
+        payload: SpeakerMergeRequest,
+        session: DbSession,
+        user: EditorUser,
+    ) -> dict:
+        speaker = merge_speakers(
+            session,
+            package_id=payload.package_id,
+            keep_speaker_id=payload.keep_speaker_id,
+            merge_speaker_ids=payload.merge_speaker_ids,
+            actor=audit_actor(user),
+        )
+        return {
+            "speaker": public_speaker(session, speaker),
+            "message": "说话人已合并。",
+        }
+
+    @app.post(
+        "/api/speakers/{speaker_id}/split",
+        tags=["说话人校验"],
+    )
+    def split_speaker_endpoint(
+        speaker_id: str,
+        payload: SpeakerSplitRequest,
+        session: DbSession,
+        user: EditorUser,
+    ) -> dict:
+        speaker = split_speaker(
+            session,
+            package_id=payload.package_id,
+            speaker_id=speaker_id,
+            segment_ids=payload.segment_ids,
+            actor=audit_actor(user),
+        )
+        return {
+            "speaker": public_speaker(session, speaker),
+            "message": "说话人已拆分。",
+        }
+
+    @app.get(
+        "/api/env-check",
+        tags=["系统"],
+    )
+    def environment_check(_user: AdminUser) -> dict:
+        import shutil
+
+        settings_snapshot = model_settings.snapshot()
+        asr = settings_snapshot.asr
+        asr_healthy = False
+        if asr.enabled:
+            try:
+                response = httpx.get(
+                    f"{asr.base_url}/health",
+                    timeout=2.0,
+                    trust_env=False,
+                )
+                asr_healthy = response.status_code == 200
+            except Exception:
+                asr_healthy = False
+        return {
+            "ffmpeg": ffmpeg_available(),
+            "ffprobe": ffprobe_available(),
+            "intent_provider": settings_snapshot.provider,
+            "intent_model": settings_snapshot.model_name,
+            "asr": asr.public_dict(),
+            "asr_healthy": asr_healthy,
+            "disk_free_gb": round(
+                shutil.disk_usage(settings.data_dir).free / (1024**3), 1
+            ),
+            "ok": bool(
+                ffmpeg_available()
+                and ffprobe_available()
+                or model_settings.snapshot().provider == "mock"
+            ),
+        }
+
+    @app.post(
+        "/api/eval/runs",
+        tags=["评测"],
+    )
+    def create_eval_run(
+        payload: EvalRunRequest,
+        session: DbSession,
+        _user: EditorUser,
+    ) -> dict:
+        _get_or_404(
+            session, m.MeetingPackage, payload.package_id, "会议资料包"
+        )
+        report = run_evaluation(
+            session,
+            package_id=payload.package_id,
+            golden=[item.model_dump() for item in payload.golden],
+        )
+        return {"evaluation": report, "message": "评测完成。"}
 
     @app.get(
         "/api/meeting-packages/{package_id}/tasks", tags=["处理任务"]

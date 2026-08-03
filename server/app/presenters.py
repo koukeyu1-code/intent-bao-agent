@@ -1059,6 +1059,11 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
                 if speaker
                 else "未识别"
             ),
+            "identityConfirmed": bool(
+                speaker is not None
+                and speaker.status == "已确认"
+                and speaker.confirmed_function_id is not None
+            ),
             "attitude": observation.suggested_attitude,
             "adoptionStage": observation.suggested_adoption_stage
             or "未明确／未进入",

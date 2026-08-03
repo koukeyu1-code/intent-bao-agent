@@ -11,7 +11,7 @@ from app.database import Database
 
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
-REVISION = "0003_auth_taxonomy"
+REVISION = "0004_media_pipeline"
 REVISION_TABLES = {
     "app_users",
     "app_sessions",
@@ -21,6 +21,12 @@ REVISION_TABLES = {
     "taxonomy_import_batches",
     "observation_platform_drafts",
     "intent_platform_path_snapshots",
+}
+MEDIA_TABLES = {
+    "transcript_segments",
+    "pdf_page_texts",
+    "key_frames",
+    "alignment_links",
 }
 
 
@@ -55,6 +61,7 @@ def test_migration_reaches_0003_for_fresh_and_pre_alembic_databases(
         ).scalar_one()
     assert revision == REVISION
     assert REVISION_TABLES <= set(schema.get_table_names())
+    assert MEDIA_TABLES <= set(schema.get_table_names())
     assert "ai_snapshot" in {
         column["name"]
         for column in schema.get_columns("raw_intent_observations")

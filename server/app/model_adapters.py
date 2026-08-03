@@ -15,6 +15,8 @@ from .schemas import OllamaAnalysisResult, OllamaStructuredOutput
 
 
 MAX_PROMPT_CONTENT_CHARS = 200_000
+MIN_OUTPUT_TOKEN_BUDGET = 1024
+MAX_OUTPUT_TOKEN_BUDGET = 2048
 
 
 @dataclass
@@ -81,11 +83,13 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         model_name: str,
         api_key: str | None = None,
         timeout_seconds: float = 300,
+        thinking_enabled: bool = False,
         transport: httpx.BaseTransport | None = None,
     ):
         self.base_url = normalize_ollama_base_url(base_url)
         self.model_name = validate_model_name(model_name)
         self._api_key = api_key or None
+        self._thinking_enabled = thinking_enabled
         self._timeout = httpx.Timeout(
             timeout_seconds,
             connect=min(timeout_seconds, 5),
@@ -121,6 +125,16 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
                 "无法连接本地Ollama，请确认服务已启动且地址、端口正确"
             )
         if isinstance(exc, httpx.HTTPStatusError):
+            body_text = ""
+            try:
+                body_text = exc.response.text[:400]
+            except Exception:
+                body_text = ""
+            if exc.response.status_code == 400 and "grammar" in body_text.lower():
+                return ModelAdapterError(
+                    "Ollama无法解析结构化输出语法（grammar），"
+                    "当前模型可能不兼容完整JSON Schema"
+                )
             return ModelAdapterError(
                 f"Ollama返回HTTP {exc.response.status_code}，请检查模型和服务状态"
             )
@@ -257,6 +271,8 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             "只能使用主数据中存在的ID，不得虚构技术、平台或客户职能。"
             "每条观察必须引用材料中的原始quote；证据不足时attitude_level必须为null，"
             "并填写uncertainty_reason。输出必须严格符合给定JSON Schema。"
+            "每条观察必须包含attitude_level字段（取值为1-5或null）；"
+            "当attitude_level为null时，uncertainty_reason必须填写非空的具体原因。"
             "所有结果仅为AI草稿，不能替代产品规划负责人确认。"
         )
         user_prompt = (
@@ -270,14 +286,167 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             {"role": "user", "content": user_prompt},
         ]
 
-    def analyze(self, context: ModelContext) -> dict[str, Any]:
-        request_body = {
-            "model": self.model_name,
-            "messages": self._build_messages(context),
-            "stream": False,
-            "format": OllamaStructuredOutput.model_json_schema(),
-            "options": {"temperature": 0},
+    @staticmethod
+    def _simple_generation_schema() -> dict[str, Any]:
+        """Compact JSON Schema sent to the model for generation.
+
+        The full OllamaStructuredOutput schema carries many $defs/maxLength
+        constraints; some local models fail to parse the resulting grammar.
+        Constraints are still enforced afterwards by OllamaStructuredOutput,
+        so generation only needs field names and required keys.
+        """
+
+        def nullable(field_type: str) -> list[str]:
+            return [field_type, "null"]
+
+        return {
+            "type": "object",
+            "properties": {
+                "observations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "technology_id": {"type": "string"},
+                            "generic_platform_id": {
+                                "type": nullable("string")
+                            },
+                            "function_id": {"type": nullable("string")},
+                            "speaker_name": {"type": nullable("string")},
+                            "speaker_role": {"type": nullable("string")},
+                            "speaker_organization": {
+                                "type": nullable("string")
+                            },
+                            "quote": {"type": "string"},
+                            "attitude_level": {
+                                "enum": [1, 2, 3, 4, 5, None]
+                            },
+                            "adoption_stage": {
+                                "enum": [
+                                    "未明确／未进入",
+                                    "初步了解",
+                                    "内部评估",
+                                    "样品／技术验证",
+                                    "产品项目规划",
+                                    "确认导入",
+                                    "暂停／放弃",
+                                    None,
+                                ]
+                            },
+                            "support_reason": {"type": nullable("string")},
+                            "resistance_reason": {"type": nullable("string")},
+                            "bottlenecks": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "decision_influence": {
+                                "enum": [
+                                    "推动",
+                                    "把关",
+                                    "评估",
+                                    "影响",
+                                    "未知",
+                                    None,
+                                ]
+                            },
+                            "confidence": {"type": "number"},
+                            "uncertainty_reason": {
+                                "type": nullable("string")
+                            },
+                        },
+                        "required": [
+                            "technology_id",
+                            "quote",
+                            "confidence",
+                            "attitude_level",
+                        ],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["observations"],
         }
+
+    @staticmethod
+    def _output_token_budget(prompt_text: str) -> int:
+        """Bound generated tokens so a looping model always terminates."""
+
+        estimated = max(MIN_OUTPUT_TOKEN_BUDGET, len(prompt_text) // 6)
+        return min(MAX_OUTPUT_TOKEN_BUDGET, estimated)
+
+    @staticmethod
+    def _extract_json_object(content: str) -> str:
+        """Strip thinking text, Markdown fences and prose around the JSON."""
+
+        start = content.find("{")
+        end = content.rfind("}")
+        if start < 0 or end < start:
+            return content
+        return content[start : end + 1]
+
+    @staticmethod
+    def _is_transient_error(message: str) -> bool:
+        return ("超时" in message) or ("HTTP 5" in message) or ("连接" in message)
+
+    def chat_structured(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        budget: int,
+        use_format: bool,
+        validation_model: type = OllamaStructuredOutput,
+        generation_schema: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """POST /api/chat and validate content against ``validation_model``.
+
+        Returns ``(parsed, body)`` so callers can attach usage metadata.
+        """
+
+        request_messages = list(messages)
+        if not use_format:
+            hint = (
+                "只输出JSON对象：不要使用Markdown代码块，"
+                "不要输出任何解释或思考文字。"
+                "输出格式必须完全符合以下示例："
+                '{"observations":[{"technology_id":"tech-mini-led",'
+                '"generic_platform_id":"platform-27-5k",'
+                '"function_id":"function-product",'
+                '"speaker_name":"赵总","speaker_role":"产品规划负责人",'
+                '"speaker_organization":"客户研发",'
+                '"quote":"这是材料中的原文，必须逐字引用",'
+                '"attitude_level":4,'
+                '"adoption_stage":"样品／技术验证",'
+                '"support_reason":"认可方向并建议先做样机验证",'
+                '"resistance_reason":null,'
+                '"bottlenecks":["成本待确认"],'
+                '"decision_influence":"推动","confidence":0.8,'
+                '"uncertainty_reason":null}]}'
+                "attitude_level只能取1到5的整数或null；"
+                "adoption_stage只能取：未明确／未进入、初步了解、"
+                "内部评估、样品／技术验证、产品项目规划、确认导入、"
+                "暂停／放弃（没有证据就省略该字段）；"
+                "decision_influence只能取：推动、把关、评估、影响、未知；"
+                "confidence必须是0到1之间的数字；"
+                "每条观察必须给出attitude_level（1-5或null），"
+                "为null时必须给出非空的uncertainty_reason原因。"
+                "没有可抽取的意向时返回{\"observations\":[]}。"
+            )
+            last = dict(request_messages[-1])
+            last["content"] = f"{last['content']}\n{hint}"
+            request_messages[-1] = last
+
+        request_body: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": request_messages,
+            "stream": False,
+            "think": self._thinking_enabled,
+            "options": {"temperature": 0, "num_predict": budget},
+        }
+        if use_format:
+            request_body["format"] = (
+                generation_schema or self._simple_generation_schema()
+            )
+
         try:
             with self._client() as client:
                 response = client.post("/api/chat", json=request_body)
@@ -295,11 +464,22 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
             raise ModelAdapterError("Ollama未返回可验证的结构化结果")
-        try:
-            structured = OllamaStructuredOutput.model_validate_json(content)
-        except (ValidationError, ValueError) as exc:
-            raise ModelAdapterError("Ollama返回内容不符合意向结构契约") from exc
 
+        extracted = self._extract_json_object(content)
+        try:
+            structured = validation_model.model_validate_json(extracted)
+        except (ValidationError, ValueError) as exc:
+            raise ModelAdapterError("Ollama返回内容不符合结构契约") from exc
+
+        return structured, body
+
+    def _result_from(
+        self,
+        structured: OllamaStructuredOutput,
+        body: dict[str, Any],
+        *,
+        budget: int,
+    ) -> dict[str, Any]:
         usage_keys = (
             "total_duration",
             "load_duration",
@@ -313,13 +493,46 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             for key in usage_keys
             if isinstance(body, dict) and isinstance(body.get(key), (int, float))
         }
+        done_reason = body.get("done_reason") if isinstance(body, dict) else None
         result = OllamaAnalysisResult(
             mode="ollama",
             model=self.model_name,
             observations=structured.observations,
             usage=usage or None,
+            done_reason=done_reason if isinstance(done_reason, str) else None,
+            num_predict=budget,
         )
         return result.model_dump(mode="json")
+
+    def analyze(self, context: ModelContext) -> dict[str, Any]:
+        messages = self._build_messages(context)
+        prompt_text = messages[-1]["content"] if messages else ""
+        budget = self._output_token_budget(prompt_text)
+        errors: list[str] = []
+
+        transient_retried = False
+        while True:
+            try:
+                structured, body = self.chat_structured(
+                    messages, budget=budget, use_format=True
+                )
+                return self._result_from(structured, body, budget=budget)
+            except ModelAdapterError as exc:
+                errors.append(f"结构化生成：{exc}")
+                if self._is_transient_error(str(exc)) and not transient_retried:
+                    transient_retried = True
+                    continue
+                break
+
+        try:
+            structured, body = self.chat_structured(
+                messages, budget=budget, use_format=False
+            )
+            return self._result_from(structured, body, budget=budget)
+        except ModelAdapterError as exc:
+            errors.append(f"回退生成：{exc}")
+
+        raise ModelAdapterError("意向抽取失败：" + "；".join(errors))
 
 
 def get_model_adapter(

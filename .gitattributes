@@ -1,0 +1,14 @@
+# 大体积模型与运行库：建议使用 Git LFS 托管
+# 启用方法：git lfs install（需安装 https://git-lfs.com/）
+models/**/*.gguf filter=lfs diff=lfs merge=lfs -text
+models/llama.cpp/*.dll filter=lfs diff=lfs merge=lfs -text
+models/llama.cpp/*.exe filter=lfs diff=lfs merge=lfs -text
+
+# 文本文件统一使用 LF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.py text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.md text eol=lf
+*.json text eol=lf

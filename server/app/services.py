@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import codecs
 import hashlib
+import json
+import logging
 import re
 import shutil
 import zipfile
@@ -16,18 +18,32 @@ from sqlalchemy.orm import Session
 
 from . import models as m
 from .config import Settings
+from .diarization import DiarizationUnavailable, get_diarizer
 from .domain import (
     TERMINAL_OBSERVATION_STATUSES,
     adoption_status_key,
     formal_status_key,
 )
+from .audio_adapters import AsrSegment, get_asr_adapter
+from .media_processing import (
+    extract_audio_track,
+    extract_key_frames,
+    extract_pdf_text,
+    ocr_image,
+    parse_subtitle,
+    probe_media_duration,
+    slice_audio_segment,
+)
 from .model_adapters import IntentModelAdapter, ModelContext, get_model_adapter
+from .stage_adapters import get_stage_adapter
 from .schemas import IntentConfirmRequest, SpeakerConfirmRequest
 from .seed import TASK_STAGES
 from .taxonomy_service import (
     capture_path_snapshot,
     confirm_observation_platform,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DomainError(Exception):
@@ -268,11 +284,15 @@ def _build_model_materials(
         remaining -= len(note)
 
     if not any(item.get("content") for item in materials):
-        raise DomainError(
-            422,
-            "当前Ollama意向抽取仅能直接读取TXT、MD、SRT、VTT、DOCX和资料包备注；"
-            "录音、录屏与PDF仍需后续ASR/OCR组件处理。",
+        has_media = any(
+            item.material_type in {"录音", "录屏"} for item in files
         )
+        if not has_media:
+            raise DomainError(
+                422,
+                "当前Ollama意向抽取仅能直接读取TXT、MD、SRT、VTT、DOCX和资料包备注；"
+                "录音、录屏与PDF仍需后续ASR/OCR组件处理。",
+            )
     return materials, readable_ids
 
 
@@ -365,6 +385,623 @@ def _finish_analysis_tasks(
         task.output_hash = hashlib.sha256(
             f"{run.id}|{task.stage}|{adapter_name}".encode()
         ).hexdigest()
+
+
+def _update_task(
+    session: Session,
+    run: m.AnalysisRun,
+    stage: str,
+    *,
+    status: str,
+    progress: int | None = None,
+    result_json: dict | None = None,
+) -> None:
+    task = session.scalar(
+        select(m.ProcessingTask).where(
+            m.ProcessingTask.analysis_run_id == run.id,
+            m.ProcessingTask.stage == stage,
+        )
+    )
+    if task is None:
+        return
+    task.status = status
+    if progress is not None:
+        task.progress = progress
+    if result_json is not None:
+        task.result_json = json.dumps(result_json, ensure_ascii=False)
+    task.attempt_count = max(task.attempt_count, 1)
+    task.started_at = task.started_at or m.utcnow()
+    if status in {"已完成", "不适用", "处理失败"}:
+        task.finished_at = task.finished_at or m.utcnow()
+    task.output_hash = hashlib.sha256(
+        f"{run.id}|{task.stage}|{status}".encode()
+    ).hexdigest()
+
+
+def _fmt_ms(millis: int) -> str:
+    seconds, millis = divmod(millis, 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def _build_hotwords(session: Session, package: m.MeetingPackage) -> list[str]:
+    words: list[str] = []
+    for technology in session.scalars(
+        select(m.Technology).where(m.Technology.active.is_(True))
+    ).all():
+        words.append(technology.name)
+    for platform in session.scalars(
+        select(m.GenericPlatform).where(m.GenericPlatform.active.is_(True))
+    ).all():
+        words.append(platform.name)
+    for attendee in session.scalars(
+        select(m.MeetingAttendee).where(
+            m.MeetingAttendee.package_id == package.id
+        )
+    ).all():
+        if attendee.display_name:
+            words.append(attendee.display_name)
+    return words[:50]
+
+
+def _parse_document_stage(
+    session: Session,
+    settings: Settings,
+    run: m.AnalysisRun,
+    package: m.MeetingPackage,
+    files: list[m.MaterialFile],
+) -> tuple[set[str], list[dict], list[m.TranscriptSegment]]:
+    """Extract PDF page text and subtitle segments into derived tables."""
+
+    readable: set[str] = set()
+    extra_materials: list[dict] = []
+    parsed_transcripts: list[m.TranscriptSegment] = []
+    for item in files:
+        path = (settings.data_dir / item.relative_path).resolve()
+        if settings.data_dir.resolve() not in path.parents or not path.is_file():
+            raise DomainError(404, f"材料文件不存在：{item.safe_name}")
+        suffix = Path(item.safe_name).suffix.lower()
+        if suffix == ".pdf":
+            try:
+                pages = extract_pdf_text(path)
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise DomainError(
+                    422, f"PDF解析失败：{item.safe_name}：{exc}"
+                ) from exc
+            for page in pages:
+                session.add(
+                    m.PdfPageText(
+                        material_file_id=item.id,
+                        page_no=page.page_no,
+                        text=page.text,
+                        char_count=page.char_count,
+                        extracted_by="pymupdf",
+                    )
+                )
+                if page.text.strip():
+                    readable.add(item.id)
+                    extra_materials.append(
+                        {
+                            "id": None,
+                            "type": "PDF页面",
+                            "name": f"{item.safe_name} 第{page.page_no}页",
+                            "content": page.text,
+                        }
+                    )
+            item.parse_status = "解析完成"
+        elif suffix in {".srt", ".vtt"}:
+            try:
+                segments = parse_subtitle(path)
+            except (OSError, ValueError) as exc:
+                raise DomainError(
+                    422, f"字幕解析失败：{item.safe_name}：{exc}"
+                ) from exc
+            for index, segment in enumerate(segments, 1):
+                transcript = m.TranscriptSegment(
+                    analysis_run_id=run.id,
+                    package_id=package.id,
+                    material_file_id=item.id,
+                    order_index=index,
+                    start_ms=segment.start_ms,
+                    end_ms=segment.end_ms,
+                    text=segment.text,
+                )
+                session.add(transcript)
+                parsed_transcripts.append(transcript)
+                readable.add(item.id)
+            item.parse_status = "解析完成"
+    session.flush()
+    return readable, extra_materials, parsed_transcripts
+
+
+def _extend_materials_with_derived(
+    model_materials: list[dict],
+    extra_materials: list[dict],
+    transcripts: list[m.TranscriptSegment],
+    pages: list[m.PdfPageText],
+) -> list[dict]:
+    combined = list(model_materials)
+    remaining = _MODEL_INPUT_LIMIT
+    for item in combined:
+        remaining -= len(str(item.get("content") or ""))
+
+    for item in extra_materials:
+        if remaining <= 0:
+            break
+        content = str(item.get("content") or "")[:3000]
+        if not content:
+            continue
+        clipped = content[:remaining]
+        combined.append(
+            {
+                **item,
+                "content": clipped,
+                "truncated": len(clipped) < len(content),
+            }
+        )
+        remaining -= len(clipped)
+
+    for transcript in transcripts:
+        if remaining <= 0:
+            break
+        content = (
+            f"[{_fmt_ms(transcript.start_ms)}-{_fmt_ms(transcript.end_ms)}] "
+            f"{transcript.text}"
+        )[:3000]
+        combined.append(
+            {
+                "id": transcript.id,
+                "type": "转写片段",
+                "name": transcript.speaker_label or "转写片段",
+                "content": content,
+                "truncated": False,
+            }
+        )
+        remaining -= len(content)
+
+    for page in pages:
+        if remaining <= 0:
+            break
+        content = page.text[:3000]
+        if not content:
+            continue
+        clipped = content[:remaining]
+        combined.append(
+            {
+                "id": page.id,
+                "type": "PDF页面",
+                "name": f"第{page.page_no}页",
+                "content": clipped,
+                "truncated": len(clipped) < len(content),
+            }
+        )
+        remaining -= len(clipped)
+    return combined
+
+
+def _run_alignment_stage(
+    session: Session,
+    stage_adapter,
+    run: m.AnalysisRun,
+    package: m.MeetingPackage,
+    transcripts: list[m.TranscriptSegment],
+    pages: list[m.PdfPageText],
+    frames: list[m.KeyFrame],
+) -> None:
+    if stage_adapter is None or not transcripts or not (pages or frames):
+        _update_task(
+            session,
+            run,
+            "资料对齐",
+            status="已完成",
+            result_json={"alignments": 0, "reason": "无可用片段或页面"},
+        )
+        return
+    segment_payload = [
+        {
+            "id": item.id,
+            "start_ms": item.start_ms,
+            "end_ms": item.end_ms,
+            "speaker": item.speaker_label,
+            "text": item.text,
+        }
+        for item in transcripts
+    ]
+    page_payload = [
+        {
+            "id": item.id,
+            "page_no": item.page_no,
+            "text": item.text[:2000],
+        }
+        for item in pages
+        if item.text.strip()
+    ]
+    frame_payload = [
+        {
+            "id": item.id,
+            "time_ms": item.time_ms,
+            "text": item.ocr_text or "",
+        }
+        for item in frames
+    ]
+    try:
+        alignments = stage_adapter.align_materials(
+            segments=segment_payload,
+            pages=page_payload,
+            frames=frame_payload,
+        )
+    except Exception as exc:
+        _update_task(
+            session,
+            run,
+            "资料对齐",
+            status="已完成",
+            result_json={
+                "alignments": 0,
+                "error": f"对齐调用失败：{exc}",
+            },
+        )
+        return
+
+    valid_ids = {
+        item.id for item in transcripts
+    }
+    page_ids = {item.id for item in pages}
+    frame_ids = {item.id for item in frames}
+    persisted = 0
+    for alignment in alignments:
+        if alignment.segment_id not in valid_ids:
+            continue
+        if alignment.target_type == "pdf_page" and alignment.target_id not in page_ids:
+            continue
+        if alignment.target_type == "key_frame" and alignment.target_id not in frame_ids:
+            continue
+        session.add(
+            m.AlignmentLink(
+                analysis_run_id=run.id,
+                package_id=package.id,
+                segment_id=alignment.segment_id,
+                target_type=alignment.target_type,
+                target_id=alignment.target_id,
+                confidence=alignment.confidence,
+                reason=alignment.reason,
+            )
+        )
+        persisted += 1
+    _update_task(
+        session,
+        run,
+        "资料对齐",
+        status="已完成",
+        result_json={"alignments": persisted},
+    )
+
+
+def _run_identity_stage(
+    session: Session,
+    stage_adapter,
+    run: m.AnalysisRun,
+    package: m.MeetingPackage,
+    master_data: dict,
+    speakers: list[m.SpeakerCluster],
+) -> None:
+    if stage_adapter is None or not speakers:
+        _update_task(
+            session,
+            run,
+            "身份辅助匹配",
+            status="已完成",
+            result_json={"recommendations": 0},
+        )
+        return
+    speaker_ids = [item.id for item in speakers]
+    observations = session.scalars(
+        select(m.RawIntentObservation).where(
+            m.RawIntentObservation.package_id == package.id,
+            m.RawIntentObservation.speaker_id.in_(speaker_ids),
+        )
+    ).all()
+    segments = []
+    for speaker in speakers:
+        quotes = [
+            item.raw_quote for item in observations if item.speaker_id == speaker.id
+        ]
+        segments.append(
+            {
+                "id": speaker.id,
+                "speaker_label": speaker.label,
+                "text": "；".join(quotes[:3]) or speaker.recommended_name or speaker.label,
+            }
+        )
+    attendees = [
+        {
+            "display_name": item.display_name,
+            "role": item.role,
+            "organization": item.organization,
+            "function_id": item.function_id,
+        }
+        for item in session.scalars(
+            select(m.MeetingAttendee).where(
+                m.MeetingAttendee.package_id == package.id
+            )
+        ).all()
+    ]
+    try:
+        recommendations = stage_adapter.recommend_identities(
+            segments=segments,
+            attendees=attendees,
+            master_data=master_data,
+        )
+    except Exception as exc:
+        _update_task(
+            session,
+            run,
+            "身份辅助匹配",
+            status="已完成",
+            result_json={
+                "recommendations": 0,
+                "error": f"身份推荐调用失败：{exc}",
+            },
+        )
+        return
+    applied = 0
+    for recommendation in recommendations:
+        speaker = next(
+            (item for item in speakers if item.label == recommendation.speaker_label),
+            None,
+        )
+        if speaker is None:
+            continue
+        if recommendation.display_name:
+            speaker.recommended_name = recommendation.display_name
+        if recommendation.role:
+            speaker.recommended_role = recommendation.role
+        if recommendation.organization:
+            speaker.recommended_organization = recommendation.organization
+        if recommendation.function_id and session.get(
+            m.CustomerFunction, recommendation.function_id
+        ):
+            speaker.recommended_function_id = recommendation.function_id
+        speaker.confidence = recommendation.confidence
+        applied += 1
+    _update_task(
+        session,
+        run,
+        "身份辅助匹配",
+        status="已完成",
+        result_json={"recommendations": applied},
+    )
+
+
+def _run_audio_stage(
+    session: Session,
+    settings: Settings,
+    run: m.AnalysisRun,
+    package: m.MeetingPackage,
+    files: list[m.MaterialFile],
+    asr_settings,
+) -> tuple[bool, list[m.TranscriptSegment]]:
+    targets = [
+        item for item in files if item.material_type in {"录音", "录屏"}
+    ]
+    if not targets or asr_settings is None or not asr_settings.enabled:
+        _update_task(session, run, "音轨与转写", status="不适用")
+        _update_task(session, run, "说话人分离", status="不适用")
+        return False, []
+    adapter = get_asr_adapter(
+        asr_settings.provider,
+        base_url=asr_settings.base_url,
+        model_name=asr_settings.model_name,
+    )
+    transcripts: list[m.TranscriptSegment] = []
+    target = targets[0]
+    path = (settings.data_dir / target.relative_path).resolve()
+    audio_path = path
+    if target.material_type == "录屏":
+        wav_path = settings.data_dir / "temp" / f"{run.id}-{target.id}.wav"
+        if not extract_audio_track(path, wav_path):
+            raise DomainError(
+                422, "FFmpeg不可用或音轨提取失败，无法处理录屏"
+            )
+        audio_path = wav_path
+    elif path.suffix.lower() not in {".wav", ".mp3", ".m4a"}:
+        wav_path = settings.data_dir / "temp" / f"{run.id}-{target.id}.wav"
+        if not extract_audio_track(path, wav_path):
+            raise DomainError(
+                422, "FFmpeg不可用或音频转换失败，无法处理该录音格式"
+            )
+        audio_path = wav_path
+
+    duration_ms = probe_media_duration(audio_path)
+    hotwords = _build_hotwords(session, package)
+
+    diarized_turns: list[Any] = []
+    diarization_note: dict[str, Any] = {
+        "provider": None,
+        "turns": 0,
+        "speakers": 0,
+    }
+    try:
+        diarizer = get_diarizer(settings)
+        if diarizer is not None:
+            diarized_turns = diarizer.diarize(
+                audio_path, duration_ms=duration_ms
+            )
+            diarization_note = {
+                "provider": "funasr",
+                "turns": len(diarized_turns),
+                "speakers": len(
+                    {turn.speaker_label for turn in diarized_turns}
+                ),
+            }
+    except Exception as exc:
+        logger.warning("说话人分离不可用，退回整段转写：%s", exc)
+
+    transcript_model = adapter.model_name
+    if diarized_turns:
+        segments: list[AsrSegment] = []
+        temp_dir = settings.data_dir / "temp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for turn_index, turn in enumerate(diarized_turns):
+            seg_wav = (
+                temp_dir
+                / f"{run.id}-{target.id}-diar-{turn_index}.wav"
+            )
+            if not slice_audio_segment(
+                audio_path, turn.start_ms, turn.end_ms, seg_wav
+            ):
+                continue
+            try:
+                turn_result = adapter.transcribe(
+                    seg_wav,
+                    language="zh",
+                    hotwords=hotwords,
+                    duration_ms=turn.end_ms - turn.start_ms,
+                )
+            except Exception as exc:
+                logger.warning("说话人片段转写失败，跳过：%s", exc)
+                continue
+            finally:
+                try:
+                    seg_wav.unlink(missing_ok=True)
+                except OSError:
+                    # The ASR client may still hold the file handle on
+                    # Windows; leftover temp slices are harmless.
+                    pass
+            for seg in turn_result.segments:
+                segments.append(
+                    AsrSegment(
+                        start_ms=turn.start_ms,
+                        end_ms=turn.end_ms,
+                        text=seg.text,
+                        speaker_label=turn.speaker_label,
+                        confidence=seg.confidence,
+                        language=seg.language,
+                    )
+                )
+    else:
+        result = adapter.transcribe(
+            audio_path,
+            language="zh",
+            hotwords=hotwords,
+            duration_ms=duration_ms,
+        )
+        transcript_model = result.model_name
+        segments = list(result.segments)
+
+    label_to_cluster: dict[str, m.SpeakerCluster] = {}
+    for index, segment in enumerate(segments, 1):
+        transcript = m.TranscriptSegment(
+            analysis_run_id=run.id,
+            package_id=package.id,
+            material_file_id=target.id,
+            order_index=index,
+            start_ms=segment.start_ms,
+            end_ms=segment.end_ms,
+            text=segment.text,
+            speaker_label=segment.speaker_label,
+            language=segment.language,
+            confidence=segment.confidence,
+        )
+        session.add(transcript)
+        transcripts.append(transcript)
+        if segment.speaker_label:
+            cluster = label_to_cluster.get(segment.speaker_label)
+            if cluster is None:
+                cluster = m.SpeakerCluster(
+                    package_id=package.id,
+                    label=segment.speaker_label,
+                    recommended_name=f"待确认人员{len(label_to_cluster) + 1}",
+                    confidence=0.5,
+                    status="待确认",
+                )
+                session.add(cluster)
+                # Assign the string PK before referencing it from segments.
+                session.flush()
+                label_to_cluster[segment.speaker_label] = cluster
+            session.add(
+                m.SpeakerSegment(
+                    speaker_id=cluster.id,
+                    start_ms=segment.start_ms,
+                    end_ms=segment.end_ms,
+                    transcript=segment.text,
+                    confidence=segment.confidence,
+                )
+            )
+    session.flush()
+    target.parse_status = "解析完成"
+    _update_task(
+        session,
+        run,
+        "音轨与转写",
+        status="已完成",
+        result_json={
+            "segments": len(transcripts),
+            "duration_ms": duration_ms,
+            "model": transcript_model,
+            **(
+                {"diarization": diarization_note}
+                if diarized_turns
+                else {}
+            ),
+        },
+    )
+    _update_task(
+        session,
+        run,
+        "说话人分离",
+        status="已完成",
+        result_json={"speaker_labels": len(label_to_cluster)},
+    )
+    return True, transcripts
+
+
+def _run_visual_stage(
+    session: Session,
+    settings: Settings,
+    run: m.AnalysisRun,
+    package: m.MeetingPackage,
+    files: list[m.MaterialFile],
+) -> list[m.KeyFrame]:
+    screen = [item for item in files if item.material_type == "录屏"]
+    if not screen:
+        _update_task(session, run, "画面与PDF解析", status="不适用")
+        return []
+    frames: list[m.KeyFrame] = []
+    for item in screen[:1]:
+        path = (settings.data_dir / item.relative_path).resolve()
+        target_dir = (
+            settings.data_dir
+            / "projects"
+            / package.project_id
+            / package.id
+            / "derived"
+            / "frames"
+        )
+        extracted = extract_key_frames(path, target_dir, max_frames=20)
+        for descriptor in extracted:
+            relative = descriptor["path"].relative_to(settings.data_dir).as_posix()
+            ocr = ocr_image(descriptor["path"])
+            frame = m.KeyFrame(
+                material_file_id=item.id,
+                time_ms=descriptor.get("time_ms"),
+                image_relative_path=relative,
+                image_sha256=descriptor.get("sha256"),
+                ocr_text=ocr,
+            )
+            session.add(frame)
+            frames.append(frame)
+        item.parse_status = "解析完成" if extracted else "待专用解析"
+    session.flush()
+    _update_task(
+        session,
+        run,
+        "画面与PDF解析",
+        status="已完成" if frames else "不适用",
+        result_json={"key_frames": len(frames)},
+    )
+    return frames
 
 
 def _persist_mock_observations(
@@ -507,10 +1144,12 @@ def _persist_model_observations(
     materials: list[dict[str, Any]],
     adapter_result: dict[str, Any],
     adapter: IntentModelAdapter,
+    material_file_ids: set[str] | None = None,
 ) -> tuple[int, int, list[str]]:
     observations = adapter_result.get("observations")
     if not isinstance(observations, list):
         raise DomainError(502, "模型响应缺少结构化 observations 数组")
+    valid_file_ids = material_file_ids or set()
 
     technology_ids = set(
         session.scalars(
@@ -599,7 +1238,11 @@ def _persist_model_observations(
         speaker_count += 1
         evidence = m.EvidenceFragment(
             package_id=package.id,
-            material_file_id=material.get("id"),
+            material_file_id=(
+                material.get("id")
+                if material.get("id") in valid_file_ids
+                else None
+            ),
             evidence_type=f"{material.get('type', '会议材料')}原文",
             locator=f"{material.get('name', '会议材料')} · 第{line_no}行",
             excerpt=quote,
@@ -1044,7 +1687,7 @@ async def save_uploaded_file(
     return item, duplicate
 
 
-def run_analysis(
+def create_analysis_run(
     session: Session,
     package: m.MeetingPackage,
     *,
@@ -1052,7 +1695,15 @@ def run_analysis(
     force: bool,
     settings: Settings | None = None,
     adapter: IntentModelAdapter | None = None,
+    stage_adapter=None,
+    asr_settings=None,
 ) -> m.AnalysisRun:
+    """Validate inputs and persist a run plus its eight stage tasks.
+
+    This runs in the request thread so callers receive a run id and can
+    return HTTP 202 immediately; stage execution is delegated to the
+    background worker (``execute_analysis_run``).
+    """
     if adapter is None:
         try:
             adapter = get_model_adapter(adapter_name)
@@ -1069,7 +1720,7 @@ def run_analysis(
                 m.AnalysisRun.package_id == package.id,
                 m.AnalysisRun.adapter == adapter.name,
                 m.AnalysisRun.model_name == adapter.model_name,
-                m.AnalysisRun.status == "已完成",
+                m.AnalysisRun.status.in_(("已完成", "运行中")),
             )
             .order_by(m.AnalysisRun.created_at.desc())
         )
@@ -1106,24 +1757,6 @@ def run_analysis(
         )
     package.material_completeness = "完整"
 
-    model_materials = [
-        {
-            "id": item.id,
-            "type": item.material_type,
-            "name": item.safe_name,
-        }
-        for item in files
-    ]
-    readable_material_ids: set[str] = set()
-    master_data: dict[str, list[dict[str, Any]]] = {}
-    if adapter.name != "mock":
-        if settings is None:
-            raise DomainError(500, "真实模型分析缺少本地数据目录配置")
-        model_materials, readable_material_ids = _build_model_materials(
-            settings, package, list(files)
-        )
-        master_data = _master_data_for_model(session)
-
     run = m.AnalysisRun(
         package_id=package.id,
         adapter=adapter.name,
@@ -1149,37 +1782,149 @@ def run_analysis(
     package.status = "分析中"
     package.version += 1
     session.commit()
+    session.refresh(run)
+    return run
+
+
+def execute_analysis_run(
+    session: Session,
+    run: m.AnalysisRun,
+    *,
+    settings: Settings | None = None,
+    adapter: IntentModelAdapter | None = None,
+    stage_adapter=None,
+    asr_settings=None,
+) -> m.AnalysisRun:
+    """Run the stage pipeline for an already-created analysis run.
+
+    Called by the background worker (and by ``run_analysis`` for tests and
+    compatibility).  Each stage persists its own result_json so a client can
+    poll ``/api/meeting-packages/{id}/tasks`` for live progress.
+    """
+    package = session.get(m.MeetingPackage, run.package_id)
+    if package is None:
+        raise DomainError(404, "会议资料包不存在")
+    if adapter is None:
+        try:
+            adapter = get_model_adapter(run.adapter)
+        except ValueError as exc:
+            raise DomainError(422, str(exc)) from exc
+    files = session.scalars(
+        select(m.MaterialFile).where(
+            m.MaterialFile.package_id == package.id,
+            m.MaterialFile.is_deleted.is_(False),
+        )
+    ).all()
+    model_materials = [
+        {
+            "id": item.id,
+            "type": item.material_type,
+            "name": item.safe_name,
+        }
+        for item in files
+    ]
+    readable_material_ids: set[str] = set()
+    master_data: dict[str, list[dict[str, Any]]] = {}
+    if adapter.name != "mock":
+        if settings is None:
+            raise DomainError(500, "真实模型分析缺少本地数据目录配置")
+        model_materials, readable_material_ids = _build_model_materials(
+            settings, package, list(files)
+        )
+        master_data = _master_data_for_model(session)
 
     try:
-        adapter_result = adapter.analyze(
-            ModelContext(
-                package_id=package.id,
-                customer_id=package.customer_id,
-                material_summaries=model_materials,
-                master_data=master_data,
-            )
-        )
-        tasks = session.scalars(
-            select(m.ProcessingTask)
-            .where(m.ProcessingTask.analysis_run_id == run.id)
-            .order_by(m.ProcessingTask.stage_order)
-        ).all()
-        _finish_analysis_tasks(run, list(tasks), adapter_name=adapter.name)
-        for material in files:
-            if adapter.name == "mock":
-                material.parse_status = "模拟解析完成"
-            elif material.id in readable_material_ids:
-                material.parse_status = "模型已读取"
-            else:
-                material.parse_status = "待专用解析"
-
         if adapter.name == "mock":
+            _update_task(session, run, "文件预检", status="已完成", progress=100)
+            adapter_result = adapter.analyze(
+                ModelContext(
+                    package_id=package.id,
+                    customer_id=package.customer_id,
+                    material_summaries=model_materials,
+                    master_data=master_data,
+                )
+            )
+            tasks = session.scalars(
+                select(m.ProcessingTask)
+                .where(m.ProcessingTask.analysis_run_id == run.id)
+                .order_by(m.ProcessingTask.stage_order)
+            ).all()
+            _finish_analysis_tasks(run, list(tasks), adapter_name=adapter.name)
+            for material in files:
+                material.parse_status = "模拟解析完成"
             speaker_count, observation_count, unresolved = (
                 _persist_mock_observations(
                     session, package, run, list(files), adapter
                 )
             )
         else:
+            if settings is None:
+                raise DomainError(500, "真实模型分析缺少本地数据目录配置")
+            _update_task(session, run, "文件预检", status="已完成", progress=100)
+
+            parsed_readable, extra_materials, parsed_transcripts = (
+                _parse_document_stage(
+                session, settings, run, package, list(files)
+                )
+            )
+            readable_material_ids |= parsed_readable
+            _update_task(
+                session,
+                run,
+                "文档解析",
+                status="已完成",
+                result_json={"derived_materials": len(extra_materials)},
+            )
+            session.commit()
+
+            _asr_done, asr_transcripts = _run_audio_stage(
+                session,
+                settings,
+                run,
+                package,
+                list(files),
+                asr_settings,
+            )
+            transcripts = parsed_transcripts + asr_transcripts
+            frames = _run_visual_stage(
+                session, settings, run, package, list(files)
+            )
+            session.commit()
+            pages = list(
+                session.scalars(
+                    select(m.PdfPageText).where(
+                        m.PdfPageText.material_file_id.in_(
+                            [item.id for item in files]
+                        )
+                    )
+                ).all()
+            )
+            model_materials = _extend_materials_with_derived(
+                model_materials,
+                extra_materials,
+                transcripts,
+                pages,
+            )
+
+            _run_alignment_stage(
+                session,
+                stage_adapter,
+                run,
+                package,
+                transcripts,
+                pages,
+                frames,
+            )
+            session.commit()
+
+            adapter_result = adapter.analyze(
+                ModelContext(
+                    package_id=package.id,
+                    customer_id=package.customer_id,
+                    material_summaries=model_materials,
+                    master_data=master_data,
+                )
+            )
             speaker_count, observation_count, unresolved = (
                 _persist_model_observations(
                     session,
@@ -1188,8 +1933,48 @@ def run_analysis(
                     model_materials,
                     adapter_result,
                     adapter,
+                    material_file_ids={item.id for item in files},
                 )
             )
+            _update_task(
+                session,
+                run,
+                "意向抽取",
+                status="已完成",
+                result_json={"observations": observation_count},
+            )
+            session.commit()
+
+            observation_speaker_ids = session.scalars(
+                select(m.RawIntentObservation.speaker_id).where(
+                    m.RawIntentObservation.analysis_run_id == run.id,
+                    m.RawIntentObservation.speaker_id.is_not(None),
+                )
+            ).all()
+            speakers: list[m.SpeakerCluster] = []
+            if observation_speaker_ids:
+                speakers = list(
+                    session.scalars(
+                        select(m.SpeakerCluster).where(
+                            m.SpeakerCluster.id.in_(observation_speaker_ids)
+                        )
+                    ).all()
+                )
+            _run_identity_stage(
+                session,
+                stage_adapter,
+                run,
+                package,
+                master_data,
+                speakers,
+            )
+            session.commit()
+
+            for material in files:
+                if material.id in readable_material_ids:
+                    material.parse_status = "模型已读取"
+                elif material.parse_status in {None, "待专用解析"}:
+                    material.parse_status = "待专用解析"
 
         run.status = "已完成"
         run.finished_at = m.utcnow()
@@ -1225,10 +2010,60 @@ def run_analysis(
             failed_package.status = "处理失败"
             failed_package.last_error = str(exc)
             failed_package.version += 1
+        open_tasks = session.scalars(
+            select(m.ProcessingTask).where(
+                m.ProcessingTask.analysis_run_id == run.id,
+                m.ProcessingTask.status.in_(("待处理", "处理中")),
+            )
+        ).all()
+        for task in open_tasks:
+            task.status = "处理失败"
+            task.error_message = str(exc)
+            task.finished_at = m.utcnow()
         session.commit()
         if isinstance(exc, DomainError):
             raise
         raise DomainError(500, f"AI分析失败：{exc}") from exc
+
+
+def run_analysis(
+    session: Session,
+    package: m.MeetingPackage,
+    *,
+    adapter_name: str,
+    force: bool,
+    settings: Settings | None = None,
+    adapter: IntentModelAdapter | None = None,
+    stage_adapter=None,
+    asr_settings=None,
+) -> m.AnalysisRun:
+    """Synchronous entrypoint retained for tests and compatibility.
+
+    Production API routes use ``create_analysis_run`` + the background worker
+    instead; this helper keeps the previous blocking behaviour available to
+    callers that intentionally wait for completion in one call.
+    """
+    run = create_analysis_run(
+        session,
+        package,
+        adapter_name=adapter_name,
+        force=force,
+        settings=settings,
+        adapter=adapter,
+        stage_adapter=stage_adapter,
+        asr_settings=asr_settings,
+    )
+    if run.status == "已完成":
+        # A completed run was reused because force=False.
+        return run
+    return execute_analysis_run(
+        session,
+        run,
+        settings=settings,
+        adapter=adapter,
+        stage_adapter=stage_adapter,
+        asr_settings=asr_settings,
+    )
 
 
 def run_mock_analysis(
@@ -1250,6 +2085,116 @@ def run_mock_analysis(
         settings=settings,
         adapter=adapter,
     )
+
+
+def merge_speakers(
+    session: Session,
+    *,
+    package_id: str,
+    keep_speaker_id: str,
+    merge_speaker_ids: list[str],
+    actor: str,
+) -> m.SpeakerCluster:
+    keep = session.get(m.SpeakerCluster, keep_speaker_id)
+    if keep is None or keep.package_id != package_id:
+        raise DomainError(404, "保留说话人不存在或不属于该资料包")
+    for speaker_id in merge_speaker_ids:
+        target = session.get(m.SpeakerCluster, speaker_id)
+        if target is None or target.package_id != package_id:
+            raise DomainError(404, f"说话人不存在：{speaker_id}")
+        if target.status == "已确认":
+            raise DomainError(
+                422,
+                f"说话人{target.label}已确认身份，请先拆分或取消确认后再合并",
+            )
+        segments = session.scalars(
+            select(m.SpeakerSegment).where(
+                m.SpeakerSegment.speaker_id == target.id
+            )
+        ).all()
+        for segment in segments:
+            segment.speaker_id = keep.id
+        observations = session.scalars(
+            select(m.RawIntentObservation).where(
+                m.RawIntentObservation.speaker_id == target.id
+            )
+        ).all()
+        for observation in observations:
+            observation.speaker_id = keep.id
+            observation.version += 1
+        session.add(
+            m.ConfirmationRecord(
+                target_type="speaker",
+                target_id=target.id,
+                action="合并",
+                before_snapshot={"merged_into": keep.id},
+                after_snapshot={"merged_into": keep.id},
+                actor=actor,
+                note=f"合并到{keep.label}",
+            )
+        )
+        session.delete(target)
+    keep.version += 1
+    session.commit()
+    session.refresh(keep)
+    return keep
+
+
+def _next_speaker_label(session: Session, package_id: str) -> int:
+    count = session.scalar(
+        select(func.count())
+        .select_from(m.SpeakerCluster)
+        .where(m.SpeakerCluster.package_id == package_id)
+    )
+    return int(count or 0) + 1
+
+
+def split_speaker(
+    session: Session,
+    *,
+    package_id: str,
+    speaker_id: str,
+    segment_ids: list[str],
+    actor: str,
+) -> m.SpeakerCluster:
+    source = session.get(m.SpeakerCluster, speaker_id)
+    if source is None or source.package_id != package_id:
+        raise DomainError(404, "说话人不存在或不属于该资料包")
+    segments = session.scalars(
+        select(m.SpeakerSegment).where(
+            m.SpeakerSegment.speaker_id == source.id,
+            m.SpeakerSegment.id.in_(segment_ids),
+        )
+    ).all()
+    if not segments:
+        raise DomainError(422, "没有可拆分的片段")
+    label_index = _next_speaker_label(session, package_id)
+    target = m.SpeakerCluster(
+        package_id=package_id,
+        label=f"Speaker {label_index}",
+        recommended_name="待确认人员（拆分）",
+        confidence=0.5,
+        status="待确认",
+    )
+    session.add(target)
+    session.flush()
+    moved_ids = [segment.id for segment in segments]
+    for segment in segments:
+        segment.speaker_id = target.id
+    session.add(
+        m.ConfirmationRecord(
+            target_type="speaker",
+            target_id=source.id,
+            action="拆分",
+            before_snapshot={"segments": moved_ids},
+            after_snapshot={"created_speaker": target.id, "segments": moved_ids},
+            actor=actor,
+        )
+    )
+    source.version += 1
+    session.commit()
+    session.refresh(target)
+    return target
 
 
 def confirm_speaker(

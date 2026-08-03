@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$NoBrowser,
     [ValidateRange(1, 65535)]
     [int]$BackendPort = 8000,
@@ -237,11 +237,25 @@ $frontendMetaFile = Join-Path $RuntimeDir "frontend.meta.json"
 $initialCredentialsDir = Join-Path $DataDir "config\initial-login-credentials"
 $backendUrl = "http://127.0.0.1:$BackendPort/api/health"
 $frontendUrl = "http://127.0.0.1:$FrontendPort"
+$asrPort = 8099
+$asrPidFile = Join-Path $RuntimeDir "asr.pid"
+$asrMetaFile = Join-Path $RuntimeDir "asr.meta.json"
+$asrHealthUrl = "http://127.0.0.1:$asrPort/health"
+$asrServerExe = Join-Path $projectRoot "models\llama.cpp\llama-server.exe"
+$asrModel = Join-Path $projectRoot "models\qwen3-asr\Qwen3-ASR-1.7B.Q8_0.gguf"
+$asrMmproj = Join-Path $projectRoot "models\qwen3-asr\mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"
+$asrAvailable = (
+    (Test-Path -LiteralPath $asrServerExe) -and
+    (Test-Path -LiteralPath $asrModel) -and
+    (Test-Path -LiteralPath $asrMmproj)
+)
 
 $managedBackend = Get-ManagedService -PidFile $backendPidFile -MetaFile $backendMetaFile -ExpectedNames @("python", "pythonw") -Port $BackendPort -HealthUrl $backendUrl
 $managedFrontend = Get-ManagedService -PidFile $frontendPidFile -MetaFile $frontendMetaFile -ExpectedNames @("node") -Port $FrontendPort -HealthUrl $frontendUrl
+$managedAsr = Get-ManagedService -PidFile $asrPidFile -MetaFile $asrMetaFile -ExpectedNames @("llama-server") -Port $asrPort -HealthUrl $asrHealthUrl
 $backendHealthy = Test-ServiceHealth -Url $backendUrl
 $frontendHealthy = Test-ServiceHealth -Url $frontendUrl
+$asrHealthy = Test-ServiceHealth -Url $asrHealthUrl
 
 if ($backendHealthy -and $frontendHealthy) {
     if ($managedBackend -and $managedFrontend) {
@@ -257,6 +271,29 @@ if ($backendHealthy -and $frontendHealthy) {
 
 $startedProcesses = @()
 try {
+    if ($asrAvailable -and -not $asrHealthy) {
+        Write-Host "正在启动 ASR 语音服务（端口 $asrPort）..." -ForegroundColor Cyan
+        $asrProcess = Start-HiddenProcess `
+            -FilePath $asrServerExe `
+            -Arguments "-m `"$asrModel`" --mmproj `"$asrMmproj`" --host 127.0.0.1 --port $asrPort" `
+            -WorkingDirectory (Split-Path -Parent $asrServerExe) `
+            -StandardOutputPath (Join-Path $logDir "asr.out.log") `
+            -StandardErrorPath (Join-Path $logDir "asr.err.log")
+        $startedProcesses += $asrProcess
+        if (Wait-ForUrl -Url $asrHealthUrl -Attempts 120) {
+            $asrOwnerPid = Get-PortOwnerPid -Port $asrPort
+            if ($asrOwnerPid) {
+                $asrProcess = Get-Process -Id $asrOwnerPid -ErrorAction SilentlyContinue
+                if ($asrProcess) {
+                    Write-ServiceMarker -Process $asrProcess -PidFile $asrPidFile -MetaFile $asrMetaFile -Port $asrPort -HealthUrl $asrHealthUrl
+                }
+            }
+        }
+        else {
+            Write-Host "[intent-bao] Warning: ASR 服务启动超时；录音转写与说话人分离将不可用。" -ForegroundColor Yellow
+        }
+    }
+
     if (-not $backendHealthy) {
         Write-Host "正在启动后端服务（端口 $BackendPort）..." -ForegroundColor Cyan
         # Keep the backend as the direct child process so its PID can be
@@ -331,11 +368,30 @@ catch {
     throw
 }
 
+# Environment self-check: model and media components (warnings only)
+$ffmpegCheck = Get-Command ffmpeg -ErrorAction SilentlyContinue
+$ffprobeCheck = Get-Command ffprobe -ErrorAction SilentlyContinue
+$ollamaCheck = Get-Command ollama -ErrorAction SilentlyContinue
+if (-not $ffmpegCheck) {
+    Write-Host "[intent-bao] Warning: FFmpeg not found; audio/screen processing unavailable." -ForegroundColor Yellow
+}
+if (-not $ffprobeCheck) {
+    Write-Host "[intent-bao] Warning: FFprobe not found; media duration probe unavailable." -ForegroundColor Yellow
+}
+if (-not $ollamaCheck) {
+    Write-Host "[intent-bao] Warning: Ollama CLI not found; configure via settings page anyway." -ForegroundColor Yellow
+}
+if (-not $asrAvailable) {
+    Write-Host "[intent-bao] Warning: 未找到内置 ASR 模型（models/qwen3-asr 或 models/llama.cpp），语音转写与说话人分离不可用。" -ForegroundColor Yellow
+}
+
 if (-not $NoBrowser) { Start-Process "http://localhost:$FrontendPort" }
 Write-Host ""
 Write-Host "意向宝已启动：" -ForegroundColor Green
 Write-Host "  应用：http://localhost:$FrontendPort"
 Write-Host "  后端：http://127.0.0.1:$BackendPort/docs"
+$asrStatusLabel = if ($asrHealthy) { '已连接' } else { '未启动/不可用' }
+Write-Host "  ASR语音服务：$asrStatusLabel"
 Show-InitialLoginCredentials -CredentialsDirectory $initialCredentialsDir -OpenFolder:(-not $NoBrowser)
 Write-Host ""
 Write-Host "默认使用模拟分析；如需调用本地Ollama，请在页面“模型设置”中测试并保存。"

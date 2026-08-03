@@ -10,7 +10,8 @@ export type ViewKey =
   | "competition"
   | "history"
   | "dictionary"
-  | "settings";
+  | "settings"
+  | "evaluation";
 
 export type DataSourceMode = "loading" | "api" | "mock";
 
@@ -26,6 +27,9 @@ export interface ModelSettings {
   provider: ModelProvider;
   baseUrl: string;
   modelName: string;
+  asrProvider: "mock" | "llamacpp";
+  asrBaseUrl: string;
+  asrModelName: string;
   apiKeyConfigured: boolean;
   connectionStatus: ModelConnectionStatus;
   lastCheckedAt?: string;
@@ -36,8 +40,27 @@ export interface ModelSettingsInput {
   provider: ModelProvider;
   baseUrl: string;
   modelName: string;
+  asrProvider?: "mock" | "llamacpp";
+  asrBaseUrl?: string;
+  asrModelName?: string;
   apiKey?: string;
   clearApiKey?: boolean;
+}
+
+export interface ProcessingTask {
+  id: string;
+  packageId: string;
+  analysisRunId: string;
+  stage: string;
+  stageOrder: number;
+  status: "待处理" | "处理中" | "已完成" | "不适用" | "已取消" | "处理失败";
+  progress: number;
+  attemptCount: number;
+  startedAt?: string;
+  finishedAt?: string;
+  errorMessage?: string;
+  updatedAt: string;
+  version: number;
 }
 
 export interface ModelConnectionResult {
@@ -172,6 +195,7 @@ export interface IntentObservation {
   customerProject: string;
   functionName: string;
   person: string;
+  identityConfirmed?: boolean;
   attitude: AttitudeLevel;
   adoptionStage: AdoptionStage;
   confidence: number;

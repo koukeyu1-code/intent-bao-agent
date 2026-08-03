@@ -12,8 +12,8 @@ test("business API shares the auth base and sends Bearer without cookies", async
   assert.doesNotMatch(source, /credentials:\s*"include"/);
   assert.equal(
     source.match(/credentials:\s*"omit"/g)?.length,
-    3,
-    "JSON, material upload, and Excel preflight must all reject cookies",
+    4,
+    "JSON, material upload, Excel preflight, and result export must all reject cookies",
   );
   assert.ok(
     (source.match(/bearerHeaders\(\)/g)?.length ?? 0) >= 3,

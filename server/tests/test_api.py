@@ -7,6 +7,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from conftest import wait_for_analysis
+
 from app import models as m
 from app.auth import AppUser, ROLE_VIEWER
 from app.main import create_app
@@ -62,6 +64,11 @@ def _create_analyzed_package(client: TestClient, title: str) -> tuple[dict, list
         f"/api/meeting-packages/{package['id']}/analyze", json={}
     )
     assert analyzed.status_code == 202, analyzed.text
+    wait_for_analysis(
+        client,
+        package["id"],
+        run_id=analyzed.json()["analysis_run"]["id"],
+    )
     speakers = client.get(
         "/api/speakers", params={"package_id": package["id"]}
     ).json()["items"]
@@ -196,8 +203,12 @@ def test_create_upload_analyze_validate_and_confirm_flow(
     )
     assert analyzed.status_code == 202, analyzed.text
     assert analyzed.json()["analysis_run"]["adapter"] == "mock"
-    assert analyzed.json()["analysis_run"]["status"] == "已完成"
-    assert all(stage["status"] == "已完成" for stage in analyzed.json()["stages"])
+    assert analyzed.json()["analysis_run"]["status"] == "运行中"
+    wait_for_analysis(
+        client,
+        package["id"],
+        run_id=analyzed.json()["analysis_run"]["id"],
+    )
     analyzed_package = client.get(
         f"/api/meeting-packages/{package['id']}"
     ).json()
@@ -486,6 +497,11 @@ def test_backfilled_old_meeting_does_not_replace_current_status(
             f"/api/meeting-packages/{package['id']}/analyze", json={}
         )
         assert analyzed.status_code == 202, analyzed.text
+        wait_for_analysis(
+            client,
+            package["id"],
+            run_id=analyzed.json()["analysis_run"]["id"],
+        )
 
         speakers = client.get(
             "/api/speakers", params={"package_id": package["id"]}

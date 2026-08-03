@@ -1,9 +1,11 @@
-param(
+﻿param(
     [string]$RuntimeDir,
     [ValidateRange(1, 65535)]
     [int]$BackendPort = 8000,
     [ValidateRange(1, 65535)]
-    [int]$FrontendPort = 3000
+    [int]$FrontendPort = 3000,
+    [ValidateRange(1, 65535)]
+    [int]$AsrPort = 8099
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,7 +53,8 @@ function Get-SafelyOwnedProcess {
 
 $services = @(
     @{ Name = "后端"; File = "backend.pid"; Meta = "backend.meta.json"; ExpectedNames = @("python", "pythonw"); Port = $BackendPort },
-    @{ Name = "前端"; File = "frontend.pid"; Meta = "frontend.meta.json"; ExpectedNames = @("node"); Port = $FrontendPort }
+    @{ Name = "前端"; File = "frontend.pid"; Meta = "frontend.meta.json"; ExpectedNames = @("node"); Port = $FrontendPort },
+    @{ Name = "ASR语音"; File = "asr.pid"; Meta = "asr.meta.json"; ExpectedNames = @("llama-server"); Port = $AsrPort }
 )
 
 foreach ($entry in $services) {

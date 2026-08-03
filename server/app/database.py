@@ -70,6 +70,19 @@ class Database:
                         "ADD COLUMN ai_snapshot JSON"
                     )
                 )
+        if "processing_tasks" in inspector.get_table_names():
+            task_columns = {
+                column["name"]
+                for column in inspector.get_columns("processing_tasks")
+            }
+            if "result_json" not in task_columns:
+                with self.engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            "ALTER TABLE processing_tasks "
+                            "ADD COLUMN result_json TEXT"
+                        )
+                    )
 
     def session(self) -> Session:
         return self.session_factory()

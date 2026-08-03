@@ -19,11 +19,13 @@ import {
   LogoutOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
+  MergeOutlined,
   PlayCircleOutlined,
   PlusOutlined,
   RadarChartOutlined,
   SafetyCertificateOutlined,
   SearchOutlined,
+  ScissorOutlined,
   SettingOutlined,
   SoundOutlined,
   UserSwitchOutlined,
@@ -37,6 +39,7 @@ import {
   Checkbox,
   ConfigProvider,
   Descriptions,
+  Divider,
   Drawer,
   Empty,
   Form,
@@ -74,12 +77,22 @@ import {
   confirmSpeakerIdentity,
   commitTaxonomyImport,
   createMeetingPackage,
+  exportMeetingPackage,
   loadBootstrapDataset,
+  loadPackageTasks,
+  loadSpeakerDetail,
   materialTypeForFile,
+  mergeSpeakers,
   preflightTaxonomyExcel,
+  runEvaluation,
+  splitSpeaker,
   updateIntentReviewDraft,
   updateIntentStatus,
   uploadMeetingMaterial,
+  type AnalyzeMeetingResult,
+  type EvaluationReport,
+  type GoldenIntentRecord,
+  type SpeakerSegmentDetail,
   type TaxonomyImportPreview,
 } from "./api-client";
 import {
@@ -126,6 +139,7 @@ import {
   type IntentStatus,
   type MeetingPackage,
   type MvpDataset,
+  type ProcessingTask,
   type SpeakerSegment,
   type ViewKey,
 } from "./types";
@@ -147,6 +161,41 @@ type NavigationSection = {
   label: string;
   items: NavigationItem[];
 };
+
+const TERMINAL_TASK_STATUSES = new Set([
+  "已完成",
+  "不适用",
+  "已取消",
+  "处理失败",
+]);
+
+const waitForAnalysisCompletion = async (
+  meetingId: string,
+  runId: string,
+  timeoutMs = 10 * 60_000,
+  intervalMs = 2_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { items } = await loadPackageTasks(meetingId);
+    const runTasks = items.filter((item) => item.analysisRunId === runId);
+    if (
+      runTasks.length &&
+      runTasks.every((item) => TERMINAL_TASK_STATUSES.has(item.status))
+    ) {
+      const failed = runTasks.find((item) => item.status === "处理失败");
+      if (failed) {
+        throw new Error(
+          failed.errorMessage || `阶段“${failed.stage}”处理失败`,
+        );
+      }
+      return;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+  }
+  throw new Error("分析任务超时，请稍后在资料包中查看最新状态");
+};
+
 type CompetitorProductGroup = {
   key: string;
   competitor: string;
@@ -272,6 +321,7 @@ const navigationSections: NavigationSection[] = [
       { key: "history", icon: <HistoryOutlined />, label: "历史证据" },
       { key: "dictionary", icon: <DatabaseOutlined />, label: "数据字典" },
       { key: "settings", icon: <SettingOutlined />, label: "模型设置" },
+      { key: "evaluation", icon: <AuditOutlined />, label: "模型评测" },
     ],
   },
 ];
@@ -339,6 +389,12 @@ const pageMeta: Record<
     title: "模型设置",
     description:
       "连接本地Ollama或保留模拟适配器，测试服务并选择当前活动模型。",
+  },
+  evaluation: {
+    eyebrow: "MODEL EVALUATION",
+    title: "模型评测",
+    description:
+      "用金标准逐条比对AI原始输出，量化结构化准确率、证据可追溯率与未知误判率。",
   },
 };
 
@@ -980,6 +1036,41 @@ function MeetingsPage({
   const [analysisBusyId, setAnalysisBusyId] = useState<string>();
   const [supplementBusyId, setSupplementBusyId] = useState<string>();
   const [form] = Form.useForm();
+  const watchingRef = useRef<Set<string>>(new Set());
+  const [watchingCount, setWatchingCount] = useState(0);
+
+  const watchAnalysis = useCallback(
+    async (meetingId: string, runId: string) => {
+      if (watchingRef.current.has(meetingId)) return;
+      watchingRef.current.add(meetingId);
+      setWatchingCount(watchingRef.current.size);
+      try {
+        await waitForAnalysisCompletion(meetingId, runId);
+        await reloadDataset();
+        message.success(`分析已完成，结果已更新。资料包：${meetingId}`, 5);
+      } catch (error) {
+        const reason =
+          error instanceof Error ? error.message : "本地API暂不可用";
+        if (reason.includes("超时")) {
+          message.warning("分析仍在后台进行，可稍后在列表中查看进度", 5);
+        } else {
+          message.error(`分析处理失败：${reason}`, 6);
+        }
+      } finally {
+        watchingRef.current.delete(meetingId);
+        setWatchingCount(watchingRef.current.size);
+      }
+    },
+    [reloadDataset],
+  );
+
+  useEffect(() => {
+    if (watchingCount === 0) return;
+    const timer = window.setInterval(() => {
+      void reloadDataset().catch(() => undefined);
+    }, 4_000);
+    return () => window.clearInterval(timer);
+  }, [watchingCount, reloadDataset]);
 
   const resetCreateDialog = () => {
     setCreateOpen(false);
@@ -1047,14 +1138,17 @@ function MeetingsPage({
         }
       }
 
-      setSubmitStage("正在启动AI分析任务…");
+      setSubmitStage("分析任务已进入后台队列，正在处理…");
       const analysis = await analyzeMeetingPackage(createdId);
+      setSubmitting(false);
+      setSubmitStage("");
+      resetCreateDialog();
       await reloadDataset();
       message.success(
-        `${analysis.message} 资料包编号：${createdId}`,
-        5,
+        `分析任务已进入后台队列，完成后会自动提示。资料包编号：${createdId}`,
+        4,
       );
-      resetCreateDialog();
+      void watchAnalysis(createdId, analysis.analysis_run.id);
     } catch (error) {
       await reloadDataset().catch(() => undefined);
       const reason =
@@ -1230,9 +1324,10 @@ function MeetingsPage({
     setAnalysisBusyId(meetingId);
     try {
       const result = await analyzeMeetingPackage(meetingId, true);
-      await reloadDataset();
-      message.success(result.message);
       setDetail(undefined);
+      await reloadDataset();
+      message.success("分析任务已进入后台队列，完成后会自动提示", 4);
+      void watchAnalysis(meetingId, result.analysis_run.id);
     } catch (error) {
       const reason =
         error instanceof Error ? error.message : "本地API暂不可用";
@@ -1255,6 +1350,35 @@ function MeetingsPage({
       message.error(`补充材料失败：${reason}`);
     } finally {
       setSupplementBusyId(undefined);
+    }
+  };
+
+  const [exportBusyFormat, setExportBusyFormat] = useState<
+    "csv" | "xlsx" | "md" | undefined
+  >();
+
+  const exportDetail = async (format: "csv" | "xlsx" | "md") => {
+    if (!detail || exportBusyFormat) return;
+    setExportBusyFormat(format);
+    try {
+      const blob = await exportMeetingPackage(detail.id, format);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const suffix =
+        format === "xlsx" ? "xlsx" : format === "md" ? "md" : "csv";
+      link.href = url;
+      link.download = `意向宝-${detail.title}-${Date.now()}.${suffix}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      message.success(`已导出 ${suffix.toUpperCase()} 文件`);
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "本地API暂不可用";
+      message.error(`导出失败：${reason}`);
+    } finally {
+      setExportBusyFormat(undefined);
     }
   };
 
@@ -1555,6 +1679,35 @@ function MeetingsPage({
               >
                 启动／重跑AI分析
               </Button>
+              <div className="detail-export-row">
+                <span>结果导出</span>
+                <Space wrap>
+                  <Button
+                    size="small"
+                    loading={exportBusyFormat === "csv"}
+                    disabled={Boolean(exportBusyFormat)}
+                    onClick={() => void exportDetail("csv")}
+                  >
+                    CSV
+                  </Button>
+                  <Button
+                    size="small"
+                    loading={exportBusyFormat === "xlsx"}
+                    disabled={Boolean(exportBusyFormat)}
+                    onClick={() => void exportDetail("xlsx")}
+                  >
+                    Excel
+                  </Button>
+                  <Button
+                    size="small"
+                    loading={exportBusyFormat === "md"}
+                    disabled={Boolean(exportBusyFormat)}
+                    onClick={() => void exportDetail("md")}
+                  >
+                    Markdown
+                  </Button>
+                </Space>
+              </div>
               <p className="identity-boundary">
                 后端将根据资料数据属性与当前活动模型决定是否允许处理；不满足安全策略时会明确拒绝，不会自动降级或外发。
               </p>
@@ -1655,6 +1808,93 @@ function SpeakersPage({
   };
 
   const pending = scopedSpeakers.filter((item) => !item.confirmed).length;
+  const [mergeMode, setMergeMode] = useState(false);
+  const [selectedMergeIds, setSelectedMergeIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [splitSpeakerId, setSplitSpeakerId] = useState<string>();
+  const [splitSegments, setSplitSegments] = useState<
+    SpeakerSegmentDetail[]
+  >([]);
+  const [splitSelectedIds, setSplitSelectedIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [speakerBusyId, setSpeakerBusyId] = useState<
+    string | "merge" | "split"
+  >();
+
+  const toggleMergeSelect = (id: string) => {
+    setSelectedMergeIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const handleMerge = async () => {
+    if (!activeSpeaker || !meetingId || !selectedMergeIds.size) return;
+    setSpeakerBusyId("merge");
+    try {
+      await mergeSpeakers({
+        packageId: meetingId,
+        keepSpeakerId: activeSpeaker.id,
+        mergeSpeakerIds: [...selectedMergeIds],
+      });
+      setMergeMode(false);
+      setSelectedMergeIds(new Set());
+      await reloadDataset();
+      message.success("说话人已合并到当前片段");
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "本地API暂不可用";
+      message.error(`合并失败：${reason}`);
+    } finally {
+      setSpeakerBusyId(undefined);
+    }
+  };
+
+  const openSplit = async (speakerId: string) => {
+    setSplitSpeakerId(speakerId);
+    setSplitSelectedIds(new Set());
+    try {
+      const detail = await loadSpeakerDetail(speakerId);
+      setSplitSegments(detail.segments);
+      if (!detail.segments.length) {
+        setSplitSpeakerId(undefined);
+        message.info("该说话人没有可拆分的转写片段");
+      }
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "本地API暂不可用";
+      setSplitSpeakerId(undefined);
+      message.error(`读取片段失败：${reason}`);
+    }
+  };
+
+  const confirmSplit = async () => {
+    if (!splitSpeakerId || !meetingId || !splitSelectedIds.size) return;
+    setSpeakerBusyId("split");
+    try {
+      await splitSpeaker({
+        packageId: meetingId,
+        speakerId: splitSpeakerId,
+        segmentIds: [...splitSelectedIds],
+      });
+      setSplitSpeakerId(undefined);
+      await reloadDataset();
+      message.success("所选片段已拆分为新的说话人");
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "本地API暂不可用";
+      message.error(`拆分失败：${reason}`);
+    } finally {
+      setSpeakerBusyId(undefined);
+    }
+  };
 
   return (
     <div className="page-stack">
@@ -1668,6 +1908,29 @@ function SpeakersPage({
           </span>
         </div>
         <Space wrap>
+          <Button
+            icon={<MergeOutlined />}
+            disabled={!scopedSpeakers.length || Boolean(splitSpeakerId)}
+            onClick={() => {
+              setMergeMode((current) => !current);
+              setSelectedMergeIds(new Set());
+            }}
+          >
+            {mergeMode ? "退出合并" : "合并说话人"}
+          </Button>
+          {mergeMode ? (
+            <Button
+              type="primary"
+              danger
+              loading={speakerBusyId === "merge"}
+              disabled={
+                !activeSpeaker || !selectedMergeIds.size
+              }
+              onClick={() => void handleMerge()}
+            >
+              合并 {selectedMergeIds.size} 个到「{activeSpeaker?.speakerCode ?? ""}」
+            </Button>
+          ) : null}
           <Select
             value={meetingId}
             placeholder="选择会议资料包"
@@ -1698,12 +1961,24 @@ function SpeakersPage({
                 key={speaker.id}
                 className={`speaker-list-item ${
                   activeSpeaker?.id === speaker.id ? "is-active" : ""
-                }`}
+                } ${mergeMode ? "is-merging" : ""}`}
                 aria-label={`选择${speaker.speakerCode}片段`}
                 aria-pressed={activeSpeaker?.id === speaker.id}
                 title={speaker.speakerCode}
-                onClick={() => setActiveSpeakerId(speaker.id)}
+                onClick={() =>
+                  mergeMode
+                    ? toggleMergeSelect(speaker.id)
+                    : setActiveSpeakerId(speaker.id)
+                }
               >
+                {mergeMode ? (
+                  <Checkbox
+                    checked={selectedMergeIds.has(speaker.id)}
+                    disabled={speaker.id === activeSpeaker?.id}
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={() => toggleMergeSelect(speaker.id)}
+                  />
+                ) : null}
                 <div className="speaker-avatar">
                   {speaker.speakerCode.replace("Speaker ", "")}
                 </div>
@@ -1720,6 +1995,11 @@ function SpeakersPage({
             ))}
             {!scopedSpeakers.length ? (
               <Empty description="当前资料包暂无说话人片段" />
+            ) : null}
+            {mergeMode ? (
+              <p className="merge-hint">
+                勾选要合并的说话人，点击顶部按钮合并到当前片段；保留片段会自动合并其转写。
+              </p>
             ) : null}
           </div>
         </Card>
@@ -1751,6 +2031,15 @@ function SpeakersPage({
                 </div>
                 <ConfidenceMark value={activeSpeaker.confidence} />
               </div>
+              <Button
+                size="small"
+                icon={<ScissorOutlined />}
+                loading={speakerBusyId === "split"}
+                disabled={mergeMode}
+                onClick={() => void openSplit(activeSpeaker.id)}
+              >
+                拆分此说话人
+              </Button>
             </>
           ) : (
             <Empty description="暂无说话人片段" />
@@ -1853,6 +2142,273 @@ function SpeakersPage({
               </p>
             </>
           ) : null}
+        </Card>
+      </div>
+
+      <Modal
+        title={`拆分说话人片段`}
+        open={Boolean(splitSpeakerId)}
+        onCancel={() => setSplitSpeakerId(undefined)}
+        onOk={() => void confirmSplit()}
+        okText="拆分所选片段"
+        cancelText="取消"
+        okButtonProps={{
+          disabled: !splitSelectedIds.size || speakerBusyId === "split",
+          loading: speakerBusyId === "split",
+        }}
+        width={640}
+      >
+        <p className="identity-boundary">
+          选择要移出的转写片段；确认后这些片段将归入一个新的待确认说话人。
+        </p>
+        <div className="split-segment-list">
+          {splitSegments.map((segment) => (
+            <label
+              className="split-segment-item"
+              key={segment.id}
+              htmlFor={`split-${segment.id}`}
+            >
+              <Checkbox
+                id={`split-${segment.id}`}
+                checked={splitSelectedIds.has(segment.id)}
+                onClick={() => {
+                  setSplitSelectedIds((current) => {
+                    const next = new Set(current);
+                    if (next.has(segment.id)) {
+                      next.delete(segment.id);
+                    } else {
+                      next.add(segment.id);
+                    }
+                    return next;
+                  });
+                }}
+              />
+              <span>
+                {new Date(segment.start_ms).toISOString().slice(14, 19)}–
+                {new Date(segment.end_ms).toISOString().slice(14, 19)}
+              </span>
+              <blockquote>{segment.transcript}</blockquote>
+            </label>
+          ))}
+          {!splitSegments.length ? (
+            <Empty description="该说话人没有转写片段" />
+          ) : null}
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function EvaluationPage({
+  meetings,
+  intents,
+  evidence,
+  dictionaries,
+}: {
+  meetings: MeetingPackage[];
+  intents: IntentObservation[];
+  evidence: Evidence[];
+  dictionaries: DictionaryCollection;
+}) {
+  const [selectedMeetingId, setSelectedMeetingId] = useState<string>();
+  const [goldenText, setGoldenText] = useState("");
+  const [report, setReport] = useState<EvaluationReport>();
+  const [busy, setBusy] = useState(false);
+
+  const meetingObservations = useMemo(
+    () =>
+      selectedMeetingId
+        ? intents.filter((item) => item.meetingId === selectedMeetingId)
+        : [],
+    [selectedMeetingId, intents],
+  );
+
+  const fillFromAiDraft = () => {
+    if (!meetingObservations.length) return;
+    setGoldenText(
+      meetingObservations
+        .map((item) => {
+          const quote =
+            evidence.find((entry) => entry.id === item.evidenceId)?.quote ??
+            "";
+          const functionId =
+            dictionaries.functions.find(
+              (entry) => entry.name === item.functionName,
+            )?.id ?? "";
+          return [
+            quote,
+            item.technologyId ?? "",
+            functionId,
+            item.attitude ?? "",
+            item.adoptionStage ?? "",
+          ].join("\t");
+        })
+        .join("\n"),
+    );
+  };
+
+  const parseGolden = (): GoldenIntentRecord[] => {
+    const records: GoldenIntentRecord[] = [];
+    for (const line of goldenText.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const [quote, technologyId = "", functionId = "", attitudeRaw = "", stage = ""] =
+        trimmed.split("\t");
+      const parsedAttitude = Number(attitudeRaw);
+      records.push({
+        quote,
+        technology_id: technologyId || null,
+        function_id: functionId || null,
+        attitude_level:
+          attitudeRaw !== "" && Number.isFinite(parsedAttitude)
+            ? parsedAttitude
+            : null,
+        adoption_stage: stage || null,
+      });
+    }
+    return records;
+  };
+
+  const handleRun = async () => {
+    if (!selectedMeetingId) return;
+    const golden = parseGolden();
+    if (!golden.length) {
+      message.warning("请先填写至少一条金标准记录");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await runEvaluation(selectedMeetingId, golden);
+      setReport(result.evaluation);
+      message.success("评测完成");
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "本地API暂不可用";
+      message.error(`评测失败：${reason}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rate = (value: number | null | undefined) =>
+    value === null || value === undefined
+      ? "—"
+      : `${(value * 100).toFixed(1)}%`;
+
+  return (
+    <div className="page-stack">
+      <div className="page-toolbar">
+        <div>
+          <Tag color="blue">金标准评测</Tag>
+          <span>比对AI原始输出与人工标注，指标不随人工修正变化</span>
+        </div>
+        <Space wrap>
+          <Select
+            style={{ minWidth: 280 }}
+            placeholder="选择会议资料包"
+            value={selectedMeetingId}
+            onChange={(value) => {
+              setSelectedMeetingId(value);
+              setReport(undefined);
+              setGoldenText("");
+            }}
+            options={meetings.map((meeting) => ({
+              value: meeting.id,
+              label: meeting.title,
+            }))}
+          />
+        </Space>
+      </div>
+
+      <div className="evaluation-grid">
+        <Card className="content-card" title="金标准输入">
+          <Paragraph type="secondary">
+            每行一条记录，字段用 Tab 分隔：原文引用、技术ID、职能ID（可空）、态度档位（1–5，空表示未知）、采用阶段（可空）。
+          </Paragraph>
+          <Button
+            size="small"
+            icon={<FileSearchOutlined />}
+            disabled={!meetingObservations.length}
+            onClick={fillFromAiDraft}
+          >
+            从当前AI草稿生成模板
+          </Button>
+          <Input.TextArea
+            value={goldenText}
+            onChange={(event) => setGoldenText(event.target.value)}
+            rows={10}
+            placeholder={
+              "原文引用\ttech-mini-led\tfunction-product\t5\t样品／技术验证"
+            }
+            style={{ marginTop: 12 }}
+          />
+          <Button
+            type="primary"
+            block
+            loading={busy}
+            disabled={!selectedMeetingId}
+            onClick={() => void handleRun()}
+            style={{ marginTop: 12 }}
+          >
+            运行评测
+          </Button>
+        </Card>
+
+        <Card className="content-card" title="评测结果">
+          {report ? (
+            <>
+              <Descriptions column={2} size="small" bordered>
+                <Descriptions.Item label="金标准总数">
+                  {report.total}
+                </Descriptions.Item>
+                <Descriptions.Item label="完全一致">
+                  {report.correct}
+                </Descriptions.Item>
+                <Descriptions.Item label="结构化准确率">
+                  {rate(report.structured_accuracy)}
+                </Descriptions.Item>
+                <Descriptions.Item label="证据可追溯率">
+                  {rate(report.traceable_rate)}
+                </Descriptions.Item>
+                <Descriptions.Item label="未知样本数">
+                  {report.unknown_total}
+                </Descriptions.Item>
+                <Descriptions.Item label="未知误判率">
+                  {rate(report.unknown_misjudge_rate)}
+                </Descriptions.Item>
+                <Descriptions.Item label="技术字段准确率">
+                  {rate(report.field_accuracy.technology)}
+                </Descriptions.Item>
+                <Descriptions.Item label="职能字段准确率">
+                  {rate(report.field_accuracy.function)}
+                </Descriptions.Item>
+                <Descriptions.Item label="态度字段准确率">
+                  {rate(report.field_accuracy.attitude)}
+                </Descriptions.Item>
+                <Descriptions.Item label="阶段字段准确率">
+                  {rate(report.field_accuracy.stage)}
+                </Descriptions.Item>
+              </Descriptions>
+              <Paragraph type="secondary" style={{ marginTop: 12 }}>
+                {report.notice}
+              </Paragraph>
+              {report.error_count > 0 ? (
+                <>
+                  <Divider plain>错例明细（{report.error_count}）</Divider>
+                  {report.errors.slice(0, 20).map((error, index) => (
+                    <div className="eval-error-item" key={index}>
+                      <strong>{String(error.quote ?? "")}</strong>
+                      <span>{String(error.error ?? "")}</span>
+                    </div>
+                  ))}
+                </>
+              ) : (
+                <Empty description="没有错例，全部金标准记录一致" />
+              )}
+            </>
+          ) : (
+            <Empty description="运行评测后在此展示指标" />
+          )}
         </Card>
       </div>
     </div>
@@ -1965,7 +2521,7 @@ function InsightsPage({
           (item) =>
             item.conflict ||
             item.confidence < 0.75 ||
-            item.person.includes("待确认") ||
+            !item.identityConfirmed ||
             item.attitude === null,
         );
         if (blocked.length) {
@@ -4256,6 +4812,15 @@ function IntentBaoShell() {
         );
       case "settings":
         return <ModelSettingsPage />;
+      case "evaluation":
+        return (
+          <EvaluationPage
+            meetings={dataset.meetings}
+            intents={dataset.intents}
+            evidence={dataset.evidence}
+            dictionaries={dataset.dictionaries}
+          />
+        );
       default:
         return (
           <OverviewPage

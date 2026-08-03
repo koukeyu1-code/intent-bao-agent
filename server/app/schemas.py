@@ -110,6 +110,29 @@ class SpeakerConfirmRequest(StrictRequestModel):
         return self
 
 
+class SpeakerMergeRequest(StrictRequestModel):
+    package_id: str = Field(min_length=1, max_length=64)
+    keep_speaker_id: str = Field(min_length=1, max_length=64)
+    merge_speaker_ids: list[str] = Field(
+        min_length=1, max_length=20, default_factory=list
+    )
+    actor: str = Field(default="本地产品规划负责人", max_length=100)
+
+    @model_validator(mode="after")
+    def validate_merge_targets(self):
+        if self.keep_speaker_id in self.merge_speaker_ids:
+            raise ValueError("保留说话人不能同时出现在合并列表中")
+        return self
+
+
+class SpeakerSplitRequest(StrictRequestModel):
+    package_id: str = Field(min_length=1, max_length=64)
+    segment_ids: list[str] = Field(
+        min_length=1, max_length=500, default_factory=list
+    )
+    actor: str = Field(default="本地产品规划负责人", max_length=100)
+
+
 class IntentConfirmRequest(StrictRequestModel):
     version: int = Field(ge=1)
     attitude_level: int | None = Field(
@@ -237,6 +260,9 @@ class ModelSettingsUpdateRequest(StrictRequestModel):
         description="只写字段；后端仅保存在当前进程内存，任何响应均不回显",
     )
     clear_api_key: bool = False
+    asr_provider: Literal["mock", "llamacpp"] | None = None
+    asr_base_url: str | None = Field(default=None, max_length=500)
+    asr_model_name: str | None = Field(default=None, max_length=200)
 
     @field_validator("clear_api_key")
     @classmethod
@@ -253,6 +279,7 @@ class ModelSettingsResponse(BaseModel):
     base_url: str
     model_name: str
     api_key_configured: bool
+    asr: dict[str, Any] | None = None
     connection_status: ModelConnectionStatus = "unknown"
     last_checked_at: str | None = None
     last_error: str | None = None
@@ -299,7 +326,7 @@ class OllamaIntentObservation(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    technology_id: str = Field(min_length=1, max_length=64)
+    technology_id: str | None = Field(default=None, max_length=64)
     generic_platform_id: str | None = Field(default=None, max_length=64)
     function_id: str | None = Field(default=None, max_length=64)
     speaker_name: str | None = Field(default=None, max_length=100)
@@ -314,6 +341,31 @@ class OllamaIntentObservation(BaseModel):
     decision_influence: Literal["推动", "把关", "评估", "影响", "未知"] | None = None
     confidence: float = Field(ge=0, le=1)
     uncertainty_reason: str | None = Field(default=None, max_length=2000)
+
+    @field_validator(
+        "technology_id",
+        "generic_platform_id",
+        "function_id",
+        "speaker_name",
+        "speaker_role",
+        "speaker_organization",
+        mode="before",
+    )
+    @classmethod
+    def normalize_empty_identifiers(cls, value):
+        """Coerce blank identifiers to null.
+
+        Local models frequently emit ``""`` when they cannot map a material
+        to a master-data identifier.  Downstream persistence treats a null
+        technology as an unresolved candidate instead of failing the whole
+        analysis run, which matches the product rule "unknown is not neutral
+        and never becomes a fabricated 1-5 attitude".
+        """
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @field_validator("bottlenecks")
     @classmethod
@@ -359,3 +411,63 @@ class OllamaAnalysisResult(BaseModel):
         default_factory=list, max_length=100
     )
     usage: dict[str, Any] | None = None
+    done_reason: str | None = None
+    num_predict: int | None = None
+
+
+class SpeakerIdentityRecommendation(BaseModel):
+    """Strict AI output contract for speaker identity recommendations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    speaker_label: str = Field(min_length=1, max_length=64)
+    display_name: str | None = Field(default=None, max_length=100)
+    role: str | None = Field(default=None, max_length=100)
+    organization: str | None = Field(default=None, max_length=200)
+    function_id: str | None = Field(default=None, max_length=64)
+    granularity: Literal["完整", "角色", "职能", "待确认"] = "待确认"
+    confidence: float = Field(ge=0, le=1)
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class IdentityRecommendationOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    speakers: list[SpeakerIdentityRecommendation] = Field(
+        default_factory=list, max_length=100
+    )
+
+
+class MaterialAlignment(BaseModel):
+    """Strict AI output contract for transcript-to-page alignment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segment_id: str = Field(min_length=1, max_length=64)
+    target_type: Literal["pdf_page", "key_frame"]
+    target_id: str = Field(min_length=1, max_length=64)
+    confidence: float = Field(ge=0, le=1)
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class MaterialAlignmentOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    alignments: list[MaterialAlignment] = Field(
+        default_factory=list, max_length=200
+    )
+
+
+class GoldenIntentRecord(StrictRequestModel):
+    quote: str = Field(min_length=1, max_length=4000)
+    technology_id: str | None = Field(default=None, max_length=64)
+    function_id: str | None = Field(default=None, max_length=64)
+    attitude_level: int | None = Field(default=None, ge=1, le=5)
+    adoption_stage: AdoptionStage | None = None
+
+
+class EvalRunRequest(StrictRequestModel):
+    package_id: str = Field(min_length=1, max_length=64)
+    golden: list[GoldenIntentRecord] = Field(
+        min_length=1, max_length=500
+    )

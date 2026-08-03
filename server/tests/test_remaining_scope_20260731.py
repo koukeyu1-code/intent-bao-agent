@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+
+from conftest import wait_for_analysis
 
 from app import models as m
 from app.main import create_app
@@ -177,7 +180,12 @@ def test_pdf_preflight_rejects_fake_and_valid_signature_can_analyze(isolated) ->
     assert accepted.json()["file"]["parse_status"] == "预检通过"
     analyzed = client.post(f"/api/meeting-packages/{package['id']}/analyze", json={})
     assert analyzed.status_code == 202
-    assert analyzed.json()["analysis_run"]["status"] == "已完成"
+    assert analyzed.json()["analysis_run"]["status"] == "运行中"
+    wait_for_analysis(
+        client,
+        package["id"],
+        run_id=analyzed.json()["analysis_run"]["id"],
+    )
 
 
 def test_task_idempotency_force_runs_and_missing_retry_cancel_endpoints(isolated) -> None:
@@ -208,14 +216,26 @@ class BrokenAdapter(IntentModelAdapter):
 
 def test_task_failure_is_persisted_but_no_api_recovery_action(isolated, monkeypatch) -> None:
     client, app, _data_dir, _db_path = isolated
-    import app.services as services
+    import app.stage_orchestrator as orchestrator
 
-    monkeypatch.setattr(services, "get_model_adapter", lambda _name: BrokenAdapter())
+    monkeypatch.setattr(
+        orchestrator,
+        "get_model_adapter",
+        lambda *_args, **_kwargs: BrokenAdapter(),
+    )
     package = create_package(client)
     assert upload_text(client, package["id"]).status_code == 201
-    failed = client.post(f"/api/meeting-packages/{package['id']}/analyze", json={})
-    assert failed.status_code == 500
-    detail = client.get(f"/api/meeting-packages/{package['id']}").json()
+    started = client.post(
+        f"/api/meeting-packages/{package['id']}/analyze", json={}
+    )
+    assert started.status_code == 202
+    deadline = time.monotonic() + 15.0
+    detail = {}
+    while time.monotonic() < deadline:
+        detail = client.get(f"/api/meeting-packages/{package['id']}").json()
+        if detail["status"] == "处理失败":
+            break
+        time.sleep(0.1)
     assert detail["status"] == "处理失败"
     with app.state.database.session() as session:
         run = session.query(m.AnalysisRun).filter_by(package_id=package["id"]).one()
@@ -262,7 +282,15 @@ def test_cors_non_mock_scope_and_path_traversal_protection(isolated) -> None:
     # the evidence endpoint must still refuse to serve a file outside data_dir.
     package = create_package(client)
     assert upload_text(client, package["id"]).status_code == 201
-    assert client.post(f"/api/meeting-packages/{package['id']}/analyze", json={}).status_code == 202
+    analyzed = client.post(
+        f"/api/meeting-packages/{package['id']}/analyze", json={}
+    )
+    assert analyzed.status_code == 202
+    wait_for_analysis(
+        client,
+        package["id"],
+        run_id=analyzed.json()["analysis_run"]["id"],
+    )
     observation = client.get("/api/intent-observations", params={"package_id": package["id"]}).json()["items"][0]
     evidence_id = observation["evidence"]["id"]
     with app.state.database.session() as session:
