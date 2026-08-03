@@ -342,7 +342,7 @@ export default function LoginGate({ children }: LoginGateProps) {
             </button>
           </form>
 
-          <p style={styles.hint}>测试账号：admin（管理员）/ planner（普通用户）</p>
+          <p style={styles.hint}>演示账号：admin（管理员）/ planner（产品规划）</p>
           {errorMessage ? (
             <div style={{ textAlign: "center" }}>
               <button

@@ -171,7 +171,7 @@ test("groups navigation and keeps competitive intelligence separate from formal 
       .length >= 2,
     "own and competitor records must associate by stable platform leaf id",
   );
-  assert.match(appSource, /竞品区为脱敏模拟情报/);
+  assert.match(appSource, /竞品对照数据需接入授权来源并保留出处/);
   assert.match(appSource, /item\?\.attitude \?\? null/);
   assert.doesNotMatch(
     appSource,

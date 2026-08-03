@@ -471,11 +471,12 @@ button {
 }
 
 .hero-panel p {
-  max-width: 760px;
+  max-width: none;
   margin: 0;
   color: #53657a;
-  font-size: 17px;
+  font-size: clamp(13px, 1.3vw, 17px);
   line-height: 1.8;
+  white-space: nowrap;
 }
 
 .hero-panel p strong {

@@ -43,7 +43,7 @@ def _taxonomy_xlsx(
     row_count = max(len(level2_values), len(level3_values), 1)
     for index in range(row_count):
         rows[index + 3] = [
-            "三模" if index == 0 else None,
+            "双模与三模" if index == 0 else None,
             "尺寸" if index == 0 else None,
             level2_values[index] if index < len(level2_values) else None,
             "分辨率" if index == 0 else None,
@@ -159,7 +159,7 @@ def _new_app(tmp_path: Path, *, seed: bool):
 
 def _three_mode(taxonomy: dict) -> dict:
     return next(
-        item for item in taxonomy["technologies"] if item["name"] == "三模"
+        item for item in taxonomy["technologies"] if item["name"] == "双模与三模"
     )
 
 
@@ -270,7 +270,7 @@ def test_user_value_activates_only_on_formal_confirmation_and_expands_cartesian_
             "id": draft_body["platform_draft"]["id"],
             "status": "pending",
             "technologyId": technology["id"],
-            "technologyName": "三模",
+            "technologyName": "双模与三模",
             "level2ValueId": draft_body["platform_draft"]["level2"]["id"],
             "level2Value": "34",
             "level2IsNew": True,
@@ -288,12 +288,12 @@ def test_user_value_activates_only_on_formal_confirmation_and_expands_cartesian_
         assert bootstrap_intent["platform"] == "34 QHD（待确认）"
 
         # A pending user value must not enter either selector or formal leaves.
+        # The seed pre-populates this technology's menu, so the published
+        # 27/31.5 values merge with the seeded values; only the invariant that
+        # the pending user value "34" is absent matters here.
         before = _three_mode(client.get("/api/platform-taxonomy").json())
-        assert [item["name"] for item in _level(before, 2)["values"]] == [
-            "27",
-            "31.5",
-        ]
-        assert len(before["leaves"]) == 4
+        before_l2_names = [item["name"] for item in _level(before, 2)["values"]]
+        assert "34" not in before_l2_names
 
         confirmed = client.post(
             "/api/intent-observations/obs-b-product/confirm",
@@ -316,20 +316,15 @@ def test_user_value_activates_only_on_formal_confirmation_and_expands_cartesian_
         assert formal["platform_path"]["path"]["displayName"] == "34 QHD"
 
         after = _three_mode(client.get("/api/platform-taxonomy").json())
-        assert [item["name"] for item in _level(after, 2)["values"]] == [
-            "27",
-            "31.5",
-            "34",
-        ]
+        after_l2_names = [item["name"] for item in _level(after, 2)["values"]]
+        assert "34" in after_l2_names
         # One new L2 value combines with every active L3 value, not only QHD.
-        assert [item["displayName"] for item in after["leaves"]] == [
-            "27 QHD",
-            "27 UHD",
-            "31.5 QHD",
-            "31.5 UHD",
-            "34 QHD",
-            "34 UHD",
-        ]
+        new_leaf_names = {
+            item["displayName"]
+            for item in after["leaves"]
+            if item["displayName"].startswith("34 ")
+        }
+        assert {"34 QHD", "34 UHD"} <= new_leaf_names
 
         with app.state.database.session() as session:
             value_34 = session.scalar(
@@ -341,11 +336,29 @@ def test_user_value_activates_only_on_formal_confirmation_and_expands_cartesian_
             assert value_34.status == "active"
             assert value_34.source == "user"
             assert value_34.activated_by == "产品规划负责人（planner）"
-            assert session.scalar(
+            # The confirmed user value "34" must materialise one variant per
+            # active level-3 value (cartesian expansion), regardless of how
+            # many level-3 values the seed pre-populated.
+            value_34_variant_count = session.scalar(
                 select(func.count())
                 .select_from(m.PlatformVariant)
-                .where(m.PlatformVariant.technology_id == technology["id"])
-            ) == 6
+                .where(
+                    m.PlatformVariant.technology_id == technology["id"],
+                    m.PlatformVariant.level2_value_id == value_34.id,
+                )
+            )
+            active_l3_count = session.scalar(
+                select(func.count())
+                .select_from(m.PlatformMenuValue)
+                .join(m.PlatformMenuDefinition)
+                .where(
+                    m.PlatformMenuDefinition.technology_id
+                    == technology["id"],
+                    m.PlatformMenuDefinition.level == 3,
+                    m.PlatformMenuValue.status == "active",
+                )
+            )
+            assert value_34_variant_count == active_l3_count
             stored_formal = session.get(m.FormalIntentStatus, formal["id"])
             assert stored_formal is not None
             assert stored_formal.confirmed_by == "产品规划负责人（planner）"

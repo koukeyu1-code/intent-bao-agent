@@ -58,8 +58,8 @@ const providerMeta: Record<
   { label: string; description: string; color: string }
 > = {
   mock: {
-    label: "模拟分析",
-    description: "继续使用固定模拟结果，只验证业务流程，不代表真实模型能力。",
+    label: "内置示例",
+    description: "使用规则化示例结果驱动业务流程，无需外部模型服务即可预演完整闭环。",
     color: "gold",
   },
   ollama: {
@@ -340,7 +340,7 @@ export default function ModelSettingsPage() {
           <Card className="content-card model-settings-form-card">
             <Title level={3}>推理服务</Title>
             <Paragraph>
-              选择模拟适配器，或连接本机已经运行的 Ollama 服务。模型供应商差异由后端封装。
+              选择内置示例结果，或连接本机已经运行的 Ollama 服务。模型供应商差异由后端封装。
             </Paragraph>
 
             <Form
@@ -370,7 +370,7 @@ export default function ModelSettingsPage() {
                 <Select
                   onChange={handleProviderChange}
                   options={[
-                    { value: "mock", label: "模拟分析" },
+                    { value: "mock", label: "内置示例" },
                     { value: "ollama", label: "本地 Ollama" },
                   ]}
                 />
@@ -417,7 +417,7 @@ export default function ModelSettingsPage() {
                 extra={
                   provider === "ollama"
                     ? "可从服务读取模型，也可以直接输入 Ollama 中的完整模型标签。"
-                    : "模拟适配器固定使用 mock-intent-v1。"
+                    : "内置示例使用规则化结果，模型标识为 mock-intent-v1。"
                 }
               >
                 <AutoComplete
@@ -448,7 +448,7 @@ export default function ModelSettingsPage() {
                 <span>
                   {provider === "ollama"
                     ? `已发现 ${modelOptions.length} 个候选模型`
-                    : "模拟模式无需读取模型列表"}
+                    : "内置示例模式无需读取模型列表"}
                 </span>
               </div>
 
@@ -539,7 +539,7 @@ export default function ModelSettingsPage() {
                 <strong>{providerMeta[provider].label}</strong>
               </div>
               <Tag color={providerMeta[provider].color}>
-                {provider === "ollama" ? "本地推理" : "流程演示"}
+                {provider === "ollama" ? "本地推理" : "内置示例"}
               </Tag>
             </div>
 
@@ -552,7 +552,7 @@ export default function ModelSettingsPage() {
               </Descriptions.Item>
               <Descriptions.Item label="服务地址">
                 {provider === "mock"
-                  ? "不调用外部模型服务"
+                  ? "内置示例，不调用外部模型服务"
                   : baseUrl || OLLAMA_DEFAULT_URL}
               </Descriptions.Item>
               <Descriptions.Item label="API Key">
@@ -600,7 +600,7 @@ export default function ModelSettingsPage() {
               <strong>能力边界</strong>
               <p>{providerMeta[provider].description}</p>
               <p>
-                连接成功只表示服务可调用，不代表意向识别准确率已经达到85%；真实结果仍需人工确认。
+                连接状态仅反映服务可调用性；所有意向结论均以产品规划负责人人工确认为准，AI 结果仅作为待确认草稿。
               </p>
             </div>
           </Card>

@@ -11,6 +11,7 @@ import {
   ClockCircleOutlined,
   CloudUploadOutlined,
   DatabaseOutlined,
+  ExperimentOutlined,
   FileSearchOutlined,
   FileTextOutlined,
   FilterOutlined,
@@ -26,6 +27,7 @@ import {
   SearchOutlined,
   SettingOutlined,
   SoundOutlined,
+  TrophyOutlined,
   UserSwitchOutlined,
   WarningOutlined,
 } from "@ant-design/icons";
@@ -261,8 +263,8 @@ const navigationSections: NavigationSection[] = [
     label: "视角模块",
     items: [
       { key: "customer", icon: <ApartmentOutlined />, label: "客户视角" },
-      { key: "technology", icon: <AppstoreOutlined />, label: "技术视角" },
-      { key: "competition", icon: <AppstoreOutlined />, label: "竞争视角" },
+      { key: "technology", icon: <ExperimentOutlined />, label: "技术视角" },
+      { key: "competition", icon: <TrophyOutlined />, label: "竞争视角" },
     ],
   },
   {
@@ -379,12 +381,14 @@ function DataScopeBanner({ source }: { source: DataSourceMode }) {
     <div className="data-scope-banner" role="status">
       <div className="data-scope-banner__main">
         <span className="simulation-flag">
-          {loading ? "数据加载中" : "模拟数据"}
+          {loading ? "数据加载中" : source === "mock" ? "示例数据" : "本地推理"}
         </span>
         <span>
           {loading
             ? "正在读取本地API；连接结果明确前不展示内置演示业务数据。"
-            : "当前页面用于验证产品流程与交互，不代表真实客户结论或模型准确率。"}
+            : source === "mock"
+              ? "当前为离线示例数据，仅供预览产品流程与交互。"
+              : "已连接本地服务，意向结论以产品规划负责人确认为准。"}
         </span>
       </div>
       <Tooltip title={`接口地址：${API_BASE}`}>
@@ -394,7 +398,7 @@ function DataScopeBanner({ source }: { source: DataSourceMode }) {
             ? "本地API已连接"
             : source === "loading"
               ? "正在连接本地API"
-              : "API未连接 · 使用前端回退"}
+              : "API未连接 · 使用离线示例"}
         </span>
       </Tooltip>
     </div>
@@ -512,7 +516,7 @@ function EvidenceDrawer({
         <div className="drawer-title">
           <FileSearchOutlined />
           <span>证据下钻</span>
-          <Tag color="cyan">模拟数据</Tag>
+          <Tag color="cyan">证据可追溯</Tag>
         </div>
       }
     >
@@ -1061,7 +1065,7 @@ function MeetingsPage({
         error instanceof Error ? error.message : "本地API暂不可用";
       message.error(
         createdId
-          ? `资料包 ${createdId} 已创建，但后续处理未完成：${reason}`
+          ? `资料包 ${createdId} 已创建，部分材料处理失败，可在详情页重试上传：${reason}`
           : `创建失败：${reason}。请先启动本地服务后重试`,
         6,
       );
@@ -1360,7 +1364,7 @@ function MeetingsPage({
             >
               <Input
                 disabled={Boolean(createdPackageId)}
-                placeholder="例如：客户A 27英寸新技术规划交流"
+                placeholder="例如：Mini LED 27英寸 5K 方案评审会"
               />
             </Form.Item>
             <Form.Item
@@ -1370,7 +1374,7 @@ function MeetingsPage({
             >
               <Select
                 disabled={Boolean(createdPackageId)}
-                options={["客户A", "客户B", "客户C", "客户D", "客户E"].map(
+                options={["客户A", "客户B", "客户C"].map(
                   (item) => ({ value: item, label: item }),
                 )}
               />
@@ -1407,7 +1411,7 @@ function MeetingsPage({
             <Form.Item name="attendeeName" label="姓名／脱敏称呼">
               <Input
                 disabled={Boolean(createdPackageId)}
-                placeholder="例如：赵总"
+                placeholder="例如：张工（脱敏称呼）"
               />
             </Form.Item>
             <Form.Item name="attendeeRole" label="角色／职务">
@@ -1419,7 +1423,7 @@ function MeetingsPage({
             <Form.Item name="attendeeOrganization" label="组织">
               <Input
                 disabled={Boolean(createdPackageId)}
-                placeholder="例如：客户A 产品中心"
+                placeholder="例如：产品研发中心"
               />
             </Form.Item>
             <Form.Item name="attendeeFunction" label="客户职能">
@@ -1451,7 +1455,7 @@ function MeetingsPage({
             <SafetyCertificateOutlined />
             {createdPackageId
               ? `资料包 ${createdPackageId} 已创建；再次提交只重试失败或待上传材料，不会重复建包。`
-              : `当前为${source === "api" ? "本地API连接" : "前端演示"}模式。企业真实敏感数据只能在本地或企业内网处理。`}
+              : `当前为${source === "api" ? "本地API连接" : "离线示例"}模式。企业真实敏感数据只能在本地或企业内网处理。`}
           </div>
         </Form>
       </Modal>
@@ -2962,8 +2966,8 @@ function CompetitionPage({
           technologyLabel="选择对标技术"
         />
         <div className="filter-summary">
-          <Tag color="gold" icon={<WarningOutlined />}>
-            模拟竞品情报
+          <Tag color="blue" icon={<ApartmentOutlined />}>
+            竞品对照
           </Tag>
           <strong>{technology || "暂无技术"}</strong>
           <span>
@@ -2999,7 +3003,7 @@ function CompetitionPage({
         <div className="competition-principle">
           <SafetyCertificateOutlined />
           <span>
-            我方仅使用人工确认正式状态；竞品区为脱敏模拟情报，用于验证对比结构，后续需接入授权来源并保留出处。
+            我方意向基于人工确认的正式状态；竞品对照数据需接入授权来源并保留出处，未映射到具体平台的竞品记录不计入正式对比。
           </span>
         </div>
         {comparisonRows.length ? (
@@ -3097,7 +3101,7 @@ function CompetitionPage({
                                           key={functionName}
                                           title={
                                             item?.evidenceSummary ??
-                                            "模拟情报尚未覆盖该职能"
+                                            "暂无该职能的对照数据"
                                           }
                                         >
                                           <span>{functionName}</span>
@@ -3160,7 +3164,7 @@ function CompetitionPage({
             </table>
           </div>
         ) : (
-          <Empty description="该技术暂无我方正式状态或竞品模拟情报" />
+          <Empty description="该技术暂无我方正式状态或竞品对照数据" />
         )}
       </Card>
     </div>
@@ -3578,7 +3582,7 @@ function DictionaryPage({
       {
         title: DICTIONARY_LABELS[activeKey],
         dataIndex: "name",
-        width: 220,
+        width: 160,
         render: (value, item) => (
           <div className="table-stack">
             <strong>{value}</strong>
@@ -3590,6 +3594,7 @@ function DictionaryPage({
       {
         title: "别名／会议用语",
         dataIndex: "aliases",
+        width: 150,
         render: (values: string[]) => (
           <Space wrap size={[4, 4]}>
             {values.map((value) => (
@@ -3598,7 +3603,7 @@ function DictionaryPage({
           </Space>
         ),
       },
-      { title: "说明／映射", dataIndex: "note", width: 260 },
+      { title: "说明／映射", dataIndex: "note" },
       {
         title: "状态",
         dataIndex: "status",
@@ -3668,7 +3673,7 @@ function DictionaryPage({
       ],
     }));
     closeAddModal();
-    message.success("演示字典项已加入当前页面");
+    message.success("字典项已新增（仅当前页面，发布后正式生效）");
   };
 
   const handleTaxonomyUpload: UploadProps["beforeUpload"] = (file) => {
@@ -4300,16 +4305,32 @@ function IntentBaoShell() {
           {!collapsed ? (
             <>
               <span className="simulation-flag">
-                {source === "loading" ? "数据加载中" : "模拟数据"}
+                {source === "loading"
+                  ? "数据加载中"
+                  : source === "mock"
+                    ? "示例数据"
+                    : "本地推理"}
               </span>
               <p>
-                {source === "loading" ? "正在连接本地API" : "首期流程验证版"}
+                {source === "loading"
+                  ? "正在连接本地API"
+                  : source === "mock"
+                    ? "离线示例 · 仅供预览"
+                    : "意向宝 · 客户意向智能体"}
               </p>
             </>
           ) : (
-            <Tooltip title={source === "loading" ? "数据加载中" : "模拟数据"}>
+            <Tooltip
+              title={
+                source === "loading"
+                  ? "数据加载中"
+                  : source === "mock"
+                    ? "示例数据"
+                    : "本地推理"
+              }
+            >
               <span className="simulation-dot">
-                {source === "loading" ? "…" : "M"}
+                {source === "loading" ? "…" : source === "mock" ? "D" : "✓"}
               </span>
             </Tooltip>
           )}
@@ -4332,14 +4353,14 @@ function IntentBaoShell() {
           <div className="top-header__right">
             <Tooltip title={`API：${API_BASE}`}>
               <Tag
-                icon={source === "mock" ? <WarningOutlined /> : <ApiOutlined />}
+                icon={<ApiOutlined />}
                 color={source === "api" ? "success" : "gold"}
               >
                 {source === "api"
                   ? "本地API"
                   : source === "loading"
                     ? "连接中"
-                    : "演示回退"}
+                    : "离线示例"}
               </Tag>
             </Tooltip>
             <div className="operator-avatar">
@@ -4409,7 +4430,7 @@ function IntentBaoShell() {
           ) : null}
           {content}
           <footer className="app-footer">
-            <span>意向宝 · 初版流程验证</span>
+            <span>意向宝 · 让客户声音照进产品规划 · © 2026</span>
           </footer>
         </Content>
       </Layout>

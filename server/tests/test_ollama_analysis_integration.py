@@ -22,8 +22,8 @@ class FixedOllamaAdapter(IntentModelAdapter):
             "model": self.model_name,
             "observations": [
                 {
-                    "technology_id": "tech-mini-led",
-                    "generic_platform_id": "platform-27-5k",
+                    "technology_id": "tech-mini-led-backlight",
+                    "generic_platform_id": "platform-tech-mini-led-backlight-27QHD-240Hz",
                     "function_id": "function-development",
                     "speaker_name": "赵总",
                     "speaker_role": "开发负责人",
