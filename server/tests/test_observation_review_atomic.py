@@ -26,7 +26,7 @@ def _new_app(tmp_path: Path):
             {
                 "technologies": [
                     {
-                        "name": "三模",
+                        "name": "双模与三模",
                         "level2": {"name": "尺寸", "values": ["27", "31.5"]},
                         "level3": {
                             "name": "分辨率",
@@ -56,7 +56,7 @@ def _login(client: TestClient) -> None:
 def _three_mode(client: TestClient) -> dict:
     taxonomy = client.get("/api/platform-taxonomy").json()
     return next(
-        item for item in taxonomy["technologies"] if item["name"] == "三模"
+        item for item in taxonomy["technologies"] if item["name"] == "双模与三模"
     )
 
 

@@ -1041,11 +1041,14 @@ def _persist_mock_observations(
         ),
     ]
     technology = session.scalar(
-        select(m.Technology).where(m.Technology.id == "tech-mini-led")
+        select(m.Technology).where(
+            m.Technology.id == "tech-mini-led-backlight"
+        )
     ) or session.scalar(select(m.Technology).order_by(m.Technology.name))
     platform = session.scalar(
         select(m.GenericPlatform).where(
-            m.GenericPlatform.id == "platform-27-5k"
+            m.GenericPlatform.id
+            == "platform-tech-mini-led-backlight-27QHD-240Hz"
         )
     ) or session.scalar(select(m.GenericPlatform))
     if technology is None:
