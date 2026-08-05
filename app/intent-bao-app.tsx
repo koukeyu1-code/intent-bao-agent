@@ -2876,6 +2876,7 @@ function InsightsPage({
         title="修改AI建议"
         okText="保存为待确认"
         cancelText="取消"
+        width={720}
         confirmLoading={savingEdit}
         onCancel={() => setEditing(undefined)}
         onOk={() => void saveEditing()}

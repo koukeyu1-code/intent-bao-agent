@@ -1930,6 +1930,18 @@ button {
 
 .platform-draft-field .platform-cascade-select {
   width: 100%;
+  flex-wrap: nowrap !important;
+  align-items: flex-start;
+}
+
+.platform-draft-field .platform-cascade-select__field {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.platform-draft-field .platform-cascade-select__field .ant-select {
+  min-width: 0;
+  width: 100%;
 }
 
 .platform-draft-note {
