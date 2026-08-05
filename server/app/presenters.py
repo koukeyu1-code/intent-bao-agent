@@ -583,6 +583,7 @@ def public_observation(
         "support_reason": observation.support_reason,
         "resistance_reason": observation.resistance_reason,
         "bottlenecks": observation.bottlenecks or [],
+        "highlight_spec": observation.highlight_spec,
         "decision_influence": observation.decision_influence,
         "confidence": observation.confidence,
         "status": observation.status,
@@ -1071,6 +1072,7 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
             "decisionImpact": observation.decision_influence or "未知",
             "supportReason": observation.support_reason
             or "尚无明确支持理由",
+            "highlightSpec": observation.highlight_spec or "",
             "blocker": "、".join(observation.bottlenecks or [])
             or observation.resistance_reason
             or observation.uncertainty_reason

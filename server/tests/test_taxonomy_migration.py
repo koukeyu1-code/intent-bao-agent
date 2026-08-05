@@ -11,7 +11,7 @@ from app.database import Database
 
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
-REVISION = "0004_media_pipeline"
+REVISION = "0005_highlight_spec"
 REVISION_TABLES = {
     "app_users",
     "app_sessions",

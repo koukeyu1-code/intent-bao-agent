@@ -2900,6 +2900,20 @@ function InsightsPage({
               ) : null}
             </div>
             <label>
+              亮点规格
+              <Input
+                value={editing.highlightSpec ?? ""}
+                onChange={(event) =>
+                  setEditing({
+                    ...editing,
+                    highlightSpec: event.target.value,
+                  })
+                }
+                placeholder="例如：27QHD 240Hz 1ms，峰值亮度1000nits"
+                maxLength={500}
+              />
+            </label>
+            <label>
               职能态度
               <Select
                 value={editing.attitude ?? "unknown"}

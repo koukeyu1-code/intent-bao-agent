@@ -459,6 +459,7 @@ export const updateIntentSuggestion = async (
       suggested_attitude: intent.attitude,
       suggested_adoption_stage: intent.adoptionStage,
       support_reason: intent.supportReason,
+      highlight_spec: intent.highlightSpec ?? null,
       bottlenecks:
         intent.blocker && intent.blocker !== "暂无明确卡点"
           ? [intent.blocker]

@@ -515,6 +515,8 @@ class RawIntentObservation(Base, AuditColumns):
     confidence: Mapped[float | None] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(32), default="AI草稿", index=True)
     uncertainty_reason: Mapped[str | None] = mapped_column(Text)
+    # 亮点规格：人工确认时补充的该意向对应的具体规格亮点（如"27QHD 240Hz 1ms"）
+    highlight_spec: Mapped[str | None] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(128), default="mock-intent-v1")
     prompt_version: Mapped[str] = mapped_column(String(64), default="intent-prompt-v1")
     rule_version: Mapped[str] = mapped_column(String(64), default="business-rule-v1")

@@ -202,6 +202,7 @@ export interface IntentObservation {
   decisionImpact: "推动" | "评估" | "把关" | "否决" | "使用" | "未知";
   supportReason: string;
   blocker: string;
+  highlightSpec?: string;
   status: IntentStatus;
   evidenceId: string;
   conflict: boolean;

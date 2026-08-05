@@ -183,6 +183,7 @@ class ObservationUpdateRequest(StrictRequestModel):
     resistance_reason: str | None = None
     bottlenecks: list[str] = Field(default_factory=list)
     uncertainty_reason: str | None = None
+    highlight_spec: str | None = Field(default=None, max_length=500)
 
     @field_validator("suggested_attitude")
     @classmethod
