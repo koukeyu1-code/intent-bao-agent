@@ -4149,7 +4149,7 @@ function DictionaryPage({
       {
         title: DICTIONARY_LABELS[activeKey],
         dataIndex: "name",
-        width: 220,
+        width: 160,
         render: (value, item) => (
           <div className="table-stack">
             <strong>{value}</strong>
@@ -4161,6 +4161,7 @@ function DictionaryPage({
       {
         title: "别名／会议用语",
         dataIndex: "aliases",
+        width: 150,
         render: (values: string[]) => (
           <Space wrap size={[4, 4]}>
             {values.map((value) => (
@@ -4169,7 +4170,7 @@ function DictionaryPage({
           </Space>
         ),
       },
-      { title: "说明／映射", dataIndex: "note", width: 260 },
+      { title: "说明／映射", dataIndex: "note", width: 320 },
       {
         title: "状态",
         dataIndex: "status",
