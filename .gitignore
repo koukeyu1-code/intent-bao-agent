@@ -69,3 +69,7 @@ __pycache__/
 /runtime/*
 !/runtime/intent_bao_backend_entry.py
 dev-frontend*.log
+
+# 2.1GB ASR 主模型：超过 GitHub LFS 2GB 单文件上限，不纳入版本控制。
+# 本地运行需要此文件，请按 models/qwen3-asr/!下载模型到此处.txt 自行下载放置。
+/models/qwen3-asr/Qwen3-ASR-1.7B.Q8_0.gguf
