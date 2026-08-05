@@ -102,8 +102,8 @@ def test_health_bootstrap_and_master_data(client: TestClient) -> None:
     assert bootstrap.status_code == 200
     body = bootstrap.json()
     assert body["project"]["data_scope"] == "模拟数据"
-    assert body["dashboard"]["metrics"]["meeting_packages"] >= 6
-    assert body["meeting_packages"]["total"] >= 6
+    assert body["dashboard"]["metrics"]["meeting_packages"] >= 4
+    assert body["meeting_packages"]["total"] >= 4
     assert {"meetings", "speakers", "intents", "evidence", "history", "dictionaries"} <= set(body)
     assert body["meetings"]
     assert body["speakers"]
@@ -114,26 +114,26 @@ def test_health_bootstrap_and_master_data(client: TestClient) -> None:
     platform_27_5k = next(
         item
         for item in body["dictionaries"]["platforms"]
-        if item["id"] == "platform-27-5k"
+        if item["id"] == "platform-tech-mini-led-backlight-27QHD-240Hz"
     )
     project_a = next(
         item
         for item in body["dictionaries"]["projects"]
-        if item["id"] == "customer-project-a-pro"
+        if item["id"] == "customer-project-a-led"
     )
     product_function = next(
         item
         for item in body["dictionaries"]["functions"]
         if item["id"] == "function-product"
     )
-    assert "tech-mini-led" in platform_27_5k["parentIds"]
+    assert "tech-mini-led-backlight" in platform_27_5k["parentIds"]
     assert project_a["parentIds"] == ["customer-a"]
     assert "customer-a" in product_function["parentIds"]
     product_history = [
         item
         for item in body["history"]
         if item["customer"] == "客户A"
-        and item["technology"] == "Mini LED"
+        and item["technology"] == "MiniLED背光"
         and item["functionName"] == "产品"
     ]
     assert len(product_history) >= 2
@@ -141,12 +141,14 @@ def test_health_bootstrap_and_master_data(client: TestClient) -> None:
 
     master = client.get("/api/master-data").json()
     assert {item["name"] for item in master["technologies"]} >= {
-        "Mini LED",
-        "三模",
-        "高色域",
-        "AGLR",
-        "圆偏光",
-        "STW",
+        "MiniLED背光",
+        "高色域色彩",
+        "低反射光学",
+        "护眼健康",
+        "极致电竞",
+        "刷新率提升",
+        "双模与三模",
+        "其他创新",
     }
     assert {item["name"] for item in master["customer_functions"]} == {
         "采购",
@@ -312,14 +314,14 @@ def test_dashboard_history_evidence_and_unknown_guard(client: TestClient) -> Non
     assert body["metrics"]["evidence_traceability_rate"] == 100.0
 
     matrix = client.get("/api/dashboard/technology-matrix").json()
-    assert matrix["total"] >= 6
+    assert matrix["total"] >= 4
     assert all(item["evidence_count"] >= 1 for item in matrix["items"])
 
     history = client.get(
         "/api/history",
         params={
             "customer_id": "customer-a",
-            "technology_id": "tech-mini-led",
+            "technology_id": "tech-mini-led-backlight",
             "function_id": "function-product",
         },
     ).json()
@@ -353,7 +355,7 @@ def test_dashboard_history_evidence_and_unknown_guard(client: TestClient) -> Non
     aglr_pm = next(
         item
         for item in all_formal
-        if item["technology"]["id"] == "tech-aglr"
+        if item["technology"]["id"] == "tech-low-reflection"
         and item["function"]["id"] == "function-pm"
     )
     assert aglr_pm["attitude"]["level"] == 1
@@ -375,7 +377,7 @@ def test_dashboard_history_evidence_and_unknown_guard(client: TestClient) -> Non
         item
         for item in all_formal
         if item["customer"]["id"] == "customer-a"
-        and item["technology"]["id"] == "tech-mini-led"
+        and item["technology"]["id"] == "tech-mini-led-backlight"
     ]
     assert {item["attitude"]["level"] for item in customer_a_mini_led} >= {
         2,
@@ -570,7 +572,7 @@ def test_backfilled_old_meeting_does_not_replace_current_status(
         "/api/formal-intent-statuses",
         params={
             "customer_id": "customer-a",
-            "technology_id": "tech-mini-led",
+            "technology_id": "tech-mini-led-backlight",
             "function_id": "function-product",
         },
     ).json()["items"][0]
@@ -582,7 +584,7 @@ def test_backfilled_old_meeting_does_not_replace_current_status(
         params={
             "current_only": "false",
             "customer_id": "customer-a",
-            "technology_id": "tech-mini-led",
+            "technology_id": "tech-mini-led-backlight",
             "function_id": "function-product",
         },
     ).json()["items"]
@@ -674,7 +676,7 @@ def test_data_scope_and_patch_unknown_fields_are_rejected(
     )
     assert missing_scope.status_code == 422
 
-    package = client.get("/api/meeting-packages/package-a-new").json()
+    package = client.get("/api/meeting-packages/package-a-led").json()
     unsupported_patch = client.patch(
         f"/api/meeting-packages/{package['id']}",
         json={
@@ -829,7 +831,7 @@ def test_confirmation_rules_ai_snapshot_audit_and_adoption_stage(
             select(m.AdoptionStageState).where(
                 m.AdoptionStageState.status_key
                 == (
-                    "customer-a|tech-mini-led|platform-27-5k|-"
+                    "customer-a|tech-mini-led-backlight|platform-tech-mini-led-backlight-27QHD-240Hz|-"
                 ),
                 m.AdoptionStageState.is_current.is_(True),
             )

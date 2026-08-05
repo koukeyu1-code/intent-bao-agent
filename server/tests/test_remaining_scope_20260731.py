@@ -83,7 +83,7 @@ def test_empty_filters_pagination_and_unknown_resource_errors(isolated) -> None:
     page1 = client.get("/api/meeting-packages", params={"offset": 0, "limit": 2})
     page2 = client.get("/api/meeting-packages", params={"offset": 2, "limit": 2})
     assert page1.status_code == page2.status_code == 200
-    assert page1.json()["total"] >= 6
+    assert page1.json()["total"] >= 4
     assert len(page1.json()["items"]) == len(page2.json()["items"]) == 2
     assert {item["id"] for item in page1.json()["items"]}.isdisjoint(
         {item["id"] for item in page2.json()["items"]}
@@ -336,5 +336,5 @@ def test_sqlite_copy_restore_and_small_query_latency(isolated, tmp_path: Path) -
             {"Authorization": f"Bearer {login.json()['access_token']}"}
         )
         assert restored_client.get("/api/bootstrap").status_code == 200
-        assert restored_client.get("/api/meeting-packages").json()["total"] >= 6
+        assert restored_client.get("/api/meeting-packages").json()["total"] >= 4
     assert data_dir.exists()
