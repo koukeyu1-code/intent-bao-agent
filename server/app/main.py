@@ -47,6 +47,7 @@ from .model_adapters import (
     get_model_adapter,
 )
 from .model_settings import ModelSettingsError, ModelSettingsStore
+from .schema_migrations import migrate_database
 from .stage_adapters import get_stage_adapter
 from .presenters import (
     dashboard_matrix,
@@ -90,6 +91,7 @@ from .services import (
     ensure_ai_snapshot,
     merge_speakers,
     observation_review_snapshot,
+    request_analysis_run_cancellation,
     save_uploaded_file,
     split_speaker,
 )
@@ -99,6 +101,12 @@ from .stage_orchestrator import (
 )
 from .exporting import export_package
 from .evaluation import run_evaluation
+from .query_visibility import (
+    get_visible_observation,
+    get_visible_speaker,
+    visible_observation_clause,
+    visible_speaker_clause,
+)
 from .media_processing import ffmpeg_available, ffprobe_available
 from .taxonomy_excel import (
     DEFAULT_MAX_XLSX_BYTES,
@@ -125,6 +133,24 @@ def _get_or_404(session: Session, model, item_id: str, label: str):
     item = session.get(model, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=f"{label}不存在")
+    return item
+
+
+def _get_visible_observation_or_404(
+    session: Session, observation_id: str
+) -> m.RawIntentObservation:
+    item = get_visible_observation(session, observation_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="原始意向观察不存在")
+    return item
+
+
+def _get_visible_speaker_or_404(
+    session: Session, speaker_id: str
+) -> m.SpeakerCluster:
+    item = get_visible_speaker(session, speaker_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="说话人不存在")
     return item
 
 
@@ -194,6 +220,7 @@ def create_app(
 ) -> FastAPI:
     settings = Settings.load(database_url=database_url, data_dir=data_dir)
     model_settings = ModelSettingsStore(settings.data_dir)
+    migrate_database(settings.server_dir, settings.database_url)
     database = Database(settings.database_url)
     database.create_all()
     with database.session() as session:
@@ -772,14 +799,31 @@ def create_app(
     def export_package_artifacts(
         package_id: str,
         session: DbSession,
-        _user: CurrentUser,
+        user: EditorUser,
         format: Annotated[str, Query()] = "csv",
     ) -> Response:
-        _get_or_404(session, m.MeetingPackage, package_id, "会议资料包")
+        package = _get_or_404(session, m.MeetingPackage, package_id, "会议资料包")
         try:
             filename, content = export_package(session, package_id, format)
         except ValueError as exc:
             raise DomainError(422, str(exc)) from exc
+        session.add(
+            m.ConfirmationRecord(
+                target_type="meeting_package_export",
+                target_id=package_id,
+                action="导出",
+                before_snapshot=None,
+                after_snapshot={
+                    "format": format.lower(),
+                    "filename": filename,
+                    "data_scope": package.data_scope,
+                    "content_bytes": len(content),
+                },
+                actor=audit_actor(user),
+                note="资料包范围导出",
+            )
+        )
+        session.commit()
         media_type = (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             if filename.endswith(".xlsx")
@@ -803,30 +847,24 @@ def create_app(
         _user: EditorUser,
     ) -> dict:
         run = _get_or_404(session, m.AnalysisRun, run_id, "分析任务")
-        if run.status in {"已完成", "已取消", "处理失败"}:
+        cancellation_requested = request_analysis_run_cancellation(session, run)
+        if not cancellation_requested:
             return {
                 "analysis_run": {
                     "id": run.id,
                     "status": run.status,
                     "package_id": run.package_id,
+                    "cancel_requested_at": iso(run.cancel_requested_at),
                 },
                 "message": "任务已结束，无需取消。",
             }
-        run.status = "已取消"
-        run.error_message = "由用户取消"
-        run.finished_at = run.finished_at or m.utcnow()
-        tasks = session.scalars(
-            select(m.ProcessingTask).where(
-                m.ProcessingTask.analysis_run_id == run.id
-            )
-        ).all()
-        for task in tasks:
-            if task.status not in {"已完成", "不适用"}:
-                task.status = "已取消"
-                task.finished_at = task.finished_at or m.utcnow()
-        session.commit()
         return {
-            "analysis_run": {"id": run.id, "status": run.status},
+            "analysis_run": {
+                "id": run.id,
+                "status": run.status,
+                "package_id": run.package_id,
+                "cancel_requested_at": iso(run.cancel_requested_at),
+            },
             "message": "任务已取消。",
         }
 
@@ -1005,6 +1043,9 @@ def create_app(
         session: DbSession,
         user: EditorUser,
     ) -> dict:
+        _get_visible_speaker_or_404(session, payload.keep_speaker_id)
+        for speaker_id in payload.merge_speaker_ids:
+            _get_visible_speaker_or_404(session, speaker_id)
         speaker = merge_speakers(
             session,
             package_id=payload.package_id,
@@ -1027,6 +1068,7 @@ def create_app(
         session: DbSession,
         user: EditorUser,
     ) -> dict:
+        _get_visible_speaker_or_404(session, speaker_id)
         speaker = split_speaker(
             session,
             package_id=payload.package_id,
@@ -1118,7 +1160,7 @@ def create_app(
         package_id: str | None = None,
         status: str | None = None,
     ) -> dict:
-        query = select(m.SpeakerCluster)
+        query = select(m.SpeakerCluster).where(visible_speaker_clause())
         if package_id:
             query = query.where(m.SpeakerCluster.package_id == package_id)
         if status:
@@ -1135,7 +1177,7 @@ def create_app(
     def get_speaker(
         speaker_id: str, session: DbSession, _user: CurrentUser
     ) -> dict:
-        item = _get_or_404(session, m.SpeakerCluster, speaker_id, "说话人")
+        item = _get_visible_speaker_or_404(session, speaker_id)
         return public_speaker(session, item)
 
     @app.patch("/api/speakers/{speaker_id}/confirm", tags=["说话人校验"])
@@ -1146,7 +1188,7 @@ def create_app(
         session: DbSession,
         user: EditorUser,
     ) -> dict:
-        item = _get_or_404(session, m.SpeakerCluster, speaker_id, "说话人")
+        item = _get_visible_speaker_or_404(session, speaker_id)
         trusted_payload = payload.model_copy(update={"actor": audit_actor(user)})
         confirmed = confirm_speaker(session, item, trusted_payload)
         return public_speaker(session, confirmed)
@@ -1164,7 +1206,7 @@ def create_app(
     ) -> dict:
         query = select(m.RawIntentObservation)
         count_query = select(func.count()).select_from(m.RawIntentObservation)
-        conditions = []
+        conditions = [visible_observation_clause()]
         if package_id:
             conditions.append(m.RawIntentObservation.package_id == package_id)
         if status:
@@ -1175,9 +1217,8 @@ def create_app(
             conditions.append(
                 m.RawIntentObservation.technology_id == technology_id
             )
-        if conditions:
-            query = query.where(*conditions)
-            count_query = count_query.where(*conditions)
+        query = query.where(*conditions)
+        count_query = count_query.where(*conditions)
         items = session.scalars(
             query.order_by(m.RawIntentObservation.created_at.desc())
             .offset(offset)
@@ -1194,9 +1235,7 @@ def create_app(
     def get_intent_observation(
         observation_id: str, session: DbSession, _user: CurrentUser
     ) -> dict:
-        item = _get_or_404(
-            session, m.RawIntentObservation, observation_id, "原始意向观察"
-        )
+        item = _get_visible_observation_or_404(session, observation_id)
         return public_observation(session, item)
 
     @app.patch("/api/intent-observations/{observation_id}", tags=["意向确认"])
@@ -1206,9 +1245,7 @@ def create_app(
         session: DbSession,
         user: EditorUser,
     ) -> dict:
-        item = _get_or_404(
-            session, m.RawIntentObservation, observation_id, "原始意向观察"
-        )
+        item = _get_visible_observation_or_404(session, observation_id)
         if item.version != payload.version:
             raise HTTPException(
                 status_code=409,
@@ -1267,9 +1304,7 @@ def create_app(
     ) -> dict:
         """Save reviewed intent fields and its platform path atomically."""
 
-        item = _get_or_404(
-            session, m.RawIntentObservation, observation_id, "原始意向观察"
-        )
+        item = _get_visible_observation_or_404(session, observation_id)
         if item.version != payload.version:
             raise HTTPException(
                 status_code=409,
@@ -1374,9 +1409,7 @@ def create_app(
         session: DbSession,
         user: EditorUser,
     ) -> dict:
-        item = _get_or_404(
-            session, m.RawIntentObservation, observation_id, "原始意向观察"
-        )
+        item = _get_visible_observation_or_404(session, observation_id)
         if item.version != payload.version:
             raise DomainError(
                 409,
@@ -1433,9 +1466,7 @@ def create_app(
         session: DbSession,
         user: EditorUser,
     ) -> dict:
-        item = _get_or_404(
-            session, m.RawIntentObservation, observation_id, "原始意向观察"
-        )
+        item = _get_visible_observation_or_404(session, observation_id)
         trusted_payload = payload.model_copy(update={"actor": audit_actor(user)})
         observation, formal = confirm_observation(
             session, item, trusted_payload

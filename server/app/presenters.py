@@ -8,6 +8,11 @@ from sqlalchemy.orm import Session
 
 from . import models as m
 from .domain import ATTITUDE_LABELS, adoption_status_key, formal_status_key
+from .query_visibility import (
+    get_visible_observation,
+    visible_observation_clause,
+    visible_speaker_clause,
+)
 from .taxonomy_service import intent_path
 
 
@@ -101,6 +106,7 @@ def observation_conflicts(
                 m.RawIntentObservation.customer_project_id
                 == observation.customer_project_id,
                 m.RawIntentObservation.function_id == observation.function_id,
+                visible_observation_clause(),
             )
         ).all()
         if observation.suggested_attitude is not None:
@@ -352,6 +358,7 @@ def public_package(
         .where(
             m.RawIntentObservation.package_id == item.id,
             m.RawIntentObservation.status.in_(["AI草稿", "待确认", "退回补充"]),
+            visible_observation_clause(),
         )
     )
     latest_run = session.scalar(
@@ -626,7 +633,7 @@ def public_formal_status(
     evidence_items: list[dict[str, Any]] = []
     source_observations: list[m.RawIntentObservation] = []
     for observation_id in item.source_observation_ids or []:
-        observation = session.get(m.RawIntentObservation, observation_id)
+        observation = get_visible_observation(session, observation_id)
         if observation:
             source_observations.append(observation)
         if observation and observation.evidence_id:
@@ -843,7 +850,8 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
         ).all()
         observations = session.scalars(
             select(m.RawIntentObservation).where(
-                m.RawIntentObservation.package_id == package.id
+                m.RawIntentObservation.package_id == package.id,
+                visible_observation_clause(),
             )
         ).all()
         tasks = session.scalars(
@@ -939,9 +947,9 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
         )
 
     speaker_items = session.scalars(
-        select(m.SpeakerCluster).order_by(
-            m.SpeakerCluster.package_id, m.SpeakerCluster.label
-        )
+        select(m.SpeakerCluster)
+        .where(visible_speaker_clause())
+        .order_by(m.SpeakerCluster.package_id, m.SpeakerCluster.label)
     ).all()
     speakers: list[dict[str, Any]] = []
     for speaker in speaker_items:
@@ -985,9 +993,9 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
         )
 
     observation_items = session.scalars(
-        select(m.RawIntentObservation).order_by(
-            m.RawIntentObservation.updated_at.desc()
-        )
+        select(m.RawIntentObservation)
+        .where(visible_observation_clause())
+        .order_by(m.RawIntentObservation.updated_at.desc())
     ).all()
     evidence_by_id: dict[str, dict[str, Any]] = {}
     intents: list[dict[str, Any]] = []
@@ -1143,7 +1151,7 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
             else ""
         )
         source_observation = (
-            session.get(m.RawIntentObservation, source_observation_id)
+            get_visible_observation(session, source_observation_id)
             if source_observation_id
             else None
         )
@@ -1209,7 +1217,11 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
     platform_parent_ids: dict[str, set[str]] = {}
     function_parent_ids: dict[str, set[str]] = {}
     relation_items = [
-        *session.scalars(select(m.RawIntentObservation)).all(),
+        *session.scalars(
+            select(m.RawIntentObservation).where(
+                visible_observation_clause()
+            )
+        ).all(),
         *session.scalars(
             select(m.FormalIntentStatus).where(
                 m.FormalIntentStatus.is_current.is_(True)

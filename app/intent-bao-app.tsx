@@ -169,6 +169,16 @@ const TERMINAL_TASK_STATUSES = new Set([
   "处理失败",
 ]);
 
+class AnalysisCancelledError extends Error {
+  readonly runId: string;
+
+  constructor(runId: string) {
+    super(`分析任务已取消：${runId}`);
+    this.name = "AnalysisCancelledError";
+    this.runId = runId;
+  }
+}
+
 const waitForAnalysisCompletion = async (
   meetingId: string,
   runId: string,
@@ -188,6 +198,9 @@ const waitForAnalysisCompletion = async (
         throw new Error(
           failed.errorMessage || `阶段“${failed.stage}”处理失败`,
         );
+      }
+      if (runTasks.some((item) => item.status === "已取消")) {
+        throw new AnalysisCancelledError(runId);
       }
       return;
     }
@@ -1041,23 +1054,29 @@ function MeetingsPage({
 
   const watchAnalysis = useCallback(
     async (meetingId: string, runId: string) => {
-      if (watchingRef.current.has(meetingId)) return;
-      watchingRef.current.add(meetingId);
+      if (watchingRef.current.has(runId)) return;
+      watchingRef.current.add(runId);
       setWatchingCount(watchingRef.current.size);
       try {
         await waitForAnalysisCompletion(meetingId, runId);
         await reloadDataset();
-        message.success(`分析已完成，结果已更新。资料包：${meetingId}`, 5);
+        message.success(
+          `分析已完成，结果已更新。任务：${runId}；资料包：${meetingId}`,
+          5,
+        );
       } catch (error) {
         const reason =
           error instanceof Error ? error.message : "本地API暂不可用";
-        if (reason.includes("超时")) {
+        if (error instanceof AnalysisCancelledError) {
+          await reloadDataset().catch(() => undefined);
+          message.warning(`分析任务已取消。任务：${error.runId}`, 5);
+        } else if (reason.includes("超时")) {
           message.warning("分析仍在后台进行，可稍后在列表中查看进度", 5);
         } else {
-          message.error(`分析处理失败：${reason}`, 6);
+          message.error(`分析处理失败。任务：${runId}；原因：${reason}`, 6);
         }
       } finally {
-        watchingRef.current.delete(meetingId);
+        watchingRef.current.delete(runId);
         setWatchingCount(watchingRef.current.size);
       }
     },

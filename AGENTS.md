@@ -11,7 +11,9 @@
 重置意向宝登录密码.bat     # 重置 admin/planner 密码（随机或手动）
 ```
 
-当前账号：admin（管理员，密码 admin20260801）、planner（产品规划，密码 planner20260801）。
+当前账号：admin（管理员）、planner（产品规划）。密码不写入仓库；首次启动时到
+`server/data/config/initial-login-credentials/` 查看本机生成的临时凭据，随后请通过
+`重置意向宝登录密码.bat` 轮换并删除临时凭据文件。
 
 ## 技术栈
 

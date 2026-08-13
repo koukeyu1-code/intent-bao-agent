@@ -366,6 +366,9 @@ class AnalysisRun(Base, AuditColumns):
     rule_version: Mapped[str] = mapped_column(String(64), default="business-rule-v1")
     status: Mapped[str] = mapped_column(String(32), default="排队中")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     error_message: Mapped[str | None] = mapped_column(Text)

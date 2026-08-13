@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from . import models as m
 from .domain import ATTITUDE_LABELS
+from .query_visibility import visible_observation_clause
 
 
 def _package_rows(
@@ -16,7 +17,8 @@ def _package_rows(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     observations = session.scalars(
         select(m.RawIntentObservation).where(
-            m.RawIntentObservation.package_id == package_id
+            m.RawIntentObservation.package_id == package_id,
+            visible_observation_clause(),
         )
     ).all()
     observation_rows: list[dict[str, Any]] = []
@@ -70,15 +72,16 @@ def _package_rows(
         )
 
     formal_rows: list[dict[str, Any]] = []
-    formal_items = session.scalars(
-        select(m.FormalIntentStatus).where(
-            m.FormalIntentStatus.customer_id.in_(
-                select(m.MeetingPackage.customer_id).where(
-                    m.MeetingPackage.id == package_id
-                )
-            )
-        )
-    ).all()
+    # A package export is intentionally package-scoped.  Formal status rows
+    # are append-only customer history, so filtering by customer alone would
+    # disclose conclusions sourced from other meetings.  Only include status
+    # versions whose source observation belongs to this package.
+    package_observation_ids = {item.id for item in observations}
+    formal_items = [
+        item
+        for item in session.scalars(select(m.FormalIntentStatus)).all()
+        if package_observation_ids.intersection(item.source_observation_ids or [])
+    ]
     formal_by_key: dict[str, m.FormalIntentStatus] = {}
     for item in formal_items:
         existing = formal_by_key.get(item.status_key)

@@ -145,7 +145,16 @@ test("groups navigation and keeps competitive intelligence separate from formal 
   assert.match(typesSource, /mappedTechnology:\s*string/);
   assert.match(mockSource, /dataClass: "模拟数据"/);
   assert.match(mockSource, /mockCompetitiveIntents/);
-  assert.match(apiSource, /data\.competitiveIntents \?\? mockCompetitiveIntents/);
+  assert.doesNotMatch(
+    apiSource,
+    /data\.competitiveIntents \?\? mockCompetitiveIntents/,
+    "API mode must not silently mix built-in demo competitor data into customer results",
+  );
+  assert.match(
+    apiSource,
+    /competitiveIntents:\s*data\.competitiveIntents \?\? \[\]/,
+    "an API response without competitor data must render an honest empty state",
+  );
   assert.match(
     appSource,
     /const key = `\$\{customer\}\|\$\{platform\}\|\$\{customerProject\}`/,
@@ -337,6 +346,33 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
     apiSource,
     /loadPackageTasks/,
     "analysis must switch to background polling (202 + task progress)",
+  );
+  assert.match(
+    appSource,
+    /runTasks\s*=\s*items\.filter\(\(item\)\s*=>\s*item\.analysisRunId\s*===\s*runId\)/,
+    "analysis polling must select tasks by the returned run id",
+  );
+  for (const operation of ["has", "add", "delete"]) {
+    assert.match(
+      appSource,
+      new RegExp(`watchingRef\\.current\\.${operation}\\(runId\\)`),
+      `analysis watcher ${operation} must use runId`,
+    );
+    assert.doesNotMatch(
+      appSource,
+      new RegExp(`watchingRef\\.current\\.${operation}\\(meetingId\\)`),
+      `analysis watcher ${operation} must not collapse concurrent runs for one meeting`,
+    );
+  }
+  assert.match(
+    appSource,
+    /watchAnalysis\(meetingId,\s*result\.analysis_run\.id\)/,
+    "forced analysis must watch the newly returned run id",
+  );
+  assert.match(
+    appSource,
+    /item\.status\s*===\s*"已取消"[\s\S]{0,160}AnalysisCancelledError/,
+    "a cancelled run must not be reported as successfully completed",
   );
   assert.match(apiSource, /attendees:\s*payload\.attendeeName/);
   assert.match(appSource, /name="attendeeName"/);

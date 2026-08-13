@@ -5,14 +5,17 @@ import queue
 import threading
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from . import models as m
 from .config import Settings
 from .database import Database
 from .model_adapters import get_model_adapter
 from .model_settings import ModelSettingsStore
-from .services import execute_analysis_run
+from .services import (
+    execute_analysis_run,
+    finalize_analysis_run_cancellation,
+)
 from .stage_adapters import get_stage_adapter
 
 logger = logging.getLogger(__name__)
@@ -140,7 +143,12 @@ class AnalysisQueue:
     ) -> None:
         with self._database.session() as session:
             run = session.get(m.AnalysisRun, run_id)
-            if run is None or run.status in {"已取消", "已完成", "处理失败"}:
+            if run is None:
+                return
+            if run.cancel_requested_at is not None:
+                finalize_analysis_run_cancellation(session, run)
+                return
+            if run.status in {"已取消", "已完成", "处理失败"}:
                 return
             try:
                 if adapter is None:
@@ -160,6 +168,12 @@ class AnalysisQueue:
                 # run so polling clients see a terminal state, not a hang.
                 session.rollback()
                 current = session.get(m.AnalysisRun, run_id)
+                if current is not None and (
+                    current.cancel_requested_at is not None
+                    or current.status == "已取消"
+                ):
+                    finalize_analysis_run_cancellation(session, current)
+                    return
                 if (
                     current is not None
                     and current.status not in {"已取消", "已完成", "处理失败"}
@@ -200,6 +214,24 @@ def mark_stale_analysis_runs_failed(database: Database) -> int:
     from . import models as models_module
 
     with database.session() as session:
+        # A process may stop after the API persisted the cancellation marker
+        # but before the worker reached its next safe boundary.  Sweep those
+        # runs first so committed draft rows are cleaned on the next startup.
+        cancelled_ids = list(
+            session.scalars(
+                select(models_module.AnalysisRun.id).where(
+                    or_(
+                        models_module.AnalysisRun.status == "已取消",
+                        models_module.AnalysisRun.cancel_requested_at.is_not(None),
+                    )
+                )
+            ).all()
+        )
+        for run_id in cancelled_ids:
+            cancelled = session.get(models_module.AnalysisRun, run_id)
+            if cancelled is not None:
+                finalize_analysis_run_cancellation(session, cancelled)
+
         stale = list(
             session.scalars(
                 select(models_module.AnalysisRun).where(

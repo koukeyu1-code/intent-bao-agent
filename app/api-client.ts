@@ -19,7 +19,6 @@ import {
   assertConfirmedStage,
   buildIntentConfirmPayload,
 } from "./intent-view-models";
-import { mockCompetitiveIntents } from "./mock-data";
 import {
   bearerHeaders,
   clearAccessToken,
@@ -375,8 +374,10 @@ export const loadBootstrapDataset = async (): Promise<MvpDataset> => {
     ...data,
     meetings: data.meetings ?? data.meeting_packages?.items,
     dictionaries: data.dictionaries ?? data.master_data,
-    competitiveIntents:
-      data.competitiveIntents ?? mockCompetitiveIntents,
+    // API mode must never silently mix the built-in demo competitor records
+    // into customer data.  Until the backend exposes a persisted competitor
+    // dataset, an absent field is an honest empty state.
+    competitiveIntents: data.competitiveIntents ?? [],
     formalIntents: formalResponse.items
       .filter((item) => item.is_current)
       .map(normalizeFormalStatus),

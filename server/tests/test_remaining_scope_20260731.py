@@ -12,6 +12,7 @@ import os
 import shutil
 import time
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -212,6 +213,194 @@ class BrokenAdapter(IntentModelAdapter):
 
     def analyze(self, _context):
         raise RuntimeError("intentional isolated analysis failure")
+
+
+class SlowAdapter(IntentModelAdapter):
+    name = "mock"
+    model_name = "slow-cancel-test"
+
+    def __init__(self) -> None:
+        self.started = Event()
+        self.release = Event()
+
+    def analyze(self, _context):
+        self.started.set()
+        if not self.release.wait(timeout=10.0):
+            raise RuntimeError("slow adapter was not released by the test")
+        return {"mode": "mock", "model": self.model_name}
+
+
+def test_cancel_request_survives_slow_adapter_completion(
+    isolated, monkeypatch
+) -> None:
+    client, app, _data_dir, _db_path = isolated
+    import app.stage_orchestrator as orchestrator
+
+    slow_adapter = SlowAdapter()
+    monkeypatch.setattr(
+        orchestrator,
+        "get_model_adapter",
+        lambda *_args, **_kwargs: slow_adapter,
+    )
+    package = create_package(client)
+    assert upload_text(client, package["id"]).status_code == 201
+    started = client.post(
+        f"/api/meeting-packages/{package['id']}/analyze", json={}
+    )
+    assert started.status_code == 202, started.text
+    run_id = started.json()["task_id"]
+    assert slow_adapter.started.wait(timeout=5.0)
+
+    try:
+        cancelled = client.post(f"/api/analysis-runs/{run_id}/cancel")
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["analysis_run"]["status"] == "已取消"
+        assert cancelled.json()["analysis_run"]["cancel_requested_at"]
+    finally:
+        slow_adapter.release.set()
+
+    deadline = time.monotonic() + 10.0
+    while app.state.analysis_queue.contains(run_id) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not app.state.analysis_queue.contains(run_id)
+
+    with app.state.database.session() as session:
+        run = session.get(m.AnalysisRun, run_id)
+        assert run is not None
+        assert run.cancel_requested_at is not None
+        assert run.status == "已取消"
+        assert run.result_summary is None
+        refreshed_package = session.get(m.MeetingPackage, package["id"])
+        assert refreshed_package is not None
+        assert refreshed_package.status == "已取消"
+        assert refreshed_package.last_error == "由用户取消"
+        tasks = session.query(m.ProcessingTask).filter_by(
+            analysis_run_id=run_id
+        ).all()
+        assert len(tasks) == 8
+        assert {task.status for task in tasks} == {"已取消"}
+        assert (
+            session.query(m.RawIntentObservation)
+            .filter_by(analysis_run_id=run_id)
+            .count()
+            == 0
+        )
+
+
+def test_cancel_cleanup_removes_committed_run_drafts_but_keeps_upload(
+    isolated,
+) -> None:
+    """A safe-boundary cancel must clean rows committed by earlier stages."""
+
+    client, app, data_dir, _db_path = isolated
+    from app.services import (
+        finalize_analysis_run_cancellation,
+        request_analysis_run_cancellation,
+    )
+    from app.stage_orchestrator import mark_stale_analysis_runs_failed
+
+    package = create_package(client, title="分阶段提交后取消")
+    uploaded = upload_text(
+        client,
+        package["id"],
+        name="committed-before-cancel.txt",
+        content=b"Mini LED committed draft evidence",
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    material_id = uploaded.json()["file"]["id"]
+
+    with app.state.database.session() as session:
+        package_row = session.get(m.MeetingPackage, package["id"])
+        material = session.get(m.MaterialFile, material_id)
+        assert package_row is not None and material is not None
+        package_row.status = "分析中"
+        run = m.AnalysisRun(
+            package_id=package_row.id,
+            adapter="ollama",
+            model_name="cancel-after-commit-test",
+            status="运行中",
+            started_at=m.utcnow(),
+        )
+        speaker = m.SpeakerCluster(
+            package_id=package_row.id,
+            label="SPEAKER_CANCELLED",
+            status="待确认",
+        )
+        evidence = m.EvidenceFragment(
+            package_id=package_row.id,
+            material_file_id=material.id,
+            evidence_type="人工纪要",
+            locator="committed-before-cancel.txt 第1行",
+            excerpt="Mini LED committed draft evidence",
+        )
+        session.add_all([run, speaker, evidence])
+        session.flush()
+        transcript = m.TranscriptSegment(
+            analysis_run_id=run.id,
+            package_id=package_row.id,
+            material_file_id=material.id,
+            order_index=1,
+            start_ms=0,
+            end_ms=1000,
+            text="Mini LED committed draft evidence",
+            speaker_label=speaker.label,
+        )
+        observation = m.RawIntentObservation(
+            package_id=package_row.id,
+            analysis_run_id=run.id,
+            customer_id=package_row.customer_id,
+            technology_id="tech-mini-led-backlight",
+            function_id="function-product",
+            speaker_id=speaker.id,
+            evidence_id=evidence.id,
+            raw_quote=evidence.excerpt,
+            suggested_attitude=4,
+            status="待确认",
+            model_name=run.model_name,
+        )
+        session.add_all([transcript, observation])
+        session.flush()
+        alignment = m.AlignmentLink(
+            analysis_run_id=run.id,
+            package_id=package_row.id,
+            segment_id=transcript.id,
+            target_type="PDF页面",
+            target_id="cancelled-target",
+            confidence=0.8,
+        )
+        session.add(alignment)
+        session.commit()
+        run_id = run.id
+        observation_id = observation.id
+        evidence_id = evidence.id
+        transcript_id = transcript.id
+        alignment_id = alignment.id
+        original_path = (data_dir / material.relative_path).resolve()
+        original_hash = material.sha256
+
+        assert request_analysis_run_cancellation(session, run) is True
+        # Simulate the process stopping after the API commits the marker but
+        # before the worker reaches its next safe boundary.
+
+    assert mark_stale_analysis_runs_failed(app.state.database) == 0
+    with app.state.database.session() as session:
+        cancelled = session.get(m.AnalysisRun, run_id)
+        assert cancelled is not None and cancelled.status == "已取消"
+
+        assert session.get(m.RawIntentObservation, observation_id) is None
+        assert session.get(m.EvidenceFragment, evidence_id) is None
+        assert session.get(m.TranscriptSegment, transcript_id) is None
+        assert session.get(m.AlignmentLink, alignment_id) is None
+        kept_material = session.get(m.MaterialFile, material_id)
+        assert kept_material is not None
+        assert kept_material.sha256 == original_hash
+        assert original_path.is_file()
+        assert session.get(m.AnalysisRun, run_id) is not None
+
+        # Cleanup remains idempotent after the restart sweep.
+        again = finalize_analysis_run_cancellation(session, cancelled)
+        assert again is not None and again.status == "已取消"
+        assert session.get(m.MaterialFile, material_id) is not None
 
 
 def test_task_failure_is_persisted_but_no_api_recovery_action(isolated, monkeypatch) -> None:

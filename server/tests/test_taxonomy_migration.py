@@ -8,10 +8,11 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 
 from app.database import Database
+from app.schema_migrations import SchemaMigrationError, migrate_database
 
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
-REVISION = "0005_highlight_spec"
+REVISION = "0006_analysis_cancel"
 REVISION_TABLES = {
     "app_users",
     "app_sessions",
@@ -66,6 +67,13 @@ def test_migration_reaches_0003_for_fresh_and_pre_alembic_databases(
         column["name"]
         for column in schema.get_columns("raw_intent_observations")
     }
+    assert "highlight_spec" in {
+        column["name"]
+        for column in schema.get_columns("raw_intent_observations")
+    }
+    assert "cancel_requested_at" in {
+        column["name"] for column in schema.get_columns("analysis_runs")
+    }
     engine.dispose()
 
 
@@ -76,3 +84,59 @@ def test_migrated_schema_matches_current_models(tmp_path: Path) -> None:
     command.upgrade(config, "head")
     # Raises CommandError if model metadata would require another migration.
     command.check(config)
+
+
+def test_startup_migration_backs_up_and_upgrades_pre_alembic_database(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    url = f"sqlite:///{path.as_posix()}"
+    database = Database(url)
+    database.create_all()
+    with database.engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE raw_intent_observations DROP COLUMN highlight_spec")
+        )
+        connection.execute(
+            text("ALTER TABLE analysis_runs DROP COLUMN cancel_requested_at")
+        )
+    database.engine.dispose()
+
+    result = migrate_database(SERVER_ROOT, url)
+
+    assert result.revision == REVISION
+    assert result.migrated is True
+    assert result.backup_path is not None and result.backup_path.is_file()
+    schema = inspect(create_engine(url))
+    assert "highlight_spec" in {
+        column["name"]
+        for column in schema.get_columns("raw_intent_observations")
+    }
+    assert "cancel_requested_at" in {
+        column["name"] for column in schema.get_columns("analysis_runs")
+    }
+
+
+def test_startup_migration_failure_restores_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "restore.db"
+    url = f"sqlite:///{path.as_posix()}"
+    database = Database(url)
+    database.create_all()
+    database.engine.dispose()
+
+    def fail_after_mutation(_config: Config, _revision: str) -> None:
+        engine = create_engine(url)
+        with engine.begin() as connection:
+            connection.execute(text("DROP TABLE customers"))
+        engine.dispose()
+        raise RuntimeError("forced migration failure")
+
+    monkeypatch.setattr("app.schema_migrations.command.upgrade", fail_after_mutation)
+    with pytest.raises(SchemaMigrationError, match="应用已停止启动"):
+        migrate_database(SERVER_ROOT, url)
+
+    engine = create_engine(url)
+    assert "customers" in inspect(engine).get_table_names()
+    engine.dispose()

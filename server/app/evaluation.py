@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import models as m
+from .query_visibility import visible_observation_clause
 
 
 def _normalize(text: str | None) -> str:
@@ -29,7 +30,8 @@ def run_evaluation(
 
     observations = session.scalars(
         select(m.RawIntentObservation).where(
-            m.RawIntentObservation.package_id == package_id
+            m.RawIntentObservation.package_id == package_id,
+            visible_observation_clause(),
         )
     ).all()
     by_quote: dict[str, list[m.RawIntentObservation]] = {}

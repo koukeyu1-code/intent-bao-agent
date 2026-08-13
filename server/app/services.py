@@ -13,7 +13,7 @@ from typing import Any
 from xml.etree import ElementTree
 
 from fastapi import UploadFile
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from . import models as m
@@ -51,6 +51,206 @@ class DomainError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+
+
+class _AnalysisCancellationRequested(Exception):
+    """Internal control flow used to stop a run at a safe stage boundary."""
+
+
+def analysis_run_cancel_requested(
+    session: Session, run: m.AnalysisRun
+) -> bool:
+    """Refresh the cooperative cancellation marker from the database."""
+
+    session.refresh(
+        run,
+        attribute_names=["status", "cancel_requested_at"],
+    )
+    return run.status == "已取消" or run.cancel_requested_at is not None
+
+
+def _raise_if_analysis_cancel_requested(
+    session: Session, run: m.AnalysisRun
+) -> None:
+    if analysis_run_cancel_requested(session, run):
+        raise _AnalysisCancellationRequested
+
+
+def _mark_analysis_run_cancelled(
+    session: Session, run: m.AnalysisRun
+) -> None:
+    now = m.utcnow()
+    run.cancel_requested_at = run.cancel_requested_at or now
+    run.status = "已取消"
+    run.error_message = "由用户取消"
+    run.finished_at = run.finished_at or now
+    tasks = session.scalars(
+        select(m.ProcessingTask).where(
+            m.ProcessingTask.analysis_run_id == run.id
+        )
+    ).all()
+    for task in tasks:
+        if task.status not in {"已完成", "不适用"}:
+            task.status = "已取消"
+            task.error_message = "由用户取消"
+            task.finished_at = task.finished_at or now
+    package = session.get(m.MeetingPackage, run.package_id)
+    if package is not None and package.status == "分析中":
+        another_active_run = session.scalar(
+            select(m.AnalysisRun.id).where(
+                m.AnalysisRun.package_id == run.package_id,
+                m.AnalysisRun.id != run.id,
+                m.AnalysisRun.status.in_(("排队中", "运行中")),
+                m.AnalysisRun.cancel_requested_at.is_(None),
+            )
+        )
+        if another_active_run is None:
+            package.status = "已取消"
+            package.last_error = "由用户取消"
+            package.version += 1
+
+
+def _cleanup_cancelled_analysis_run_artifacts(
+    session: Session, run: m.AnalysisRun
+) -> None:
+    """Remove run-owned drafts without touching uploads or confirmed history.
+
+    Some pipeline stages intentionally commit their output before the next
+    expensive model call.  A cancellation that arrives after such a commit
+    must therefore clean up or quarantine those rows explicitly.  Tables that
+    do not yet carry ``analysis_run_id`` (PDF pages, key frames and speaker
+    clusters) are deliberately left alone: guessing their ownership from a
+    package or timestamp could delete output from an earlier successful run.
+    """
+
+    observations = list(
+        session.scalars(
+            select(m.RawIntentObservation).where(
+                m.RawIntentObservation.analysis_run_id == run.id
+            )
+        ).all()
+    )
+    observation_ids = {item.id for item in observations}
+    protected_ids: set[str] = set()
+    if observation_ids:
+        protected_ids.update(
+            session.scalars(
+                select(m.ConfirmationRecord.target_id).where(
+                    m.ConfirmationRecord.target_type
+                    == "raw_intent_observation",
+                    m.ConfirmationRecord.target_id.in_(observation_ids),
+                )
+            ).all()
+        )
+        protected_ids.update(
+            session.scalars(
+                select(m.IntentPlatformPathSnapshot.target_id).where(
+                    m.IntentPlatformPathSnapshot.target_type
+                    == "raw_intent_observation",
+                    m.IntentPlatformPathSnapshot.target_id.in_(observation_ids),
+                )
+            ).all()
+        )
+        protected_ids.update(
+            session.scalars(
+                select(m.ObservationPlatformDraft.observation_id).where(
+                    m.ObservationPlatformDraft.observation_id.in_(observation_ids)
+                )
+            ).all()
+        )
+        for formal in session.scalars(select(m.FormalIntentStatus)).all():
+            protected_ids.update(
+                observation_ids.intersection(formal.source_observation_ids or [])
+            )
+        for adoption in session.scalars(select(m.AdoptionStageState)).all():
+            protected_ids.update(
+                observation_ids.intersection(adoption.source_observation_ids or [])
+            )
+
+    candidate_evidence_ids: set[str] = set()
+    for observation in observations:
+        if observation.id in protected_ids:
+            # Historical/audited observations remain in storage, but normal
+            # queries and the confirmation Gate exclude cancelled runs.
+            continue
+        if observation.evidence_id:
+            candidate_evidence_ids.add(observation.evidence_id)
+        session.delete(observation)
+    session.flush()
+
+    for evidence_id in candidate_evidence_ids:
+        still_referenced = session.scalar(
+            select(m.RawIntentObservation.id).where(
+                m.RawIntentObservation.evidence_id == evidence_id
+            )
+        )
+        if still_referenced is None:
+            evidence = session.get(m.EvidenceFragment, evidence_id)
+            if evidence is not None:
+                session.delete(evidence)
+
+    for alignment in session.scalars(
+        select(m.AlignmentLink).where(m.AlignmentLink.analysis_run_id == run.id)
+    ).all():
+        session.delete(alignment)
+    for transcript in session.scalars(
+        select(m.TranscriptSegment).where(
+            m.TranscriptSegment.analysis_run_id == run.id
+        )
+    ).all():
+        session.delete(transcript)
+
+
+def request_analysis_run_cancellation(
+    session: Session, run: m.AnalysisRun
+) -> bool:
+    """Persist an idempotent cancellation request from the API thread."""
+
+    now = m.utcnow()
+    requested = session.execute(
+        update(m.AnalysisRun)
+        .where(
+            m.AnalysisRun.id == run.id,
+            m.AnalysisRun.status.in_(("排队中", "运行中")),
+            m.AnalysisRun.cancel_requested_at.is_(None),
+        )
+        .values(
+            cancel_requested_at=now,
+            status="已取消",
+            error_message="由用户取消",
+            finished_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if requested.rowcount != 1:
+        session.rollback()
+        session.refresh(run)
+        return False
+    session.refresh(run)
+    _mark_analysis_run_cancelled(session, run)
+    session.commit()
+    session.refresh(run)
+    return True
+
+
+def finalize_analysis_run_cancellation(
+    session: Session, run: m.AnalysisRun
+) -> m.AnalysisRun | None:
+    """Discard current-stage writes and preserve a requested cancellation."""
+
+    run_id = run.id
+    session.rollback()
+    current = session.get(m.AnalysisRun, run_id)
+    if current is None or (
+        current.status != "已取消"
+        and current.cancel_requested_at is None
+    ):
+        return None
+    _cleanup_cancelled_analysis_run_artifacts(session, current)
+    _mark_analysis_run_cancelled(session, current)
+    session.commit()
+    session.refresh(current)
+    return current
 
 
 def _human_size(size_bytes: int) -> str:
@@ -263,6 +463,9 @@ def _build_model_materials(
             "id": item.id,
             "type": item.material_type,
             "name": item.safe_name,
+            "source_material_file_id": item.id,
+            "source_material_type": item.material_type,
+            "source_material_name": item.safe_name,
         }
         if content is not None and content.strip() and remaining > 0:
             clipped = content.strip()[:remaining]
@@ -355,14 +558,106 @@ def _master_data_for_model(session: Session) -> dict[str, list[dict[str, Any]]]:
 def _locate_exact_quote(
     materials: list[dict[str, Any]], quote: str
 ) -> tuple[dict[str, Any], int] | None:
+    candidates: list[tuple[int, dict[str, Any], int]] = []
     for material in materials:
         content = material.get("content")
         if not isinstance(content, str):
             continue
         offset = content.find(quote)
         if offset >= 0:
-            return material, content.count("\n", 0, offset) + 1
-    return None
+            # Prefer the most precise derived source over a direct text copy.
+            # SRT/VTT content, for example, may occur both in the uploaded file
+            # and in a timed TranscriptSegment; the latter can be replayed.
+            priority = 0
+            if material.get("start_ms") is not None:
+                priority = 3
+            elif material.get("page_no") is not None:
+                priority = 2
+            elif material.get("frame_no") is not None:
+                priority = 1
+            candidates.append(
+                (priority, material, content.count("\n", 0, offset) + 1)
+            )
+    if not candidates:
+        return None
+    _, material, line_no = max(candidates, key=lambda item: item[0])
+    return material, line_no
+
+
+def _optional_non_negative_int(value: Any) -> int | None:
+    """Return a usable evidence coordinate without accepting booleans."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized >= 0 else None
+
+
+def _evidence_source(
+    material: dict[str, Any],
+    *,
+    valid_file_ids: set[str],
+    line_no: int,
+) -> dict[str, Any]:
+    """Resolve a derived quote back to its uploaded file and exact locator."""
+
+    source_file_id = material.get("source_material_file_id")
+    if source_file_id not in valid_file_ids:
+        direct_id = material.get("id")
+        source_file_id = direct_id if direct_id in valid_file_ids else None
+
+    source_name = str(
+        material.get("source_material_name")
+        or material.get("name")
+        or "会议材料"
+    )
+    source_type = str(
+        material.get("source_material_type")
+        or material.get("type")
+        or "会议材料"
+    )
+    start_ms = _optional_non_negative_int(material.get("start_ms"))
+    end_ms = _optional_non_negative_int(material.get("end_ms"))
+    if start_ms is None or end_ms is None or end_ms <= start_ms:
+        start_ms = None
+        end_ms = None
+    page_no = _optional_non_negative_int(material.get("page_no"))
+    if page_no == 0:
+        page_no = None
+    frame_no = _optional_non_negative_int(material.get("frame_no"))
+
+    if start_ms is not None and end_ms is not None:
+        evidence_type = "转写片段"
+        locator = (
+            f"{source_name} · {_fmt_ms(start_ms)}–{_fmt_ms(end_ms)}"
+        )
+    elif page_no is not None:
+        evidence_type = "PDF页面"
+        locator = f"{source_name} · 第{page_no}页"
+    elif frame_no is not None:
+        evidence_type = "录屏关键帧"
+        locator = f"{source_name} · 关键帧{frame_no}"
+    else:
+        evidence_type = source_type
+        locator = f"{source_name} · 第{max(1, line_no)}行"
+
+    return {
+        "material_file_id": source_file_id,
+        "evidence_type": evidence_type,
+        "locator": locator,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "page_no": page_no,
+        "frame_no": frame_no,
+        "playback_available": bool(
+            start_ms is not None
+            and end_ms is not None
+            and source_type in {"录音", "录屏"}
+        ),
+    }
 
 
 def _finish_analysis_tasks(
@@ -470,15 +765,14 @@ def _parse_document_stage(
                     422, f"PDF解析失败：{item.safe_name}：{exc}"
                 ) from exc
             for page in pages:
-                session.add(
-                    m.PdfPageText(
-                        material_file_id=item.id,
-                        page_no=page.page_no,
-                        text=page.text,
-                        char_count=page.char_count,
-                        extracted_by="pymupdf",
-                    )
+                page_row = m.PdfPageText(
+                    material_file_id=item.id,
+                    page_no=page.page_no,
+                    text=page.text,
+                    char_count=page.char_count,
+                    extracted_by="pymupdf",
                 )
+                session.add(page_row)
                 if page.text.strip():
                     readable.add(item.id)
                     extra_materials.append(
@@ -487,6 +781,10 @@ def _parse_document_stage(
                             "type": "PDF页面",
                             "name": f"{item.safe_name} 第{page.page_no}页",
                             "content": page.text,
+                            "source_material_file_id": item.id,
+                            "source_material_type": item.material_type,
+                            "source_material_name": item.safe_name,
+                            "page_no": page.page_no,
                         }
                     )
             item.parse_status = "解析完成"
@@ -522,6 +820,11 @@ def _extend_materials_with_derived(
     pages: list[m.PdfPageText],
 ) -> list[dict]:
     combined = list(model_materials)
+    source_by_id = {
+        str(item.get("source_material_file_id") or item.get("id")): item
+        for item in combined
+        if item.get("source_material_file_id") or item.get("id")
+    }
     remaining = _MODEL_INPUT_LIMIT
     for item in combined:
         remaining -= len(str(item.get("content") or ""))
@@ -556,6 +859,21 @@ def _extend_materials_with_derived(
                 "name": transcript.speaker_label or "转写片段",
                 "content": content,
                 "truncated": False,
+                "source_material_file_id": transcript.material_file_id,
+                "source_material_type": (
+                    source_by_id.get(str(transcript.material_file_id), {}).get(
+                        "source_material_type"
+                    )
+                ),
+                "source_material_name": (
+                    source_by_id.get(str(transcript.material_file_id), {}).get(
+                        "source_material_name"
+                    )
+                ),
+                "transcript_segment_id": transcript.id,
+                "speaker_label": transcript.speaker_label,
+                "start_ms": transcript.start_ms,
+                "end_ms": transcript.end_ms,
             }
         )
         remaining -= len(content)
@@ -571,9 +889,25 @@ def _extend_materials_with_derived(
             {
                 "id": page.id,
                 "type": "PDF页面",
-                "name": f"第{page.page_no}页",
+                "name": (
+                    f"{source_by_id.get(str(page.material_file_id), {}).get('source_material_name') or 'PDF'} "
+                    f"第{page.page_no}页"
+                ),
                 "content": clipped,
                 "truncated": len(clipped) < len(content),
+                "source_material_file_id": page.material_file_id,
+                "source_material_type": (
+                    source_by_id.get(str(page.material_file_id), {}).get(
+                        "source_material_type"
+                    )
+                ),
+                "source_material_name": (
+                    source_by_id.get(str(page.material_file_id), {}).get(
+                        "source_material_name"
+                    )
+                ),
+                "pdf_page_text_id": page.id,
+                "page_no": page.page_no,
             }
         )
         remaining -= len(clipped)
@@ -890,7 +1224,25 @@ def _run_audio_stage(
         transcript_model = result.model_name
         segments = list(result.segments)
 
-    label_to_cluster: dict[str, m.SpeakerCluster] = {}
+    existing_clusters = session.scalars(
+        select(m.SpeakerCluster).where(
+            m.SpeakerCluster.package_id == package.id
+        )
+    ).all()
+    label_to_cluster: dict[str, m.SpeakerCluster] = {
+        item.label: item for item in existing_clusters
+    }
+    existing_segment_keys = {
+        (item.speaker_id, item.start_ms, item.end_ms, item.transcript)
+        for item in session.scalars(
+            select(m.SpeakerSegment).where(
+                m.SpeakerSegment.speaker_id.in_(
+                    [cluster.id for cluster in existing_clusters]
+                )
+            )
+        ).all()
+    } if existing_clusters else set()
+    current_labels: set[str] = set()
     for index, segment in enumerate(segments, 1):
         transcript = m.TranscriptSegment(
             analysis_run_id=run.id,
@@ -907,6 +1259,7 @@ def _run_audio_stage(
         session.add(transcript)
         transcripts.append(transcript)
         if segment.speaker_label:
+            current_labels.add(segment.speaker_label)
             cluster = label_to_cluster.get(segment.speaker_label)
             if cluster is None:
                 cluster = m.SpeakerCluster(
@@ -920,15 +1273,21 @@ def _run_audio_stage(
                 # Assign the string PK before referencing it from segments.
                 session.flush()
                 label_to_cluster[segment.speaker_label] = cluster
-            session.add(
-                m.SpeakerSegment(
+            segment_key = (
+                cluster.id,
+                segment.start_ms,
+                segment.end_ms,
+                segment.text,
+            )
+            if segment_key not in existing_segment_keys:
+                session.add(m.SpeakerSegment(
                     speaker_id=cluster.id,
                     start_ms=segment.start_ms,
                     end_ms=segment.end_ms,
                     transcript=segment.text,
                     confidence=segment.confidence,
-                )
-            )
+                ))
+                existing_segment_keys.add(segment_key)
     session.flush()
     target.parse_status = "解析完成"
     _update_task(
@@ -952,7 +1311,7 @@ def _run_audio_stage(
         run,
         "说话人分离",
         status="已完成",
-        result_json={"speaker_labels": len(label_to_cluster)},
+        result_json={"speaker_labels": len(current_labels)},
     )
     return True, transcripts
 
@@ -1174,8 +1533,16 @@ def _persist_model_observations(
         ).all()
     )
 
+    existing_speakers = list(
+        session.scalars(
+            select(m.SpeakerCluster).where(
+                m.SpeakerCluster.package_id == package.id
+            )
+        ).all()
+    )
+    speakers_by_label = {item.label: item for item in existing_speakers}
     created = 0
-    speaker_count = 0
+    observation_speaker_ids: set[str] = set()
     unresolved: list[str] = []
     for index, raw in enumerate(observations, 1):
         if not isinstance(raw, dict):
@@ -1214,43 +1581,84 @@ def _persist_model_observations(
             if str(item).strip()
         ][:20]
         material, line_no = located
-        speaker = m.SpeakerCluster(
-            package_id=package.id,
-            label=f"Speaker {index}",
-            recommended_name=(
-                str(raw.get("speaker_name")).strip()
-                if raw.get("speaker_name")
-                else f"待确认人员{index}"
-            ),
-            recommended_role=(
-                str(raw.get("speaker_role")).strip()
-                if raw.get("speaker_role")
-                else None
-            ),
-            recommended_organization=(
-                str(raw.get("speaker_organization")).strip()
-                if raw.get("speaker_organization")
-                else "客户组织（待确认）"
-            ),
-            recommended_function_id=function_id,
-            confidence=confidence,
-            status="待确认",
+        source = _evidence_source(
+            material,
+            valid_file_ids=valid_file_ids,
+            line_no=line_no,
         )
-        session.add(speaker)
-        session.flush()
-        speaker_count += 1
+        # A model may quote package notes, but those notes are not an uploaded
+        # source that can be opened later.  Keep the item unresolved instead
+        # of manufacturing a formally confirmable evidence chain.
+        if source["material_file_id"] is None:
+            unresolved.append(f"第{index}条证据无法关联原始材料文件")
+            continue
+
+        speaker_label = str(
+            material.get("speaker_label") or f"Speaker {index}"
+        ).strip()
+        speaker = speakers_by_label.get(speaker_label)
+        if speaker is None:
+            speaker = m.SpeakerCluster(
+                package_id=package.id,
+                label=speaker_label,
+                recommended_name=(
+                    str(raw.get("speaker_name")).strip()
+                    if raw.get("speaker_name")
+                    else f"待确认人员{len(speakers_by_label) + 1}"
+                ),
+                recommended_role=(
+                    str(raw.get("speaker_role")).strip()
+                    if raw.get("speaker_role")
+                    else None
+                ),
+                recommended_organization=(
+                    str(raw.get("speaker_organization")).strip()
+                    if raw.get("speaker_organization")
+                    else "客户组织（待确认）"
+                ),
+                recommended_function_id=function_id,
+                confidence=confidence,
+                status="待确认",
+            )
+            session.add(speaker)
+            session.flush()
+            speakers_by_label[speaker_label] = speaker
+        else:
+            # ASR creates the stable cluster first.  Intent extraction may add
+            # useful identity hints, but must not replace a human-confirmed
+            # identity or erase earlier recommendations.
+            if speaker.status != "已确认":
+                if not speaker.recommended_name and raw.get("speaker_name"):
+                    speaker.recommended_name = str(raw["speaker_name"]).strip()
+                if not speaker.recommended_role and raw.get("speaker_role"):
+                    speaker.recommended_role = str(raw["speaker_role"]).strip()
+                if (
+                    not speaker.recommended_organization
+                    and raw.get("speaker_organization")
+                ):
+                    speaker.recommended_organization = str(
+                        raw["speaker_organization"]
+                    ).strip()
+                if (
+                    speaker.recommended_function_id is None
+                    and function_id is not None
+                ):
+                    speaker.recommended_function_id = function_id
+                if speaker.confidence is None:
+                    speaker.confidence = confidence
+        observation_speaker_ids.add(speaker.id)
         evidence = m.EvidenceFragment(
             package_id=package.id,
-            material_file_id=(
-                material.get("id")
-                if material.get("id") in valid_file_ids
-                else None
-            ),
-            evidence_type=f"{material.get('type', '会议材料')}原文",
-            locator=f"{material.get('name', '会议材料')} · 第{line_no}行",
+            material_file_id=source["material_file_id"],
+            evidence_type=source["evidence_type"],
+            locator=source["locator"],
             excerpt=quote,
+            start_ms=source["start_ms"],
+            end_ms=source["end_ms"],
+            page_no=source["page_no"],
+            frame_no=source["frame_no"],
             confidence=confidence,
-            playback_available=False,
+            playback_available=source["playback_available"],
         )
         session.add(evidence)
         session.flush()
@@ -1294,7 +1702,7 @@ def _persist_model_observations(
             )
         )
         created += 1
-    return speaker_count, created, unresolved
+    return len(observation_speaker_ids), created, unresolved
 
 
 def _snapshot(model: Any, fields: list[str]) -> dict[str, Any]:
@@ -1804,6 +2212,10 @@ def execute_analysis_run(
     compatibility).  Each stage persists its own result_json so a client can
     poll ``/api/meeting-packages/{id}/tasks`` for live progress.
     """
+    if analysis_run_cancel_requested(session, run):
+        cancelled_run = finalize_analysis_run_cancellation(session, run)
+        if cancelled_run is not None:
+            return cancelled_run
     package = session.get(m.MeetingPackage, run.package_id)
     if package is None:
         raise DomainError(404, "会议资料包不存在")
@@ -1837,6 +2249,7 @@ def execute_analysis_run(
         master_data = _master_data_for_model(session)
 
     try:
+        _raise_if_analysis_cancel_requested(session, run)
         if adapter.name == "mock":
             _update_task(session, run, "文件预检", status="已完成", progress=100)
             adapter_result = adapter.analyze(
@@ -1847,6 +2260,7 @@ def execute_analysis_run(
                     master_data=master_data,
                 )
             )
+            _raise_if_analysis_cancel_requested(session, run)
             tasks = session.scalars(
                 select(m.ProcessingTask)
                 .where(m.ProcessingTask.analysis_run_id == run.id)
@@ -1860,6 +2274,7 @@ def execute_analysis_run(
                     session, package, run, list(files), adapter
                 )
             )
+            _raise_if_analysis_cancel_requested(session, run)
         else:
             if settings is None:
                 raise DomainError(500, "真实模型分析缺少本地数据目录配置")
@@ -1878,8 +2293,10 @@ def execute_analysis_run(
                 status="已完成",
                 result_json={"derived_materials": len(extra_materials)},
             )
+            _raise_if_analysis_cancel_requested(session, run)
             session.commit()
 
+            _raise_if_analysis_cancel_requested(session, run)
             _asr_done, asr_transcripts = _run_audio_stage(
                 session,
                 settings,
@@ -1888,10 +2305,12 @@ def execute_analysis_run(
                 list(files),
                 asr_settings,
             )
+            _raise_if_analysis_cancel_requested(session, run)
             transcripts = parsed_transcripts + asr_transcripts
             frames = _run_visual_stage(
                 session, settings, run, package, list(files)
             )
+            _raise_if_analysis_cancel_requested(session, run)
             session.commit()
             pages = list(
                 session.scalars(
@@ -1909,6 +2328,7 @@ def execute_analysis_run(
                 pages,
             )
 
+            _raise_if_analysis_cancel_requested(session, run)
             _run_alignment_stage(
                 session,
                 stage_adapter,
@@ -1918,8 +2338,10 @@ def execute_analysis_run(
                 pages,
                 frames,
             )
+            _raise_if_analysis_cancel_requested(session, run)
             session.commit()
 
+            _raise_if_analysis_cancel_requested(session, run)
             adapter_result = adapter.analyze(
                 ModelContext(
                     package_id=package.id,
@@ -1928,6 +2350,7 @@ def execute_analysis_run(
                     master_data=master_data,
                 )
             )
+            _raise_if_analysis_cancel_requested(session, run)
             speaker_count, observation_count, unresolved = (
                 _persist_model_observations(
                     session,
@@ -1946,8 +2369,10 @@ def execute_analysis_run(
                 status="已完成",
                 result_json={"observations": observation_count},
             )
+            _raise_if_analysis_cancel_requested(session, run)
             session.commit()
 
+            _raise_if_analysis_cancel_requested(session, run)
             observation_speaker_ids = session.scalars(
                 select(m.RawIntentObservation.speaker_id).where(
                     m.RawIntentObservation.analysis_run_id == run.id,
@@ -1971,6 +2396,7 @@ def execute_analysis_run(
                 master_data,
                 speakers,
             )
+            _raise_if_analysis_cancel_requested(session, run)
             session.commit()
 
             for material in files:
@@ -1979,14 +2405,14 @@ def execute_analysis_run(
                 elif material.parse_status in {None, "待专用解析"}:
                     material.parse_status = "待专用解析"
 
-        run.status = "已完成"
-        run.finished_at = m.utcnow()
+        _raise_if_analysis_cancel_requested(session, run)
+        finished_at = m.utcnow()
         safe_adapter_summary = {
             key: adapter_result[key]
             for key in ("mode", "model", "usage", "notice")
             if key in adapter_result
         }
-        run.result_summary = {
+        result_summary = {
             **safe_adapter_summary,
             "speaker_count": speaker_count,
             "observation_count": observation_count,
@@ -1994,6 +2420,22 @@ def execute_analysis_run(
             "unresolved_reasons": unresolved[:20],
             "data_scope": package.data_scope,
         }
+        completion = session.execute(
+            update(m.AnalysisRun)
+            .where(
+                m.AnalysisRun.id == run.id,
+                m.AnalysisRun.status == "运行中",
+                m.AnalysisRun.cancel_requested_at.is_(None),
+            )
+            .values(
+                status="已完成",
+                finished_at=finished_at,
+                result_summary=result_summary,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if completion.rowcount != 1:
+            raise _AnalysisCancellationRequested
         package.status = (
             "待身份校验" if observation_count > 0 else "待意向确认"
         )
@@ -2001,8 +2443,15 @@ def execute_analysis_run(
         session.commit()
         session.refresh(run)
         return run
+    except _AnalysisCancellationRequested:
+        cancelled_run = finalize_analysis_run_cancellation(session, run)
+        if cancelled_run is not None:
+            return cancelled_run
+        raise DomainError(409, "分析任务已停止")
     except Exception as exc:
-        session.rollback()
+        cancelled_run = finalize_analysis_run_cancellation(session, run)
+        if cancelled_run is not None:
+            return cancelled_run
         failed_run = session.get(m.AnalysisRun, run.id)
         failed_package = session.get(m.MeetingPackage, package.id)
         if failed_run:
@@ -2318,14 +2767,64 @@ def confirm_observation(
         )
     if observation.function_id is None:
         raise DomainError(422, "客户职能尚未确认，不能形成正式职能状态")
-    if observation.speaker_id:
-        speaker = session.get(m.SpeakerCluster, observation.speaker_id)
-        if speaker is not None and speaker.status != "已确认":
-            raise DomainError(422, "说话人身份仍待确认，不能形成正式职能状态")
-    if observation.evidence_id is None or session.get(
-        m.EvidenceFragment, observation.evidence_id
-    ) is None:
+    if observation.analysis_run_id is not None:
+        source_run = session.get(m.AnalysisRun, observation.analysis_run_id)
+        if (
+            source_run is None
+            or source_run.status != "已完成"
+            or source_run.cancel_requested_at is not None
+        ):
+            raise DomainError(
+                422, "来源分析尚未成功完成或已被取消，不能形成正式职能状态"
+            )
+    if observation.speaker_id is None:
+        raise DomainError(422, "缺少可回溯的说话人身份，不能形成正式职能状态")
+    speaker = session.get(m.SpeakerCluster, observation.speaker_id)
+    if speaker is None or speaker.package_id != observation.package_id:
+        raise DomainError(422, "说话人未关联本会议，不能形成正式职能状态")
+    if speaker.status != "已确认":
+        raise DomainError(422, "说话人身份仍待确认，不能形成正式职能状态")
+    evidence = (
+        session.get(m.EvidenceFragment, observation.evidence_id)
+        if observation.evidence_id
+        else None
+    )
+    if evidence is None:
         raise DomainError(422, "缺少可追溯证据，不能形成正式意向状态")
+    material = (
+        session.get(m.MaterialFile, evidence.material_file_id)
+        if evidence.material_file_id
+        else None
+    )
+    if (
+        evidence.package_id != observation.package_id
+        or material is None
+        or material.package_id != observation.package_id
+        or material.is_deleted
+    ):
+        raise DomainError(
+            422, "证据未关联本会议的原始材料，不能形成正式意向状态"
+        )
+    has_valid_time_range = (
+        evidence.start_ms is not None
+        and evidence.end_ms is not None
+        and evidence.start_ms >= 0
+        and evidence.end_ms > evidence.start_ms
+    )
+    has_valid_page = evidence.page_no is not None and evidence.page_no > 0
+    has_valid_frame = evidence.frame_no is not None and evidence.frame_no >= 0
+    has_text_locator = bool(evidence.locator and evidence.locator.strip())
+    if not (
+        has_valid_time_range
+        or has_valid_page
+        or has_valid_frame
+        or has_text_locator
+    ):
+        raise DomainError(
+            422, "证据缺少时间戳、页码或文本位置，不能形成正式意向状态"
+        )
+    if not evidence.excerpt or not evidence.excerpt.strip():
+        raise DomainError(422, "证据原文为空，不能形成正式意向状态")
 
     # A reviewed platform proposal remains pending until this exact formal
     # confirmation.  Activating it here keeps the dictionary publication,

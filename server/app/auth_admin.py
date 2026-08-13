@@ -14,6 +14,7 @@ from .auth import (
 )
 from .config import Settings
 from .database import Database
+from .schema_migrations import migrate_database
 
 
 def _password_from_prompt() -> str:
@@ -56,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             password = _password_from_prompt()
 
         settings = Settings.load(data_dir=args.data_dir)
+        migrate_database(settings.server_dir, settings.database_url)
         database = Database(settings.database_url)
         database.create_all()
         generated_file: Path | None = None
