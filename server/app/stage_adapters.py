@@ -4,7 +4,10 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any
 
-from .model_adapters import OllamaIntentModelAdapter
+from .model_adapters import (
+    OllamaIntentModelAdapter,
+    OpenAICompatibleModelAdapter,
+)
 from .schemas import (
     IdentityRecommendationOutput,
     MaterialAlignment,
@@ -219,6 +222,30 @@ class OllamaLlmStageAdapter(LlmStageAdapter):
         return parsed.alignments
 
 
+class OpenAICompatibleLlmStageAdapter(OllamaLlmStageAdapter):
+    """Same stage-level JSON tasks against a local OpenAI-compatible server."""
+
+    name = "openai-compatible-llm"
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model_name: str,
+        api_key: str | None = None,
+        timeout_seconds: float = 480,
+        transport: Any | None = None,
+    ):
+        self._chat = OpenAICompatibleModelAdapter(
+            base_url=base_url,
+            model_name=model_name,
+            api_key=api_key,
+            timeout_seconds=timeout_seconds,
+            transport=transport,
+        )
+        self.model_name = model_name
+
+
 def get_stage_adapter(
     provider: str,
     *,
@@ -228,13 +255,24 @@ def get_stage_adapter(
     transport: Any | None = None,
 ) -> LlmStageAdapter:
     normalized = (provider or "").strip().lower()
-    if normalized not in {"ollama", "ollama-llm"}:
+    if normalized not in {
+        "ollama",
+        "ollama-llm",
+        "openai-compatible",
+        "openai-compatible-llm",
+    }:
         raise ValueError(
-            f"阶段适配器“{normalized}”尚未配置；当前仅支持本地ollama。"
+            f"阶段适配器“{normalized}”尚未配置；"
+            "当前仅支持本地ollama或openai-compatible。"
         )
     if not base_url or not model_name:
         raise ValueError("阶段适配器缺少服务地址或模型名称")
-    return OllamaLlmStageAdapter(
+    adapter_class = (
+        OpenAICompatibleLlmStageAdapter
+        if normalized in {"openai-compatible", "openai-compatible-llm"}
+        else OllamaLlmStageAdapter
+    )
+    return adapter_class(
         base_url=base_url,
         model_name=model_name,
         api_key=api_key,

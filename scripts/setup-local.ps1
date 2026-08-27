@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $backendRoot = Join-Path $projectRoot "server"
@@ -52,7 +52,8 @@ function Ensure-ExternalTool {
 }
 
 # 1) Python 3.11+
-$python = Find-Executable -Candidates @($env:PYTHON, "python.exe", "python3.exe")
+$pythonCandidates = @($env:PYTHON, "python.exe", "python3.exe") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+$python = Find-Executable -Candidates $pythonCandidates
 if (-not $python) {
     throw "未找到 Python 3.11+。请先安装 Python（https://www.python.org/downloads/）并勾选 Add to PATH，或设置 PYTHON 环境变量指向 python.exe。"
 }

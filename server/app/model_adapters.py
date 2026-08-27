@@ -10,7 +10,11 @@ from typing import Any
 import httpx
 from pydantic import ValidationError
 
-from .model_settings import normalize_ollama_base_url, validate_model_name
+from .model_settings import (
+    normalize_ollama_base_url,
+    normalize_openai_compatible_base_url,
+    validate_model_name,
+)
 from .schemas import OllamaAnalysisResult, OllamaStructuredOutput
 
 
@@ -55,26 +59,12 @@ class MockIntentModelAdapter(IntentModelAdapter):
         }
 
 
-class OpenAICompatibleModelAdapter(IntentModelAdapter):
-    """Reserved adapter for approved internal/local OpenAI-compatible services."""
-
-    name = "openai-compatible"
-
-    def __init__(self, *, endpoint: str, model_name: str, api_key: str | None = None):
-        self.endpoint = endpoint
-        self.model_name = model_name
-        self.api_key = api_key
-
-    def analyze(self, context: ModelContext) -> dict[str, Any]:
-        raise RuntimeError(
-            "真实模型适配器仅保留接口，首版未启用。请完成数据授权和模型评测后接入。"
-        )
-
-
 class OllamaIntentModelAdapter(IntentModelAdapter):
     """Loopback-only Ollama adapter using native tags and chat endpoints."""
 
     name = "ollama"
+    _service_label = "Ollama"
+    _chat_endpoint = "/api/chat"
 
     def __init__(
         self,
@@ -86,7 +76,7 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         thinking_enabled: bool = False,
         transport: httpx.BaseTransport | None = None,
     ):
-        self.base_url = normalize_ollama_base_url(base_url)
+        self.base_url = self._normalize_base_url(base_url)
         self.model_name = validate_model_name(model_name)
         self._api_key = api_key or None
         self._thinking_enabled = thinking_enabled
@@ -95,6 +85,10 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             connect=min(timeout_seconds, 5),
         )
         self._transport = transport
+
+    @staticmethod
+    def _normalize_base_url(value: str) -> str:
+        return normalize_ollama_base_url(value)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -116,13 +110,13 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
     def _checked_at() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    @staticmethod
-    def _safe_request_error(exc: Exception) -> ModelAdapterError:
+    def _safe_request_error(self, exc: Exception) -> ModelAdapterError:
+        label = self._service_label
         if isinstance(exc, httpx.TimeoutException):
-            return ModelAdapterError("连接Ollama超时，请确认服务已启动并检查模型大小")
+            return ModelAdapterError(f"连接{label}超时，请确认服务已启动并检查模型大小")
         if isinstance(exc, httpx.ConnectError):
             return ModelAdapterError(
-                "无法连接本地Ollama，请确认服务已启动且地址、端口正确"
+                f"无法连接本地{label}，请确认服务已启动且地址、端口正确"
             )
         if isinstance(exc, httpx.HTTPStatusError):
             body_text = ""
@@ -132,15 +126,15 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
                 body_text = ""
             if exc.response.status_code == 400 and "grammar" in body_text.lower():
                 return ModelAdapterError(
-                    "Ollama无法解析结构化输出语法（grammar），"
+                    f"{label}无法解析结构化输出语法（grammar），"
                     "当前模型可能不兼容完整JSON Schema"
                 )
             return ModelAdapterError(
-                f"Ollama返回HTTP {exc.response.status_code}，请检查模型和服务状态"
+                f"{label}返回HTTP {exc.response.status_code}，请检查模型和服务状态"
             )
         if isinstance(exc, httpx.RequestError):
-            return ModelAdapterError("Ollama请求失败，请检查本地服务状态")
-        return ModelAdapterError("Ollama响应格式无效")
+            return ModelAdapterError(f"{label}请求失败，请检查本地服务状态")
+        return ModelAdapterError(f"{label}响应格式无效")
 
     def list_models(self) -> list[dict[str, Any]]:
         try:
@@ -158,7 +152,9 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
 
         raw_models = body.get("models") if isinstance(body, dict) else None
         if not isinstance(raw_models, list):
-            raise ModelAdapterError("Ollama模型列表响应格式无效")
+            raise ModelAdapterError(
+                f"{self._service_label}模型列表响应格式无效"
+            )
 
         models: list[dict[str, Any]] = []
         for raw in raw_models:
@@ -204,9 +200,9 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             }
             model_available = self.model_name in installed
             message = (
-                f"Ollama已连接，模型{self.model_name}可用"
+                f"{self._service_label}已连接，模型{self.model_name}可用"
                 if model_available
-                else f"Ollama已连接，但未找到模型{self.model_name}"
+                else f"{self._service_label}已连接，但未找到模型{self.model_name}"
             )
             return {
                 "ok": model_available,
@@ -388,6 +384,33 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
     def _is_transient_error(message: str) -> bool:
         return ("超时" in message) or ("HTTP 5" in message) or ("连接" in message)
 
+    def _build_chat_request_body(
+        self,
+        request_messages: list[dict[str, str]],
+        *,
+        budget: int,
+        use_format: bool,
+        generation_schema: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        request_body: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": request_messages,
+            "stream": False,
+            "think": self._thinking_enabled,
+            "options": {"temperature": 0, "num_predict": budget},
+        }
+        if use_format:
+            request_body["format"] = (
+                generation_schema or self._simple_generation_schema()
+            )
+        return request_body
+
+    @staticmethod
+    def _content_from_response(body: Any) -> str | None:
+        message = body.get("message") if isinstance(body, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        return content if isinstance(content, str) else None
+
     def chat_structured(
         self,
         messages: list[dict[str, str]],
@@ -435,21 +458,16 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             last["content"] = f"{last['content']}\n{hint}"
             request_messages[-1] = last
 
-        request_body: dict[str, Any] = {
-            "model": self.model_name,
-            "messages": request_messages,
-            "stream": False,
-            "think": self._thinking_enabled,
-            "options": {"temperature": 0, "num_predict": budget},
-        }
-        if use_format:
-            request_body["format"] = (
-                generation_schema or self._simple_generation_schema()
-            )
+        request_body = self._build_chat_request_body(
+            request_messages,
+            budget=budget,
+            use_format=use_format,
+            generation_schema=generation_schema,
+        )
 
         try:
             with self._client() as client:
-                response = client.post("/api/chat", json=request_body)
+                response = client.post(self._chat_endpoint, json=request_body)
                 response.raise_for_status()
                 body = response.json()
         except (
@@ -460,10 +478,11 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         ) as exc:
             raise self._safe_request_error(exc) from exc
 
-        message = body.get("message") if isinstance(body, dict) else None
-        content = message.get("content") if isinstance(message, dict) else None
+        content = self._content_from_response(body)
         if not isinstance(content, str) or not content.strip():
-            raise ModelAdapterError("Ollama未返回可验证的结构化结果")
+            raise ModelAdapterError(
+                f"{self._service_label}未返回可验证的结构化结果"
+            )
 
         extracted = self._extract_json_object(content)
         try:
@@ -535,6 +554,162 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         raise ModelAdapterError("意向抽取失败：" + "；".join(errors))
 
 
+class OpenAICompatibleModelAdapter(OllamaIntentModelAdapter):
+    """Loopback-only adapter for local OpenAI-compatible servers.
+
+    Targets LM Studio (default http://127.0.0.1:1234) and other approved
+    local OpenAI-compatible runtimes. Reuses the Ollama adapter's prompt
+    building, output budgeting, JSON extraction and retry flow; only the
+    HTTP endpoints and payload/response shapes differ.
+    """
+
+    name = "openai-compatible"
+    _service_label = "OpenAI兼容服务"
+    _chat_endpoint = "/v1/chat/completions"
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model_name: str,
+        api_key: str | None = None,
+        # LM Studio / vLLM on modest hardware often CPU-offload part of the
+        # model, so a real extraction can legitimately take several minutes.
+        timeout_seconds: float = 900,
+        transport: httpx.BaseTransport | None = None,
+    ):
+        super().__init__(
+            base_url=base_url,
+            model_name=model_name,
+            api_key=api_key,
+            timeout_seconds=timeout_seconds,
+            thinking_enabled=False,
+            transport=transport,
+        )
+
+    @staticmethod
+    def _normalize_base_url(value: str) -> str:
+        return normalize_openai_compatible_base_url(value)
+
+    def _build_chat_request_body(
+        self,
+        request_messages: list[dict[str, str]],
+        *,
+        budget: int,
+        use_format: bool,
+        generation_schema: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        request_body: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": request_messages,
+            "stream": False,
+            "temperature": 0,
+            "max_tokens": budget,
+        }
+        if use_format:
+            # LM Studio only accepts "json_schema" or "text" here (not
+            # "json_object"); json_schema is also the stricter option.
+            request_body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "intent_observations",
+                    "schema": (
+                        generation_schema or self._simple_generation_schema()
+                    ),
+                },
+            }
+        return request_body
+
+    @staticmethod
+    def _content_from_response(body: Any) -> str | None:
+        choices = body.get("choices") if isinstance(body, dict) else None
+        if not isinstance(choices, list) or not choices:
+            return None
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        return content if isinstance(content, str) else None
+
+    def list_models(self) -> list[dict[str, Any]]:
+        try:
+            with self._client() as client:
+                response = client.get("/v1/models")
+                response.raise_for_status()
+                body = response.json()
+        except (
+            httpx.RequestError,
+            httpx.HTTPStatusError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
+            raise self._safe_request_error(exc) from exc
+
+        raw_models = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(raw_models, list):
+            raise ModelAdapterError(
+                f"{self._service_label}模型列表响应格式无效"
+            )
+
+        models: list[dict[str, Any]] = []
+        for raw in raw_models:
+            if not isinstance(raw, dict):
+                continue
+            identifier = raw.get("id") or raw.get("name")
+            if not isinstance(identifier, str) or not identifier.strip():
+                continue
+            models.append(
+                {
+                    "name": identifier.strip(),
+                    "model": identifier.strip(),
+                    "size": None,
+                    "parameter_size": None,
+                    "quantization_level": None,
+                }
+            )
+        return models
+
+    def _result_from(
+        self,
+        structured: OllamaStructuredOutput,
+        body: dict[str, Any],
+        *,
+        budget: int,
+    ) -> dict[str, Any]:
+        usage: dict[str, Any] | None = None
+        raw_usage = body.get("usage") if isinstance(body, dict) else None
+        if isinstance(raw_usage, dict):
+            usage = (
+                {
+                    key: raw_usage[key]
+                    for key in (
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "total_tokens",
+                    )
+                    if isinstance(raw_usage.get(key), int)
+                }
+                or None
+            )
+        finish_reason: str | None = None
+        choices = body.get("choices") if isinstance(body, dict) else None
+        if (
+            isinstance(choices, list)
+            and choices
+            and isinstance(choices[0], dict)
+            and isinstance(choices[0].get("finish_reason"), str)
+        ):
+            finish_reason = choices[0]["finish_reason"]
+        result = OllamaAnalysisResult(
+            mode="openai-compatible",
+            model=self.model_name,
+            observations=structured.observations,
+            usage=usage,
+            done_reason=finish_reason,
+            num_predict=budget,
+        )
+        return result.model_dump(mode="json")
+
+
 def get_model_adapter(
     name: str,
     *,
@@ -546,15 +721,21 @@ def get_model_adapter(
     normalized = (name or "mock").strip().lower()
     if normalized == "mock":
         return MockIntentModelAdapter()
-    if normalized == "ollama":
+    if normalized in {"ollama", "openai-compatible"}:
         if not base_url or not model_name:
-            raise ValueError("Ollama适配器缺少服务地址或模型名称")
-        return OllamaIntentModelAdapter(
+            raise ValueError(f"{normalized}适配器缺少服务地址或模型名称")
+        adapter_class = (
+            OpenAICompatibleModelAdapter
+            if normalized == "openai-compatible"
+            else OllamaIntentModelAdapter
+        )
+        return adapter_class(
             base_url=base_url,
             model_name=model_name,
             api_key=api_key,
             transport=transport,
         )
     raise ValueError(
-        f"模型适配器“{normalized}”尚未配置；当前仅支持mock或本地ollama。"
+        f"模型适配器“{normalized}”尚未配置；"
+        "当前仅支持mock、本地ollama或openai-compatible。"
     )

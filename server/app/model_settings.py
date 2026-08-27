@@ -13,10 +13,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3:8b"
+DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://127.0.0.1:1234"
 ALLOWED_ASR_PROVIDERS = {"mock", "llamacpp"}
-ALLOWED_PROVIDERS = {"mock", "ollama"}
+ALLOWED_PROVIDERS = {"mock", "ollama", "openai-compatible"}
 _ALLOWED_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
-_MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
+# LM Studio style identifiers contain "@" (e.g. qwen3.8-9b@q4_k_m).
+_MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$")
 
 
 class ModelSettingsError(ValueError):
@@ -42,8 +44,14 @@ class AsrRuntimeSettings:
         }
 
 
-def normalize_ollama_base_url(value: str) -> str:
-    """Validate and normalize a loopback-only Ollama base URL.
+def _normalize_loopback_base_url(
+    value: str,
+    *,
+    service_label: str,
+    example_url: str,
+    allow_v1_path: bool = False,
+) -> str:
+    """Validate and normalize a loopback-only local service base URL.
 
     The settings page is intentionally unable to turn the backend into an
     arbitrary HTTP proxy. Enterprise or remote providers require a separate,
@@ -52,31 +60,59 @@ def normalize_ollama_base_url(value: str) -> str:
 
     candidate = (value or "").strip()
     if not candidate:
-        raise ModelSettingsError("Ollama地址不能为空")
+        raise ModelSettingsError(f"{service_label}地址不能为空")
 
     try:
         parsed = urlsplit(candidate)
         port = parsed.port
     except ValueError as exc:
-        raise ModelSettingsError("Ollama地址格式无效") from exc
+        raise ModelSettingsError(f"{service_label}地址格式无效") from exc
 
     if parsed.scheme.lower() != "http":
-        raise ModelSettingsError("本地Ollama仅允许使用http地址")
+        raise ModelSettingsError(f"本地{service_label}仅允许使用http地址")
     if (parsed.hostname or "").lower() not in _ALLOWED_LOOPBACK_HOSTS:
-        raise ModelSettingsError("本地Ollama地址必须是localhost或回环地址")
+        raise ModelSettingsError(f"本地{service_label}地址必须是localhost或回环地址")
     if parsed.username is not None or parsed.password is not None:
-        raise ModelSettingsError("Ollama地址不得包含用户名或密码")
+        raise ModelSettingsError(f"{service_label}地址不得包含用户名或密码")
     if parsed.query or parsed.fragment:
-        raise ModelSettingsError("Ollama地址不得包含查询参数或片段")
-    if parsed.path not in {"", "/"}:
-        raise ModelSettingsError("Ollama地址只填写服务根地址，例如http://127.0.0.1:11434")
+        raise ModelSettingsError(f"{service_label}地址不得包含查询参数或片段")
+    allowed_paths = {"", "/", "/v1", "/v1/"} if allow_v1_path else {"", "/"}
+    if parsed.path not in allowed_paths:
+        raise ModelSettingsError(
+            f"{service_label}地址只填写服务根地址，例如{example_url}"
+        )
     if port is not None and not 1 <= port <= 65535:
-        raise ModelSettingsError("Ollama端口必须在1到65535之间")
+        raise ModelSettingsError(f"{service_label}端口必须在1到65535之间")
 
     host = (parsed.hostname or "").lower()
     display_host = f"[{host}]" if host == "::1" else host
     netloc = display_host if port is None else f"{display_host}:{port}"
     return urlunsplit(("http", netloc, "", "", ""))
+
+
+def normalize_ollama_base_url(value: str) -> str:
+    return _normalize_loopback_base_url(
+        value,
+        service_label="Ollama",
+        example_url="http://127.0.0.1:11434",
+    )
+
+
+def normalize_openai_compatible_base_url(value: str) -> str:
+    """Normalize a loopback OpenAI-compatible base URL, stripping any /v1."""
+
+    return _normalize_loopback_base_url(
+        value,
+        service_label="OpenAI兼容服务",
+        example_url="http://127.0.0.1:1234",
+        allow_v1_path=True,
+    )
+
+
+def _normalize_base_url_for_provider(provider: str, base_url: str) -> str:
+    if provider == "openai-compatible":
+        return normalize_openai_compatible_base_url(base_url)
+    return normalize_ollama_base_url(base_url)
 
 
 def validate_model_name(value: str) -> str:
@@ -171,8 +207,10 @@ class ModelSettingsStore:
             model_name = str(stored.get("model_name", model_name))
 
         if provider not in ALLOWED_PROVIDERS:
-            raise ModelSettingsError("模型提供方仅支持mock或ollama")
-        base_url = normalize_ollama_base_url(base_url)
+            raise ModelSettingsError(
+                "模型提供方仅支持mock、ollama或openai-compatible"
+            )
+        base_url = _normalize_base_url_for_provider(provider, base_url)
         model_name = validate_model_name(model_name)
         api_key = (
             self._environ.get("INTENT_BAO_MODEL_API_KEY")
@@ -240,8 +278,12 @@ class ModelSettingsStore:
     ) -> RuntimeModelSettings:
         normalized_provider = (provider or "").strip().lower()
         if normalized_provider not in ALLOWED_PROVIDERS:
-            raise ModelSettingsError("模型提供方仅支持mock或ollama")
-        normalized_url = normalize_ollama_base_url(base_url)
+            raise ModelSettingsError(
+                "模型提供方仅支持mock、ollama或openai-compatible"
+            )
+        normalized_url = _normalize_base_url_for_provider(
+            normalized_provider, base_url
+        )
         normalized_model = validate_model_name(model_name)
         if clear_api_key and api_key:
             raise ModelSettingsError("不能同时设置和清除API Key")

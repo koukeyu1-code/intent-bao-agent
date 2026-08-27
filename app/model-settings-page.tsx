@@ -45,6 +45,7 @@ import type {
 const { Paragraph, Title } = Typography;
 
 const OLLAMA_DEFAULT_URL = "http://127.0.0.1:11434";
+const LMSTUDIO_DEFAULT_URL = "http://127.0.0.1:1234";
 const MOCK_MODEL_NAME = "mock-intent-v1";
 
 type ModelOperation = "models" | "test" | "save" | "clear-key";
@@ -75,6 +76,12 @@ const providerMeta: Record<
     label: "本地 Ollama",
     description: "由意向宝后端调用本机 Ollama，浏览器不会直接持有模型密钥。",
     color: "green",
+  },
+  "openai-compatible": {
+    label: "LM Studio / OpenAI 兼容",
+    description:
+      "由意向宝后端调用本机 OpenAI 兼容服务（如 LM Studio），浏览器不会直接持有模型密钥。",
+    color: "blue",
   },
 };
 
@@ -130,7 +137,11 @@ export default function ModelSettingsPage() {
     (next: ModelSettings) => {
       form.setFieldsValue({
         provider: next.provider,
-        baseUrl: next.baseUrl || OLLAMA_DEFAULT_URL,
+        baseUrl:
+          next.baseUrl ||
+          (next.provider === "openai-compatible"
+            ? LMSTUDIO_DEFAULT_URL
+            : OLLAMA_DEFAULT_URL),
         modelName:
           next.modelName ||
           (next.provider === "mock" ? MOCK_MODEL_NAME : ""),
@@ -240,8 +251,17 @@ export default function ModelSettingsPage() {
       setModelOptions([MOCK_MODEL_NAME]);
       return;
     }
+    const currentBaseUrl = form.getFieldValue("baseUrl") || "";
+    const defaultBaseUrl = (target: ModelProvider) =>
+      target === "openai-compatible"
+        ? LMSTUDIO_DEFAULT_URL
+        : OLLAMA_DEFAULT_URL;
+    const isKnownDefault =
+      !currentBaseUrl ||
+      currentBaseUrl === OLLAMA_DEFAULT_URL ||
+      currentBaseUrl === LMSTUDIO_DEFAULT_URL;
     form.setFieldsValue({
-      baseUrl: form.getFieldValue("baseUrl") || OLLAMA_DEFAULT_URL,
+      baseUrl: isKnownDefault ? defaultBaseUrl(value) : currentBaseUrl,
       modelName:
         form.getFieldValue("modelName") === MOCK_MODEL_NAME
           ? ""
@@ -386,7 +406,8 @@ export default function ModelSettingsPage() {
           <Card className="content-card model-settings-form-card">
             <Title level={3}>推理服务</Title>
             <Paragraph>
-              选择模拟适配器，或连接本机已经运行的 Ollama 服务。模型供应商差异由后端封装。
+              选择模拟适配器，或连接本机已经运行的 Ollama / LM Studio（OpenAI
+              兼容）服务。模型供应商差异由后端封装。
             </Paragraph>
 
             <Form
@@ -421,6 +442,10 @@ export default function ModelSettingsPage() {
                   options={[
                     { value: "mock", label: "模拟分析" },
                     { value: "ollama", label: "本地 Ollama" },
+                    {
+                      value: "openai-compatible",
+                      label: "LM Studio / OpenAI 兼容",
+                    },
                   ]}
                 />
               </Form.Item>
@@ -428,22 +453,30 @@ export default function ModelSettingsPage() {
               <Form.Item
                 name="baseUrl"
                 label="服务地址"
-                tooltip="本地 Ollama 默认地址为 http://127.0.0.1:11434"
+                tooltip={
+                  provider === "openai-compatible"
+                    ? "LM Studio 默认地址为 http://127.0.0.1:1234（可带 /v1 后缀）"
+                    : "本地 Ollama 默认地址为 http://127.0.0.1:11434"
+                }
                 rules={[
                   {
                     validator: (_, value) => {
                       if (provider === "mock") return Promise.resolve();
                       if (!value) {
-                        return Promise.reject(new Error("请输入 Ollama 服务地址"));
+                        return Promise.reject(
+                          new Error("请输入模型服务地址"),
+                        );
                       }
-                      if (
-                        !/^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?\/?$/i.test(
-                          value.trim(),
-                        )
-                      ) {
+                      const loopbackPattern =
+                        provider === "openai-compatible"
+                          ? /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?(?:\/v1)?\/?$/i
+                          : /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?\/?$/i;
+                      if (!loopbackPattern.test(value.trim())) {
                         return Promise.reject(
                           new Error(
-                            "仅允许本机回环地址，例如 http://127.0.0.1:11434",
+                            provider === "openai-compatible"
+                              ? "仅允许本机回环地址，例如 http://127.0.0.1:1234"
+                              : "仅允许本机回环地址，例如 http://127.0.0.1:11434",
                           ),
                         );
                       }
@@ -454,7 +487,11 @@ export default function ModelSettingsPage() {
               >
                 <Input
                   prefix={<ApiOutlined />}
-                  placeholder={OLLAMA_DEFAULT_URL}
+                  placeholder={
+                    provider === "openai-compatible"
+                      ? LMSTUDIO_DEFAULT_URL
+                      : OLLAMA_DEFAULT_URL
+                  }
                   disabled={provider === "mock"}
                 />
               </Form.Item>
@@ -466,7 +503,9 @@ export default function ModelSettingsPage() {
                 extra={
                   provider === "ollama"
                     ? "可从服务读取模型，也可以直接输入 Ollama 中的完整模型标签。"
-                    : "模拟适配器固定使用 mock-intent-v1。"
+                    : provider === "openai-compatible"
+                      ? "可从服务读取模型，也可以直接输入 LM Studio 中加载的模型标识。"
+                      : "模拟适配器固定使用 mock-intent-v1。"
                 }
               >
                 <AutoComplete
@@ -474,7 +513,9 @@ export default function ModelSettingsPage() {
                   placeholder={
                     provider === "mock"
                       ? MOCK_MODEL_NAME
-                      : "例如 qwen3:8b"
+                      : provider === "openai-compatible"
+                        ? "例如 qwen3-8b（LM Studio 模型标识）"
+                        : "例如 qwen3:8b"
                   }
                   disabled={provider === "mock"}
                   filterOption={(inputValue, option) =>
@@ -489,15 +530,15 @@ export default function ModelSettingsPage() {
                 <Button
                   icon={<ReloadOutlined />}
                   loading={activeOperation === "models"}
-                  disabled={operationBusy || provider !== "ollama"}
+                  disabled={operationBusy || provider === "mock"}
                   onClick={() => void handleLoadModels()}
                 >
                   读取本地模型
                 </Button>
                 <span>
-                  {provider === "ollama"
-                    ? `已发现 ${modelOptions.length} 个候选模型`
-                    : "模拟模式无需读取模型列表"}
+                  {provider === "mock"
+                    ? "模拟模式无需读取模型列表"
+                    : `已发现 ${modelOptions.length} 个候选模型`}
                 </span>
               </div>
 
@@ -668,7 +709,7 @@ export default function ModelSettingsPage() {
                 <strong>{providerMeta[provider].label}</strong>
               </div>
               <Tag color={providerMeta[provider].color}>
-                {provider === "ollama" ? "本地推理" : "流程演示"}
+                {provider === "mock" ? "流程演示" : "本地推理"}
               </Tag>
             </div>
 

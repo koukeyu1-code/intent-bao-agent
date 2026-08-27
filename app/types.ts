@@ -15,7 +15,7 @@ export type ViewKey =
 
 export type DataSourceMode = "loading" | "api" | "mock";
 
-export type ModelProvider = "mock" | "ollama";
+export type ModelProvider = "mock" | "ollama" | "openai-compatible";
 
 export type ModelConnectionStatus =
   | "unknown"

@@ -248,7 +248,7 @@ class ModelAdapterConfig(BaseModel):
     api_key_env_name: str | None = None
 
 
-ModelProvider = Literal["mock", "ollama"]
+ModelProvider = Literal["mock", "ollama", "openai-compatible"]
 ModelConnectionStatus = Literal["unknown", "connected", "error"]
 
 
@@ -402,11 +402,11 @@ class OllamaStructuredOutput(BaseModel):
 
 
 class OllamaAnalysisResult(BaseModel):
-    """Provider-neutral dictionary shape returned by the Ollama adapter."""
+    """Provider-neutral dictionary shape returned by real-model adapters."""
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["ollama"]
+    mode: Literal["ollama", "openai-compatible"]
     model: str
     observations: list[OllamaIntentObservation] = Field(
         default_factory=list, max_length=100

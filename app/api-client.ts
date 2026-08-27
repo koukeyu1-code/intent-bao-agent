@@ -83,12 +83,16 @@ const request = async <T>(
     if (!response.ok) {
       notifyUnauthorized(response.status);
       const errorBody = (await response.json().catch(() => null)) as
-        | { detail?: string }
+        | { detail?: string | unknown[] | Record<string, unknown> }
         | null;
-      throw new ApiClientError(
-        errorBody?.detail ?? `API ${response.status}`,
-        response.status,
-      );
+      const rawDetail = errorBody?.detail;
+      const reason =
+        typeof rawDetail === "string"
+          ? rawDetail
+          : rawDetail !== undefined && rawDetail !== null
+            ? JSON.stringify(rawDetail)
+            : `API ${response.status}`;
+      throw new ApiClientError(reason, response.status);
     }
     return (await response.json()) as T;
   } finally {
