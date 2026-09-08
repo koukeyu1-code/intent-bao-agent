@@ -13,18 +13,22 @@ from typing import Any
 from xml.etree import ElementTree
 
 from fastapi import UploadFile
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from . import models as m
 from .config import Settings
-from .diarization import DiarizationUnavailable, get_diarizer
+from .diarization import (
+    DiarizationCancelled,
+    DiarizationUnavailable,
+    get_diarizer,
+)
 from .domain import (
     TERMINAL_OBSERVATION_STATUSES,
     adoption_status_key,
     formal_status_key,
 )
-from .audio_adapters import AsrSegment, get_asr_adapter
+from .audio_adapters import AsrAdapter, AsrSegment, get_asr_adapter
 from .media_processing import (
     extract_audio_track,
     extract_key_frames,
@@ -37,6 +41,11 @@ from .media_processing import (
 from .model_adapters import IntentModelAdapter, ModelContext, get_model_adapter
 from .stage_adapters import get_stage_adapter
 from .schemas import IntentConfirmRequest, SpeakerConfirmRequest
+from .query_visibility import (
+    get_visible_speaker,
+    visible_observation_clause,
+    visible_split_provenance_clause,
+)
 from .seed import TASK_STAGES
 from .taxonomy_service import (
     capture_path_snapshot,
@@ -233,6 +242,25 @@ def request_analysis_run_cancellation(
     return True
 
 
+def cancel_active_analysis_runs(session: Session, package_id: str) -> int:
+    """Request cancellation for every queued/running run of a package.
+
+    Used by manual stop actions and by force re-runs so a new run never
+    waits behind a stale one in the serial worker queue.
+    """
+    runs = session.scalars(
+        select(m.AnalysisRun).where(
+            m.AnalysisRun.package_id == package_id,
+            m.AnalysisRun.status.in_(("排队中", "运行中")),
+        )
+    ).all()
+    cancelled = 0
+    for run in runs:
+        if request_analysis_run_cancellation(session, run):
+            cancelled += 1
+    return cancelled
+
+
 def finalize_analysis_run_cancellation(
     session: Session, run: m.AnalysisRun
 ) -> m.AnalysisRun | None:
@@ -264,7 +292,11 @@ def _human_size(size_bytes: int) -> str:
 
 
 _DIRECT_TEXT_EXTENSIONS = {".txt", ".md", ".srt", ".vtt"}
-_MODEL_INPUT_LIMIT = 80_000
+# Cap the combined material text fed to the local model. Long meetings must
+# fit the 32k-class context of an integrated-GPU workstation together with
+# the taxonomy dictionary (~8k tokens); 20k chars ≈ 14k tokens keeps the
+# whole intent-extraction prompt under ~24k tokens.
+_MODEL_INPUT_LIMIT = 20_000
 _MODEL_TEXT_READ_LIMIT_BYTES = 512 * 1024
 
 # Upload limits reflect the first-stage usage profile: a screen recording may
@@ -1108,6 +1140,12 @@ def _run_identity_stage(
     )
 
 
+class _AudioTranscriptionFailure(DomainError):
+    def __init__(self, failures: list[dict[str, Any]]):
+        super().__init__(422, f"{len(failures)} 个语音片段在重试后仍无法完整转写")
+        self.failures = failures
+
+
 def _run_audio_stage(
     session: Session,
     settings: Settings,
@@ -1129,7 +1167,89 @@ def _run_audio_stage(
         model_name=asr_settings.model_name,
     )
     transcripts: list[m.TranscriptSegment] = []
-    target = targets[0]
+    file_results: list[dict[str, Any]] = []
+    _update_task(session, run, "音轨与转写", status="处理中", progress=0)
+    _update_task(session, run, "说话人分离", status="处理中", progress=0)
+    session.commit()
+    for file_index, target in enumerate(targets):
+        _raise_if_analysis_cancel_requested(session, run)
+        try:
+            file_transcripts, summary = _run_audio_file(
+                session, settings, run, package, target, adapter,
+                file_index=file_index, file_count=len(targets),
+                order_offset=len(transcripts),
+            )
+        except _AnalysisCancellationRequested:
+            raise
+        except Exception as exc:
+            _raise_if_analysis_cancel_requested(session, run)
+            failures = (
+                exc.failures if isinstance(exc, _AudioTranscriptionFailure)
+                else [{"material_file_id": target.id, "start_ms": None,
+                       "end_ms": None, "error": "音轨提取或转写失败", "attempts": 1}]
+            )
+            first_failure = failures[0]
+            location = (
+                f"（{_fmt_ms(first_failure['start_ms'])}–{_fmt_ms(first_failure['end_ms'])}）"
+                if first_failure["start_ms"] is not None
+                and first_failure["end_ms"] is not None else ""
+            )
+            reason = (
+                f"材料“{target.safe_name}”转写不完整：{len(failures)} 个片段失败"
+                f"{location}，请检查语音服务后重试"
+            )
+            target.parse_status = "解析失败"
+            _update_task(
+                session, run, "音轨与转写", status="处理失败",
+                result_json={"files": file_results, "failed_segments": failures,
+                             "segments": len(transcripts)},
+            )
+            task = session.scalar(select(m.ProcessingTask).where(
+                m.ProcessingTask.analysis_run_id == run.id,
+                m.ProcessingTask.stage == "音轨与转写",
+            ))
+            if task is not None:
+                task.error_message = reason
+            # The outer cancellation check rolls back current-stage changes.
+            # Persist the failure coordinates before handing it control.
+            session.commit()
+            raise DomainError(422, reason) from exc
+        transcripts.extend(file_transcripts)
+        file_results.append(summary)
+        _update_task(
+            session, run, "音轨与转写", status="处理中",
+            progress=min(99, int(99 * (file_index + 1) / len(targets))),
+            result_json={"files": file_results, "segments": len(transcripts)},
+        )
+        session.commit()
+    _raise_if_analysis_cancel_requested(session, run)
+    _update_task(
+        session, run, "音轨与转写", status="已完成", progress=100,
+        result_json={"files": file_results, "segments": len(transcripts),
+                     "duration_ms": sum(item["duration_ms"] or 0 for item in file_results),
+                     "model": adapter.model_name},
+    )
+    _update_task(
+        session, run, "说话人分离", status="已完成", progress=100,
+        result_json={"speaker_labels": len({item.speaker_label for item in transcripts
+                                             if item.speaker_label})},
+    )
+    return True, transcripts
+
+
+def _run_audio_file(
+    session: Session,
+    settings: Settings,
+    run: m.AnalysisRun,
+    package: m.MeetingPackage,
+    target: m.MaterialFile,
+    adapter: AsrAdapter,
+    *,
+    file_index: int,
+    file_count: int,
+    order_offset: int,
+) -> tuple[list[m.TranscriptSegment], dict[str, Any]]:
+    transcripts: list[m.TranscriptSegment] = []
     path = (settings.data_dir / target.relative_path).resolve()
     audio_path = path
     if target.material_type == "录屏":
@@ -1156,11 +1276,32 @@ def _run_audio_stage(
         "turns": 0,
         "speakers": 0,
     }
+    progress_state = {"last": 0}
+
+    def _report_audio_progress(percent: int) -> None:
+        percent = min(99, int((file_index * 100 + percent) / file_count))
+        # Throttle to ~1% steps; every write commits so polling clients see
+        # movement during the multi-minute embedding/transcription loop.
+        if percent < progress_state["last"] + 1 and percent < 99:
+            return
+        progress_state["last"] = percent
+        _update_task(
+            session, run, "音轨与转写", status="处理中", progress=percent
+        )
+        session.commit()
+
     try:
         diarizer = get_diarizer(settings)
         if diarizer is not None:
             diarized_turns = diarizer.diarize(
-                audio_path, duration_ms=duration_ms
+                audio_path,
+                duration_ms=duration_ms,
+                should_cancel=lambda: analysis_run_cancel_requested(
+                    session, run
+                ),
+                on_progress=lambda done, total: _report_audio_progress(
+                    5 + int(65 * done / total)
+                ),
             )
             diarization_note = {
                 "provider": "funasr",
@@ -1169,33 +1310,63 @@ def _run_audio_stage(
                     {turn.speaker_label for turn in diarized_turns}
                 ),
             }
+    except (DiarizationCancelled, _AnalysisCancellationRequested):
+        # Must be caught before the generic handler below, which would
+        # silently degrade a cancellation into whole-file transcription.
+        raise _AnalysisCancellationRequested
     except Exception as exc:
         logger.warning("说话人分离不可用，退回整段转写：%s", exc)
+    _raise_if_analysis_cancel_requested(session, run)
 
     transcript_model = adapter.model_name
     if diarized_turns:
         segments: list[AsrSegment] = []
+        failed_segments: list[dict[str, Any]] = []
         temp_dir = settings.data_dir / "temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
         for turn_index, turn in enumerate(diarized_turns):
+            _raise_if_analysis_cancel_requested(session, run)
+            _report_audio_progress(
+                70 + int(28 * (turn_index + 1) / len(diarized_turns))
+            )
             seg_wav = (
                 temp_dir
                 / f"{run.id}-{target.id}-diar-{turn_index}.wav"
             )
-            if not slice_audio_segment(
-                audio_path, turn.start_ms, turn.end_ms, seg_wav
-            ):
-                continue
             try:
-                turn_result = adapter.transcribe(
-                    seg_wav,
-                    language="zh",
-                    hotwords=hotwords,
-                    duration_ms=turn.end_ms - turn.start_ms,
-                )
-            except Exception as exc:
-                logger.warning("说话人片段转写失败，跳过：%s", exc)
-                continue
+                turn_result = None
+                failure_reason = "语音服务转写失败"
+                for attempt in range(1, 3):
+                    _raise_if_analysis_cancel_requested(session, run)
+                    try:
+                        if not slice_audio_segment(
+                            audio_path, turn.start_ms, turn.end_ms, seg_wav
+                        ):
+                            failure_reason = "音频切片失败"
+                            continue
+                        candidate = adapter.transcribe(
+                            seg_wav, language="zh", hotwords=hotwords,
+                            duration_ms=turn.end_ms - turn.start_ms,
+                        )
+                        _raise_if_analysis_cancel_requested(session, run)
+                        if not candidate.segments or any(
+                            not seg.text.strip() for seg in candidate.segments
+                        ):
+                            failure_reason = "语音服务返回空转写"
+                            continue
+                        turn_result = candidate
+                        break
+                    except _AnalysisCancellationRequested:
+                        raise
+                    except Exception:
+                        failure_reason = "音频切片或语音服务转写失败"
+                if turn_result is None:
+                    failed_segments.append({
+                        "material_file_id": target.id,
+                        "start_ms": turn.start_ms, "end_ms": turn.end_ms,
+                        "error": failure_reason, "attempts": attempt,
+                    })
+                    continue
             finally:
                 try:
                     seg_wav.unlink(missing_ok=True)
@@ -1214,6 +1385,8 @@ def _run_audio_stage(
                         language=seg.language,
                     )
                 )
+        if failed_segments:
+            raise _AudioTranscriptionFailure(failed_segments)
     else:
         result = adapter.transcribe(
             audio_path,
@@ -1223,6 +1396,12 @@ def _run_audio_stage(
         )
         transcript_model = result.model_name
         segments = list(result.segments)
+        _raise_if_analysis_cancel_requested(session, run)
+        if not segments or any(not segment.text.strip() for segment in segments):
+            raise _AudioTranscriptionFailure([{
+                "material_file_id": target.id, "start_ms": 0,
+                "end_ms": duration_ms, "error": "语音服务返回空转写", "attempts": 1,
+            }])
 
     existing_clusters = session.scalars(
         select(m.SpeakerCluster).where(
@@ -1242,29 +1421,35 @@ def _run_audio_stage(
             )
         ).all()
     } if existing_clusters else set()
-    current_labels: set[str] = set()
     for index, segment in enumerate(segments, 1):
+        # Diarizer labels are local to one input file.  Never merge two
+        # recordings' SPEAKER_00 identities just because their labels match.
+        speaker_label = (
+            "Speaker " + hashlib.sha256(
+                f"{run.id}|{target.id}|{segment.speaker_label}".encode()
+            ).hexdigest()[:20]
+            if segment.speaker_label else None
+        )
         transcript = m.TranscriptSegment(
             analysis_run_id=run.id,
             package_id=package.id,
             material_file_id=target.id,
-            order_index=index,
+            order_index=order_offset + index,
             start_ms=segment.start_ms,
             end_ms=segment.end_ms,
             text=segment.text,
-            speaker_label=segment.speaker_label,
+            speaker_label=speaker_label,
             language=segment.language,
             confidence=segment.confidence,
         )
         session.add(transcript)
         transcripts.append(transcript)
-        if segment.speaker_label:
-            current_labels.add(segment.speaker_label)
-            cluster = label_to_cluster.get(segment.speaker_label)
+        if speaker_label:
+            cluster = label_to_cluster.get(speaker_label)
             if cluster is None:
                 cluster = m.SpeakerCluster(
                     package_id=package.id,
-                    label=segment.speaker_label,
+                    label=speaker_label,
                     recommended_name=f"待确认人员{len(label_to_cluster) + 1}",
                     confidence=0.5,
                     status="待确认",
@@ -1272,7 +1457,7 @@ def _run_audio_stage(
                 session.add(cluster)
                 # Assign the string PK before referencing it from segments.
                 session.flush()
-                label_to_cluster[segment.speaker_label] = cluster
+                label_to_cluster[speaker_label] = cluster
             segment_key = (
                 cluster.id,
                 segment.start_ms,
@@ -1290,30 +1475,13 @@ def _run_audio_stage(
                 existing_segment_keys.add(segment_key)
     session.flush()
     target.parse_status = "解析完成"
-    _update_task(
-        session,
-        run,
-        "音轨与转写",
-        status="已完成",
-        result_json={
-            "segments": len(transcripts),
-            "duration_ms": duration_ms,
-            "model": transcript_model,
-            **(
-                {"diarization": diarization_note}
-                if diarized_turns
-                else {}
-            ),
-        },
-    )
-    _update_task(
-        session,
-        run,
-        "说话人分离",
-        status="已完成",
-        result_json={"speaker_labels": len(current_labels)},
-    )
-    return True, transcripts
+    return transcripts, {
+        "material_file_id": target.id,
+        "segments": len(transcripts),
+        "duration_ms": duration_ms,
+        "model": transcript_model,
+        **({"diarization": diarization_note} if diarized_turns else {}),
+    }
 
 
 def _run_visual_stage(
@@ -1328,7 +1496,9 @@ def _run_visual_stage(
         _update_task(session, run, "画面与PDF解析", status="不适用")
         return []
     frames: list[m.KeyFrame] = []
-    for item in screen[:1]:
+    _update_task(session, run, "画面与PDF解析", status="处理中", progress=0)
+    for file_index, item in enumerate(screen):
+        _raise_if_analysis_cancel_requested(session, run)
         path = (settings.data_dir / item.relative_path).resolve()
         target_dir = (
             settings.data_dir
@@ -1337,8 +1507,26 @@ def _run_visual_stage(
             / package.id
             / "derived"
             / "frames"
+            / run.id
+            / item.id
         )
         extracted = extract_key_frames(path, target_dir, max_frames=20)
+        _raise_if_analysis_cancel_requested(session, run)
+        if not extracted:
+            item.parse_status = "解析失败"
+            reason = f"录屏“{item.safe_name}”未提取到画面，请检查媒体工具或文件后重试"
+            _update_task(
+                session, run, "画面与PDF解析", status="处理失败",
+                result_json={"failed_material_file_id": item.id},
+            )
+            task = session.scalar(select(m.ProcessingTask).where(
+                m.ProcessingTask.analysis_run_id == run.id,
+                m.ProcessingTask.stage == "画面与PDF解析",
+            ))
+            if task is not None:
+                task.error_message = reason
+            session.commit()
+            raise DomainError(422, reason)
         for descriptor in extracted:
             relative = descriptor["path"].relative_to(settings.data_dir).as_posix()
             ocr = ocr_image(descriptor["path"])
@@ -1351,14 +1539,19 @@ def _run_visual_stage(
             )
             session.add(frame)
             frames.append(frame)
-        item.parse_status = "解析完成" if extracted else "待专用解析"
+        item.parse_status = "解析完成"
+        _update_task(
+            session, run, "画面与PDF解析", status="处理中",
+            progress=min(99, int(99 * (file_index + 1) / len(screen))),
+        )
     session.flush()
     _update_task(
         session,
         run,
         "画面与PDF解析",
-        status="已完成" if frames else "不适用",
-        result_json={"key_frames": len(frames)},
+        status="已完成",
+        progress=100,
+        result_json={"key_frames": len(frames), "material_files": len(screen)},
     )
     return frames
 
@@ -1473,6 +1666,9 @@ def _persist_mock_observations(
                 status="待确认",
                 model_name=adapter.model_name,
                 ai_snapshot={
+                    "quote": quote,
+                    "technology_id": technology.id,
+                    "function_id": function_id,
                     "attitude_level": attitude,
                     "adoption_stage": stage,
                     "support_reason": support,
@@ -1663,6 +1859,9 @@ def _persist_model_observations(
         session.add(evidence)
         session.flush()
         snapshot = {
+            "quote": quote,
+            "technology_id": technology_id,
+            "function_id": function_id,
             "attitude_level": attitude,
             "adoption_stage": adoption_stage,
             "support_reason": raw.get("support_reason"),
@@ -1720,9 +1919,16 @@ def ai_original_snapshot(
 ) -> dict[str, Any]:
     """Return the immutable model baseline, with a legacy-row fallback."""
 
-    if observation.ai_snapshot:
-        return dict(observation.ai_snapshot)
-    return {
+    if not observation.ai_snapshot and observation.version != 1:
+        return {
+            "unavailable": True,
+            "reason": "历史记录已修改，未保留AI原始快照",
+            "analysis_run_id": observation.analysis_run_id,
+        }
+    baseline = {
+        "quote": observation.raw_quote,
+        "technology_id": observation.technology_id,
+        "function_id": observation.function_id,
         "attitude_level": observation.suggested_attitude,
         "adoption_stage": observation.suggested_adoption_stage,
         "support_reason": observation.support_reason,
@@ -1735,12 +1941,19 @@ def ai_original_snapshot(
         "prompt_version": observation.prompt_version,
         "rule_version": observation.rule_version,
     }
+    if observation.ai_snapshot:
+        # Only untouched legacy rows can safely supply fields absent in older
+        # snapshots. Never infer the model's original fields after review.
+        if observation.version == 1:
+            return {**baseline, **observation.ai_snapshot}
+        return dict(observation.ai_snapshot)
+    return baseline
 
 
 def ensure_ai_snapshot(observation: m.RawIntentObservation) -> dict[str, Any]:
     """Capture the AI baseline once, before any human mutation."""
 
-    if not observation.ai_snapshot:
+    if not observation.ai_snapshot or observation.version == 1:
         observation.ai_snapshot = ai_original_snapshot(observation)
     return dict(observation.ai_snapshot)
 
@@ -2572,6 +2785,7 @@ def merge_speakers(
             )
         ).all()
         for observation in observations:
+            ensure_ai_snapshot(observation)
             observation.speaker_id = keep.id
             observation.version += 1
         session.add(
@@ -2609,17 +2823,39 @@ def split_speaker(
     segment_ids: list[str],
     actor: str,
 ) -> m.SpeakerCluster:
-    source = session.get(m.SpeakerCluster, speaker_id)
+    source = get_visible_speaker(session, speaker_id)
     if source is None or source.package_id != package_id:
         raise DomainError(404, "说话人不存在或不属于该资料包")
-    segments = session.scalars(
+    all_segments = session.scalars(
         select(m.SpeakerSegment).where(
             m.SpeakerSegment.speaker_id == source.id,
-            m.SpeakerSegment.id.in_(segment_ids),
         )
     ).all()
-    if not segments:
-        raise DomainError(422, "没有可拆分的片段")
+    selected_ids = set(segment_ids)
+    segments = [item for item in all_segments if item.id in selected_ids]
+    if not segments or {item.id for item in segments} != selected_ids:
+        raise DomainError(422, "所选片段不存在或不属于该说话人")
+    observations = session.scalars(select(m.RawIntentObservation).where(
+        m.RawIntentObservation.speaker_id == source.id,
+        visible_observation_clause(),
+    )).all()
+    source_runs = {item.analysis_run_id for item in observations}
+    for record in session.scalars(select(m.ConfirmationRecord).where(
+        m.ConfirmationRecord.target_id == source.id,
+        visible_split_provenance_clause(),
+    )).all():
+        source_runs.add(record.after_snapshot["analysis_run_id"])
+    # Older clusters could be reused by later failed analyses and their
+    # speech rows carry no run id. Do not give those ambiguous rows a manual
+    # visibility exemption. New ASR labels are scoped to the analysis run.
+    uncertain_run = session.scalar(select(m.AnalysisRun.id).where(
+        m.AnalysisRun.package_id == package_id,
+        m.AnalysisRun.id.not_in([item for item in source_runs if item is not None]),
+        or_(m.AnalysisRun.status != "已完成", m.AnalysisRun.cancel_requested_at.is_not(None)),
+        or_(m.AnalysisRun.finished_at.is_(None), m.AnalysisRun.finished_at >= source.created_at),
+    ).limit(1))
+    if uncertain_run:
+        raise DomainError(422, "说话人可能包含未成功分析的片段，来源无法确定；请完成或重新分析后再拆分")
     label_index = _next_speaker_label(session, package_id)
     target = m.SpeakerCluster(
         package_id=package_id,
@@ -2633,17 +2869,63 @@ def split_speaker(
     moved_ids = [segment.id for segment in segments]
     for segment in segments:
         segment.speaker_id = target.id
+    moved_observations = []
+    target_runs = set()
+    attributed_segments = set()
+    for observation in observations:
+        quote = re.sub(r"\s+", "", observation.raw_quote)
+        evidence = session.get(m.EvidenceFragment, observation.evidence_id) if observation.evidence_id else None
+        matches = []
+        for segment in all_segments:
+            if not quote or quote not in re.sub(r"\s+", "", segment.transcript):
+                continue
+            if evidence and evidence.start_ms is not None and evidence.end_ms is not None:
+                if not (segment.start_ms < evidence.end_ms and evidence.start_ms < segment.end_ms):
+                    continue
+            matches.append(segment.id)
+        # Ambiguous text shared with an unselected segment stays with the source.
+        if matches and set(matches).issubset(selected_ids):
+            ensure_ai_snapshot(observation)
+            observation.speaker_id = target.id
+            observation.function_id = None
+            observation.status = "待确认"
+            observation.version += 1
+            moved_observations.append(observation.id)
+            target_runs.add(observation.analysis_run_id)
+            attributed_segments.update(matches)
+    if attributed_segments != selected_ids:
+        if len(source_runs) != 1:
+            session.rollback()
+            raise DomainError(422, "片段跨分析批次且来源不明确，无法安全拆分；请先核对证据来源")
+        target_runs = set(source_runs)
+    # A child must not inherit unrelated runs as a fallback source. Preserve
+    # an otherwise unreferenced parent for its remaining manual-review clips.
+    owners = [(target, target_runs)]
+    if len(moved_observations) == len(observations):
+        owners.append((source, source_runs))
+    for owner, run_ids in owners:
+        for run_id in run_ids:
+            session.add(m.ConfirmationRecord(
+                target_type="speaker", target_id=owner.id, action="拆分来源",
+                after_snapshot={"analysis_run_id": run_id, "source_speaker_id": source.id},
+                actor=actor,
+            ))
     session.add(
         m.ConfirmationRecord(
             target_type="speaker",
             target_id=source.id,
             action="拆分",
             before_snapshot={"segments": moved_ids},
-            after_snapshot={"created_speaker": target.id, "segments": moved_ids},
+            after_snapshot={"created_speaker": target.id, "segments": moved_ids,
+                            "observations": moved_observations},
             actor=actor,
         )
     )
     source.version += 1
+    package = session.get(m.MeetingPackage, package_id)
+    if package:
+        package.status = "待身份校验"
+        package.version += 1
     session.commit()
     session.refresh(target)
     return target
@@ -2703,6 +2985,7 @@ def confirm_speaker(
         ).all()
         for observation in observations:
             if observation.function_id is None:
+                ensure_ai_snapshot(observation)
                 observation.function_id = speaker.confirmed_function_id
                 observation.version += 1
 

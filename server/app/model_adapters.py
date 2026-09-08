@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -128,6 +129,24 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
                 return ModelAdapterError(
                     f"{label}无法解析结构化输出语法（grammar），"
                     "当前模型可能不兼容完整JSON Schema"
+                )
+            if (
+                exc.response.status_code == 400
+                and "exceed" in body_text.lower()
+                and "context" in body_text.lower()
+            ):
+                # Surface the real cause: a too-small model context window,
+                # not a broken service. LM Studio resets load params on
+                # restart unless saved as default, so name the exact fix.
+                ctx_match = re.search(
+                    r"n_ctx[\"']?\s*[:=]?\s*(\d+)", body_text
+                ) or re.search(r"context size \((\d+) tokens\)", body_text)
+                current_ctx = ctx_match.group(1) if ctx_match else "较小"
+                return ModelAdapterError(
+                    f"{label}拒绝请求：本次分析材料超出模型上下文长度"
+                    f"（当前 {current_ctx} tokens）。"
+                    "请在 LM Studio 重新加载模型并将 Context Length 调大"
+                    "（建议 32768），并在加载设置中保存为默认值"
                 )
             return ModelAdapterError(
                 f"{label}返回HTTP {exc.response.status_code}，请检查模型和服务状态"

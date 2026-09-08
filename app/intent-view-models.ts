@@ -196,6 +196,7 @@ export const computeOverviewMetrics = (
 export const buildIntentConfirmPayload = (
   intent: IntentObservation,
   action: "confirm" | "unknown",
+  reviewNote?: string,
 ): IntentConfirmPayload => ({
   version: intent.version ?? 1,
   attitude_level: action === "unknown" ? null : intent.attitude,
@@ -216,7 +217,7 @@ export const buildIntentConfirmPayload = (
   note:
     action === "unknown"
       ? "当前证据不足，保留未知；不改写采用阶段"
-      : "产品规划负责人确认",
+      : reviewNote?.trim() || "产品规划负责人确认",
 });
 
 export const assertConfirmedStage = (

@@ -14,6 +14,7 @@ from .query_visibility import (
     visible_speaker_clause,
 )
 from .taxonomy_service import intent_path
+from .services import ai_original_snapshot
 
 
 def iso(value: date | datetime | None) -> str | None:
@@ -65,21 +66,7 @@ def public_platform_draft(
 
 
 def _ai_original(observation: m.RawIntentObservation) -> dict[str, Any]:
-    if observation.ai_snapshot:
-        return dict(observation.ai_snapshot)
-    return {
-        "attitude_level": observation.suggested_attitude,
-        "adoption_stage": observation.suggested_adoption_stage,
-        "support_reason": observation.support_reason,
-        "resistance_reason": observation.resistance_reason,
-        "bottlenecks": list(observation.bottlenecks or []),
-        "decision_influence": observation.decision_influence,
-        "confidence": observation.confidence,
-        "analysis_run_id": observation.analysis_run_id,
-        "model_name": observation.model_name,
-        "prompt_version": observation.prompt_version,
-        "rule_version": observation.rule_version,
-    }
+    return ai_original_snapshot(observation)
 
 
 def observation_conflicts(

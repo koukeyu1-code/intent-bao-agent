@@ -1,0 +1,13 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Type generation only; deployment bindings remain managed by Sites/Vite.
+  "name": "intent-bao-types",
+  "main": "worker/index.ts",
+  // Matches the workerd runtime pinned by Wrangler 4.92.0.
+  "compatibility_date": "2026-05-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "send_metrics": false,
+  "d1_databases": [{ "binding": "DB" }],
+  "assets": { "binding": "ASSETS" },
+  "images": { "binding": "IMAGES" }
+}

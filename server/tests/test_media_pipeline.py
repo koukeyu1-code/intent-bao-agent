@@ -780,9 +780,12 @@ def test_business_queries_only_expose_legacy_or_successful_run_observations(
     assert evaluation.status_code == 200, evaluation.text
     report = evaluation.json()["evaluation"]
     assert report["total"] == 4
-    assert report["correct"] == 2
-    assert report["traceable"] == 2
-    assert report["error_count"] == 2
+    # Evaluation selects one completed run; unbatched legacy observations are
+    # still visible in business views but are not mixed into this batch.
+    assert report["analysis_run_id"] == "run-visibility-success"
+    assert report["correct"] == 1
+    assert report["traceable"] == 1
+    assert report["error_count"] == 3
 
 
 def test_env_check_endpoint(tmp_path: Path) -> None:

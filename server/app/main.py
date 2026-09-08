@@ -85,6 +85,7 @@ from .schemas import (
 from .seed import seed_demo_data
 from .services import (
     DomainError,
+    cancel_active_analysis_runs,
     confirm_observation,
     confirm_speaker,
     create_analysis_run,
@@ -394,6 +395,14 @@ def create_app(
         except ModelSettingsError as exc:
             raise DomainError(422, str(exc)) from exc
         return updated.public_dict()
+
+    @app.delete(
+        "/api/model-settings/api-key",
+        tags=["模型设置"],
+        response_model=ModelSettingsResponse,
+    )
+    def clear_model_api_key(_user: AdminUser) -> dict:
+        return model_settings.clear_api_key().public_dict()
 
     @app.post(
         "/api/model-settings/test",
@@ -739,6 +748,13 @@ def create_app(
                 )
             except (ModelSettingsError, ValueError) as exc:
                 raise DomainError(422, str(exc)) from exc
+        # A force re-run replaces whatever is queued/running so the new run
+        # never waits behind a stale one in the serial worker.
+        cancelled_runs = (
+            cancel_active_analysis_runs(session, package_id)
+            if payload.force
+            else 0
+        )
         run = create_analysis_run(
             session,
             package,
@@ -767,6 +783,7 @@ def create_app(
         ).all()
         return {
             "task_id": run.id,
+            "cancelled_runs": cancelled_runs,
             "analysis_run": {
                 "id": run.id,
                 "package_id": run.package_id,
@@ -789,6 +806,28 @@ def create_app(
                         "实时进度，完成后结果自动落库。"
                     )
                 )
+            ),
+        }
+
+    @app.post(
+        "/api/meeting-packages/{package_id}/analyze/cancel",
+        tags=["处理任务"],
+    )
+    def cancel_package_analysis_runs(
+        package_id: str,
+        session: DbSession,
+        _user: EditorUser,
+    ) -> dict:
+        """Manually stop all queued/running analyses of one package."""
+        package = _get_or_404(session, m.MeetingPackage, package_id, "会议资料包")
+        cancelled = cancel_active_analysis_runs(session, package_id)
+        return {
+            "package_id": package.id,
+            "cancelled_runs": cancelled,
+            "message": (
+                "已请求停止分析任务，正在运行的阶段将在数秒内退出。"
+                if cancelled
+                else "当前没有排队或运行中的分析任务。"
             ),
         }
 
@@ -881,6 +920,9 @@ def create_app(
         package = _get_or_404(
             session, m.MeetingPackage, original.package_id, "会议资料包"
         )
+        # Replace any queued/running run (including the retried one itself)
+        # so the fresh run starts instead of queueing behind it.
+        cancel_active_analysis_runs(session, package.id)
         active_model = model_settings.snapshot()
         adapter_name = active_model.provider
         adapter = None
@@ -1133,6 +1175,7 @@ def create_app(
         report = run_evaluation(
             session,
             package_id=payload.package_id,
+            analysis_run_id=payload.analysis_run_id,
             golden=[item.model_dump() for item in payload.golden],
         )
         return {"evaluation": report, "message": "评测完成。"}

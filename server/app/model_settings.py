@@ -5,7 +5,7 @@ import os
 import re
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -249,6 +249,12 @@ class ModelSettingsStore:
 
     def snapshot(self) -> RuntimeModelSettings:
         with self._lock:
+            return self._settings
+
+    def clear_api_key(self) -> RuntimeModelSettings:
+        """Clear only the in-memory credential under the settings lock."""
+        with self._lock:
+            self._settings = replace(self._settings, api_key=None)
             return self._settings
 
     def public_dict(

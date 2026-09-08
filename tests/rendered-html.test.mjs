@@ -403,9 +403,14 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
     appSource,
     /const refreshed = await reloadDataset\(\)[\s\S]{0,220}persisted\.adoptionStage !== expectedStage/,
   );
-  assert.match(
-    appSource,
-    /updateIntentStatus\(item, action\)[\s\S]{0,700}await reloadDataset\(\)/,
+  const actionSource = appSource.slice(
+    appSource.indexOf("const applyAction = useCallback"),
+    appSource.indexOf("const saveEditing = async"),
+  );
+  const statusWriteIndex = actionSource.indexOf("updateIntentStatus(item, action, preparedNote)");
+  assert.ok(
+    statusWriteIndex >= 0 && actionSource.indexOf("await reloadDataset()") > statusWriteIndex,
+    "status writes must carry the reviewed note and reload persisted results",
   );
   assert.match(
     appSource,

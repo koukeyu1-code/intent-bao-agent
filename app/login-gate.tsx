@@ -239,16 +239,18 @@ export default function LoginGate({ children }: LoginGateProps) {
   };
 
   const handleLogout = useCallback(async () => {
+    setErrorMessage("");
     try {
       await logout();
     } catch (error) {
       if (!(error instanceof AuthApiError && error.status === 401)) {
-        throw error;
+        setErrorMessage("已退出本地登录，但服务端会话注销未确认。请在服务恢复后重新登录。");
       }
+    } finally {
+      setUser(null);
+      setPassword("");
+      setPhase("unauthenticated");
     }
-    setUser(null);
-    setPassword("");
-    setPhase("unauthenticated");
   }, []);
 
   const auth = useMemo<AuthContextValue | null>(

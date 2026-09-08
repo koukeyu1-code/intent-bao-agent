@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as authApi from "../app/auth-api.ts";
+import { componentHarness, loadModule, renderedText } from "./helpers/component-harness.mjs";
 
 import {
   AuthApiError,
@@ -27,6 +29,8 @@ const withBrowserSession = async (callback) => {
   const originalWindow = globalThis.window;
   const values = new Map();
   globalThis.window = {
+    addEventListener() {},
+    removeEventListener() {},
     sessionStorage: {
       getItem: (key) => values.get(key) ?? null,
       setItem: (key, value) => values.set(key, String(value)),
@@ -197,4 +201,46 @@ test("API errors retain status and message", async () => {
       },
     );
   });
+});
+
+test("logout removes protected content for success, expired sessions, and server/network failures", async () => {
+  for (const outcome of [200, 401, 503, "offline"]) {
+    await withBrowserSession(async () => {
+      storeAccessToken("temporary-component-test-token");
+      await withMockFetch(async (url) => {
+        if (String(url).endsWith("/auth/me")) {
+          return Response.json({ id: "test-user", username: "planner", display_name: "测试", role: "user" });
+        }
+        if (outcome === "offline") throw new TypeError("Failed to fetch");
+        return Response.json({ message: "已注销", detail: "认证服务不可用" }, { status: outcome });
+      }, async () => {
+        const harness = componentHarness();
+        const { default: LoginGate } = await loadModule("../../app/login-gate.tsx", {
+          react: harness.hooks,
+          "./auth-api": authApi,
+        });
+        let authenticated;
+        let protectedRenders = 0;
+        const props = { children: (auth) => {
+          authenticated = auth;
+          protectedRenders += 1;
+          return "受保护的客户资料";
+        } };
+        harness.render(LoginGate, props);
+        await harness.settle();
+        assert.match(renderedText(harness.render(LoginGate, props)), /受保护的客户资料/);
+        await authenticated.logout();
+        const afterLogout = renderedText(harness.render(LoginGate, props));
+        assert.equal(getAccessToken(), null, String(outcome));
+        assert.match(afterLogout, /登录意向宝/, String(outcome));
+        assert.doesNotMatch(afterLogout, /受保护的客户资料/, String(outcome));
+        assert.equal(protectedRenders, 1, "authenticated children must not render after logout");
+        if (outcome === 503 || outcome === "offline") {
+          assert.match(afterLogout, /已退出本地登录.*服务端会话注销未确认/);
+        } else {
+          assert.doesNotMatch(afterLogout, /服务端会话注销未确认/);
+        }
+      });
+    });
+  }
 });

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import exists, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session
 
 from . import models as m
@@ -27,15 +27,41 @@ def visible_observation_clause():
     )
 
 
-def visible_speaker_clause():
-    """Only expose speakers referenced by at least one visible observation."""
+def visible_split_provenance_clause():
+    """Manual splits inherit the visibility of their recorded source run."""
+    run_id = m.ConfirmationRecord.after_snapshot["analysis_run_id"].as_string()
+    successful_run = exists(select(m.AnalysisRun.id).where(
+        m.AnalysisRun.id == run_id,
+        m.AnalysisRun.status == "已完成",
+        m.AnalysisRun.cancel_requested_at.is_(None),
+    )).correlate(m.ConfirmationRecord)
+    return and_(
+        m.ConfirmationRecord.target_type == "speaker",
+        m.ConfirmationRecord.action == "拆分来源",
+        or_(run_id.is_(None), successful_run),
+    )
 
-    return exists(
+
+def visible_speaker_clause():
+    """Expose visible observations' speakers and attributable manual splits."""
+
+    referenced = exists(
         select(m.RawIntentObservation.id).where(
             m.RawIntentObservation.speaker_id == m.SpeakerCluster.id,
             visible_observation_clause(),
         )
     ).correlate(m.SpeakerCluster)
+    split_source = exists(select(m.ConfirmationRecord.id).where(
+        m.ConfirmationRecord.target_id == m.SpeakerCluster.id,
+        visible_split_provenance_clause(),
+    )).correlate(m.SpeakerCluster)
+    invalid_split_source = exists(select(m.ConfirmationRecord.id).where(
+        m.ConfirmationRecord.target_id == m.SpeakerCluster.id,
+        m.ConfirmationRecord.target_type == "speaker",
+        m.ConfirmationRecord.action == "拆分来源",
+        ~visible_split_provenance_clause(),
+    )).correlate(m.SpeakerCluster)
+    return and_(or_(referenced, split_source), ~invalid_split_source)
 
 
 def get_visible_observation(

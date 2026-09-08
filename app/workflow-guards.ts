@@ -2,7 +2,7 @@ import type {
   PlatformCascadeSelection,
   PlatformTaxonomy,
 } from "./platform-taxonomy";
-import type { AdoptionStage } from "./types";
+import type { AdoptionStage, Evidence, IntentObservation } from "./types";
 
 export interface SpeakerIdentityDraft {
   alias: string;
@@ -61,6 +61,59 @@ export function assertIntentReadyForSave(input: {
   if (!ADOPTION_STAGES.has(input.adoptionStage as AdoptionStage)) {
     throw new Error("采用阶段无效，请重新选择");
   }
+}
+
+export type IntentConfirmationReview =
+  | { mode: "batch" }
+  | { mode: "manual"; note: string };
+
+export function intentConfirmationRisks(
+  intent: Pick<IntentObservation, "confidence" | "conflict">,
+) {
+  return [
+    ...(intent.confidence < 0.75 ? ["AI置信度低于75%"] : []),
+    ...(intent.conflict ? ["存在历史／内部意见冲突"] : []),
+  ];
+}
+
+export function assertIntentConfirmationEvidence(
+  intent: IntentObservation,
+  evidence: Evidence | undefined,
+) {
+  assertIntentReadyForSave(intent);
+  if (!intent.identityConfirmed) {
+    throw new Error("请先确认说话人身份与客户职能，再确认意向");
+  }
+  if (intent.attitude === null) {
+    throw new Error("当前态度未知，请先核对证据并修改态度，或标记为无法判断");
+  }
+  if (
+    !intent.evidenceId ||
+    evidence?.id !== intent.evidenceId ||
+    !evidence.quote?.trim() ||
+    (intent.meetingId && evidence.meetingId !== intent.meetingId)
+  ) {
+    throw new Error("缺少本会议的可追溯证据原文，请补齐证据后再确认");
+  }
+}
+
+export function prepareIntentConfirmation(
+  intent: IntentObservation,
+  evidence: Evidence | undefined,
+  review: IntentConfirmationReview,
+): string | undefined {
+  assertIntentConfirmationEvidence(intent, evidence);
+  if (review.mode === "batch") {
+    if (intentConfirmationRisks(intent).length) {
+      throw new Error("低置信度或存在冲突的结果需点击行内“确认”，逐条人工复核");
+    }
+    return undefined;
+  }
+  const note = cleanRequired(review.note, "复核理由");
+  if (note.length > 2000) {
+    throw new Error("复核理由不能超过2000个字符");
+  }
+  return note;
 }
 
 const cleanOptional = (value?: string) => value?.trim() || undefined;

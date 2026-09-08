@@ -79,11 +79,11 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-local.ps1
 ## 第三步：启动与停止
 
 ```text
-启动意向宝.bat    一键启动（自动拉起 ASR 语音服务 8099、后端 8000、前端 3000）
+启动意向宝.bat    一键启动（自动拉起 ASR 语音服务 8099、后端 8000、前端 5173）
 停止意向宝.bat    一键停止
 ```
 
-启动后浏览器打开 http://localhost:3000，后端接口文档在 http://127.0.0.1:8000/docs。也可手动执行 scripts/start-local.ps1 / scripts/stop-local.ps1。
+启动后浏览器打开 http://localhost:5173，后端接口文档在 http://127.0.0.1:8000/docs。也可手动执行 scripts/start-local.ps1 / scripts/stop-local.ps1。前端默认 5173 而非 3000：本机 Windows 的 winnat 端口排除范围（2912-3011）覆盖 3000，监听会被拒绝（EACCES）；其他机器如需改回 3000，可去掉 bat 中的 `-FrontendPort 5173` 参数，先用 `netsh interface ipv4 show excludedportrange protocol=tcp` 确认 3000 未被保留。
 
 ### 首次登录
 
@@ -97,11 +97,28 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-local.ps1
 2. 资料上传：新建会议资料包，上传录音/录屏/PDF/纪要；无 PDF 时填写例外原因；
 3. 启动分析：立即返回列表，任务后台执行，列表实时显示 8 阶段进度，完成后自动提示；
 4. 身份校验：对自动分离出的 Speaker A/B/C 逐个人工标注姓名、角色、组织、职能；
-5. 意向确认：逐条核对 AI 草稿的原文、证据、五档态度与采用阶段，确认后形成正式职能状态；
+5. 意向确认：行内“确认”展示原文、风险、态度与采用阶段，填写复核理由后形成正式职能状态；低置信度（低于 75%）或存在冲突的结果必须逐条复核，不能批量确认。身份未确认、证据缺失或态度未知时仍需先补齐；
 6. 看板与导出：客情总览/技术/客户视角查看正式状态；资料包详情可导出 CSV/Excel/Markdown；
-7. 模型评测（可选）：用金标准对比 AI 原始输出，查看结构化准确率、证据可追溯率、未知误判率。
+7. 模型评测（可选）：默认评测最近成功的分析批次，使用不可变 AI 快照比较金标准；报告包含实际批次、漏检数和未知样本漏检数。未知误判率以全部未知金标准样本为分母，漏检不算正确，也不计作明确态度误判。已人工修改但缺少完整原始快照的旧记录需重新分析后评测，不能用当前人工结论补作 AI 原值。API `POST /api/eval/runs` 可传 `analysis_run_id` 指定本资料包的成功批次。
 
 演示素材在 samples/：three_speakers.wav（三说话人录音，体验分离）、test_audio_tangpoems.mp3（单人唐诗朗诵）、test_screen_recording.mp4（含语音的演示录屏）、test_real_chinese_doc.pdf（中文样例 PDF）。
+
+启用真实 ASR 后，同包全部录音和录屏音轨会逐文件转写，保留各自的来源与时间轴；
+不同文件、不同分析批次中的同名说话人标签不会自动合并，需人工核对身份。所有录屏分别抽帧，
+图片按分析批次和材料隔离保存。分段切片或转写失败最多尝试两次，仍失败时任务会
+标记“处理失败”，记录材料及失败时间段，并阻止本次分析发布意向。修复服务或材料后
+通过资料包重试全量分析；不会把缺片结果标成 100% 完成。
+
+录屏关键帧保存与播放器时间轴一致的真实帧时间，旧产物的空时间戳需重新分析后补齐。
+服务重启后，总分析和未完成阶段会一起转为失败，保留已完成阶段与中断原因；通过资料包重试。
+人工拆分说话人后，新身份可继续校验；仅将原文和时间证据明确属于所选片段的意向迁移过去，
+职能重新确认。来源跨批次且无法确定、或旧说话人可能混入失败分析片段时，拆分会明确拒绝。
+
+意向编辑支持亮点规格新增、修改与清空。模型设置的“清除密钥”使用独立管理员接口
+`DELETE /api/model-settings/api-key`，只清除当前后端进程中的密钥，不应用表单草稿；
+环境变量提供的密钥仍会在后端重启时重新加载。注销请求失败也会清除本地身份并返回登录页。
+CSV 导出对可能被表格软件解释为公式的文本添加文本前缀，XLSX 将字符串明确写为文本单元格；
+原始证据保留在数据库中，导出不会执行证据中的公式。
 
 ## 测试
 
@@ -111,7 +128,19 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-local.ps1
 
 # 前端（在项目根目录，需 Node）
 node --test tests/*.test.mjs
+
+# 类型检查（在项目根目录，同时检查本地前端和 Cloudflare 模板）
+pnpm run typecheck
+# 也可分别运行 pnpm run typecheck:local / pnpm run typecheck:cloudflare
 ```
+
+本地前端使用 `tsconfig.json`，Cloudflare 模板使用 `tsconfig.cloudflare.json`，后者覆盖
+`worker/`、`db/` 和 `examples/d1/`。两套检查隔离浏览器与 Workers 的全局类型。
+`worker/worker-configuration.d.ts` 由现有 Wrangler 生成并纳入源码管理，不要手工编辑；
+调整 `wrangler.types.jsonc` 中的绑定、兼容日期/标志或升级 Wrangler 后，运行
+`pnpm run types:cloudflare` 更新声明，再运行 `pnpm run typecheck`。Cloudflare 检查会先验证声明是否过期。
+`wrangler.types.jsonc` 仅用于生成 DB、ASSETS、IMAGES 的类型，无需 Cloudflare 账号或真实资源，
+不作为部署配置；实际部署仍由 Sites/Vite 提供绑定，届时需核对绑定及兼容设置与类型配置一致。
 
 ## 上传代码仓库时的大文件说明
 

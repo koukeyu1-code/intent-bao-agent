@@ -3,12 +3,15 @@ import test from "node:test";
 
 import {
   assertIntentReadyForSave,
+  intentConfirmationRisks,
   pendingUploadIds,
+  prepareIntentConfirmation,
   preparePlatformDraftForSave,
   prepareSpeakerIdentity,
   resolveRequestedItems,
   summarizeSettledWrites,
 } from "../app/workflow-guards.ts";
+import { buildIntentConfirmPayload } from "../app/intent-view-models.ts";
 
 const taxonomy = {
   technologies: [
@@ -155,5 +158,79 @@ test("meeting retry skips materials already uploaded to the created package", ()
       { audio: "已上传", pdf: "失败", minutes: "待上传" },
     ),
     ["pdf", "minutes"],
+  );
+});
+
+const confirmableIntent = {
+  id: "intent-reviewed",
+  version: 2,
+  meetingId: "meeting-1",
+  adoptionStage: "内部评估",
+  attitude: 4,
+  identityConfirmed: true,
+  confidence: 0.92,
+  conflict: false,
+  evidenceId: "evidence-1",
+  decisionImpact: "评估",
+  blocker: "暂无明确卡点",
+};
+const confirmationEvidence = {
+  id: "evidence-1",
+  meetingId: "meeting-1",
+  quote: "我们先安排内部评估，再讨论是否进入样品验证。",
+  timecode: "01:05–01:15",
+};
+
+test("low confidence and conflict stay blocked in batch, including a single selected record", () => {
+  assert.equal(
+    prepareIntentConfirmation(confirmableIntent, confirmationEvidence, { mode: "batch" }),
+    undefined,
+  );
+  for (const risk of [
+    { confidence: 0.74 },
+    { conflict: true },
+    { confidence: 0.3, conflict: true },
+  ]) {
+    const intent = { ...confirmableIntent, ...risk };
+    assert.ok(intentConfirmationRisks(intent).length);
+    assert.throws(
+      () => prepareIntentConfirmation(intent, confirmationEvidence, { mode: "batch" }),
+      /逐条人工复核/,
+    );
+    const reviewedNote = prepareIntentConfirmation(intent, confirmationEvidence, {
+      mode: "manual",
+      note: "  已核对原文，仅确认内部评估；历史的样品验证结论不适用于本项目。  ",
+    });
+    const payload = buildIntentConfirmPayload(intent, "confirm", reviewedNote);
+    assert.equal(payload.note, "已核对原文，仅确认内部评估；历史的样品验证结论不适用于本项目。");
+    assert.equal(payload.version, 2);
+    assert.equal(payload.attitude_level, 4);
+    assert.equal(payload.adoption_stage, "内部评估");
+  }
+});
+
+test("manual review requires a meaningful reason and never bypasses identity, evidence or unknown attitude gates", () => {
+  const risky = { ...confirmableIntent, confidence: 0.4, conflict: true };
+  for (const note of ["", " \n\t ", "原".repeat(2001)]) {
+    assert.throws(
+      () => prepareIntentConfirmation(risky, confirmationEvidence, { mode: "manual", note }),
+      /复核理由/,
+    );
+  }
+  for (const review of [{ mode: "batch" }, { mode: "manual", note: "已仔细核对原文" }]) {
+    for (const [intent, evidence, message] of [
+      [{ ...confirmableIntent, identityConfirmed: false }, confirmationEvidence, /说话人身份/],
+      [{ ...confirmableIntent, attitude: null }, confirmationEvidence, /态度未知/],
+      [{ ...confirmableIntent, evidenceId: "" }, confirmationEvidence, /可追溯证据/],
+      [confirmableIntent, undefined, /可追溯证据/],
+      [confirmableIntent, { ...confirmationEvidence, quote: " " }, /可追溯证据/],
+      [confirmableIntent, { ...confirmationEvidence, meetingId: "another-meeting" }, /可追溯证据/],
+    ]) {
+      assert.throws(() => prepareIntentConfirmation(intent, evidence, review), message);
+    }
+  }
+  assert.equal(
+    buildIntentConfirmPayload(confirmableIntent, "unknown", "不能变成确认理由").note,
+    "当前证据不足，保留未知；不改写采用阶段",
   );
 });

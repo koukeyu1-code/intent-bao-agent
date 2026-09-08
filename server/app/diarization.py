@@ -6,7 +6,7 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -16,7 +16,13 @@ logger = logging.getLogger(__name__)
 
 _VAD_MODEL_ID = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 _SPEAKER_MODEL_ID = "iic/speech_campplus_sv_zh-cn_16k-common"
-_CLUSTER_THRESHOLD = 0.45
+# Calibrated 2026-08-27 on a real 100-min meeting recording: cosine-average
+# linkage at 0.45 shattered a single dominant voice into 54 clusters per
+# 10 minutes; 0.75 yields one dominant speaker plus noise fragments.
+_CLUSTER_THRESHOLD = 0.75
+# Adjacent turns from the same speaker shorter than this gap are merged into
+# one turn so VAD breathing pauses do not explode the segment count.
+_MERGE_GAP_MS = 2_000
 _MIN_SPEECH_MS = 300
 
 
@@ -29,6 +35,10 @@ class SpeakerTurn:
 
 class DiarizationUnavailable(RuntimeError):
     """Raised when the local diarization stack (funasr + torch) is missing."""
+
+
+class DiarizationCancelled(Exception):
+    """The caller requested cancellation between speaker embeddings."""
 
 
 def _resolve_models_dir(settings: Settings) -> Path:
@@ -166,8 +176,16 @@ class FunAsrDiarizer:
         audio_path: Path,
         *,
         duration_ms: int | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> list[SpeakerTurn]:
-        """Return speech turns grouped by speaker (``Speaker A/B/C``)."""
+        """Return speech turns grouped by speaker (``Speaker A/B/C``).
+
+        ``should_cancel`` is polled before each turn embedding so a
+        cooperative cancellation requested mid-audio takes effect within one
+        turn instead of after the whole file.  ``on_progress(processed,
+        total)`` reports embedding progress for UI feedback.
+        """
         self._ensure_loaded()
         if self._vad is None or self._speaker_model is None:
             raise DiarizationUnavailable("说话人分离模型未加载")
@@ -175,10 +193,16 @@ class FunAsrDiarizer:
         segments = self._speech_segments(audio_path)
         if len(segments) < 1:
             return []
-        embeddings = [
-            self._embedding_for_turn(audio, sr, start_ms, end_ms)
-            for start_ms, end_ms in segments
-        ]
+        total = len(segments)
+        embeddings = []
+        for index, (start_ms, end_ms) in enumerate(segments):
+            if should_cancel is not None and should_cancel():
+                raise DiarizationCancelled
+            embeddings.append(
+                self._embedding_for_turn(audio, sr, start_ms, end_ms)
+            )
+            if on_progress is not None:
+                on_progress(index + 1, total)
         if len(segments) == 1:
             labels = [0]
         else:
@@ -199,16 +223,36 @@ class FunAsrDiarizer:
             if label not in first_seen:
                 first_seen[label] = len(ordered)
                 ordered.append(label)
-        turns: list[SpeakerTurn] = []
+
+        def _label_name(ordinal: int) -> str:
+            # Beyond 26 clusters fall back to numeric names; ``chr`` would
+            # emit punctuation for ordinals past 'Z'.
+            if ordinal < 26:
+                return f"Speaker {chr(65 + ordinal)}"
+            return f"Speaker {ordinal + 1}"
+
+        # Merge adjacent same-speaker turns separated by short pauses so the
+        # transcription loop runs on speaker turns, not raw VAD fragments.
+        merged: list[SpeakerTurn] = []
         for (start_ms, end_ms), label in zip(segments, labels):
-            turns.append(
-                SpeakerTurn(
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    speaker_label=f"Speaker {chr(65 + first_seen[label])}",
+            display = _label_name(first_seen[label])
+            if (
+                merged
+                and merged[-1].speaker_label == display
+                and start_ms - merged[-1].end_ms <= _MERGE_GAP_MS
+            ):
+                merged[-1] = SpeakerTurn(
+                    start_ms=merged[-1].start_ms,
+                    end_ms=max(merged[-1].end_ms, end_ms),
+                    speaker_label=display,
                 )
-            )
-        return sorted(turns, key=lambda item: item.start_ms)
+            else:
+                merged.append(
+                    SpeakerTurn(
+                        start_ms=start_ms, end_ms=end_ms, speaker_label=display
+                    )
+                )
+        return sorted(merged, key=lambda item: item.start_ms)
 
 
 _diarizer_singleton: FunAsrDiarizer | None = None

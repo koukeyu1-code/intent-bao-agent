@@ -21,6 +21,7 @@ import {
   MenuUnfoldOutlined,
   MergeOutlined,
   PlayCircleOutlined,
+  StopOutlined,
   PlusOutlined,
   RadarChartOutlined,
   SafetyCertificateOutlined,
@@ -74,6 +75,7 @@ import {
   API_BASE,
   ApiClientError,
   analyzeMeetingPackage,
+  cancelMeetingPackageAnalysis,
   confirmSpeakerIdentity,
   commitTaxonomyImport,
   createMeetingPackage,
@@ -116,8 +118,11 @@ import {
 } from "./platform-taxonomy";
 import { canAccessView, resolveAuthorizedView } from "./view-permissions";
 import {
+  assertIntentConfirmationEvidence,
   assertIntentReadyForSave,
+  intentConfirmationRisks,
   pendingUploadIds,
+  prepareIntentConfirmation,
   preparePlatformDraftForSave,
   prepareSpeakerIdentity,
   resolveRequestedItems,
@@ -1047,6 +1052,7 @@ function MeetingsPage({
   const [submitting, setSubmitting] = useState(false);
   const [submitStage, setSubmitStage] = useState("");
   const [analysisBusyId, setAnalysisBusyId] = useState<string>();
+  const [stopBusyId, setStopBusyId] = useState<string>();
   const [supplementBusyId, setSupplementBusyId] = useState<string>();
   const [form] = Form.useForm();
   const watchingRef = useRef<Set<string>>(new Set());
@@ -1345,7 +1351,12 @@ function MeetingsPage({
       const result = await analyzeMeetingPackage(meetingId, true);
       setDetail(undefined);
       await reloadDataset();
-      message.success("分析任务已进入后台队列，完成后会自动提示", 4);
+      message.success(
+        result.cancelled_runs
+          ? `已停止 ${result.cancelled_runs} 个进行中的分析任务，新分析已进入后台队列`
+          : "分析任务已进入后台队列，完成后会自动提示",
+        4,
+      );
       void watchAnalysis(meetingId, result.analysis_run.id);
     } catch (error) {
       const reason =
@@ -1353,6 +1364,26 @@ function MeetingsPage({
       message.error(`分析任务启动失败：${reason}`);
     } finally {
       setAnalysisBusyId(undefined);
+    }
+  };
+
+  const stopAnalysis = async (meetingId: string) => {
+    setStopBusyId(meetingId);
+    try {
+      const result = await cancelMeetingPackageAnalysis(meetingId);
+      const refreshed = await reloadDataset();
+      setDetail(refreshed.meetings.find((item) => item.id === meetingId));
+      if (result.cancelled_runs) {
+        message.success("已请求停止分析任务，正在运行的阶段将在数秒内退出", 4);
+      } else {
+        message.info("当前没有排队或运行中的分析任务");
+      }
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "本地API暂不可用";
+      message.error(`停止分析失败：${reason}`);
+    } finally {
+      setStopBusyId(undefined);
     }
   };
 
@@ -1698,6 +1729,16 @@ function MeetingsPage({
               >
                 启动／重跑AI分析
               </Button>
+              {detail.status === "分析中" ? (
+                <Button
+                  danger
+                  icon={<StopOutlined />}
+                  loading={stopBusyId === detail.id}
+                  onClick={() => void stopAnalysis(detail.id)}
+                >
+                  停止分析
+                </Button>
+              ) : null}
               <div className="detail-export-row">
                 <span>结果导出</span>
                 <Space wrap>
@@ -2350,7 +2391,7 @@ function EvaluationPage({
             disabled={!meetingObservations.length}
             onClick={fillFromAiDraft}
           >
-            从当前AI草稿生成模板
+            从当前意向生成待标注模板
           </Button>
           <Input.TextArea
             value={goldenText}
@@ -2376,7 +2417,13 @@ function EvaluationPage({
         <Card className="content-card" title="评测结果">
           {report ? (
             <>
+              <Paragraph type="secondary">
+                默认评测最近成功的分析批次；模板需独立核对后作为金标准。
+              </Paragraph>
               <Descriptions column={2} size="small" bordered>
+                <Descriptions.Item label="分析批次" span={2}>
+                  {report.analysis_run_id ?? "历史无批次记录"}
+                </Descriptions.Item>
                 <Descriptions.Item label="金标准总数">
                   {report.total}
                 </Descriptions.Item>
@@ -2391,6 +2438,12 @@ function EvaluationPage({
                 </Descriptions.Item>
                 <Descriptions.Item label="未知样本数">
                   {report.unknown_total}
+                </Descriptions.Item>
+                <Descriptions.Item label="漏检样本数">
+                  {report.missed}
+                </Descriptions.Item>
+                <Descriptions.Item label="未知样本漏检数">
+                  {report.unknown_missed}
                 </Descriptions.Item>
                 <Descriptions.Item label="未知误判率">
                   {rate(report.unknown_misjudge_rate)}
@@ -2457,6 +2510,10 @@ function InsightsPage({
   const [activeWriteAction, setActiveWriteAction] = useState<
     "confirm" | "return" | "unknown"
   >();
+  const writeInFlight = useRef(false);
+  const [reviewing, setReviewing] = useState<IntentObservation>();
+  const [reviewNote, setReviewNote] = useState("");
+  const [reviewError, setReviewError] = useState("");
   const [platformDraft, setPlatformDraft] = useState<
     PlatformCascadeSelection & {
       level2NewValue?: string;
@@ -2487,6 +2544,10 @@ function InsightsPage({
   }, [platformDraft, taxonomy]);
   const meetingByEvidence = useMemo(
     () => new Map(evidence.map((item) => [item.id, item.meetingId])),
+    [evidence],
+  );
+  const evidenceById = useMemo(
+    () => new Map(evidence.map((item) => [item.id, item])),
     [evidence],
   );
   const scopedIntents = useMemo(
@@ -2527,37 +2588,58 @@ function InsightsPage({
     async (
       ids: string[],
       action: "confirm" | "return" | "unknown",
+      manualReview?: { version: number; note: string },
     ) => {
-      if (activeWriteAction) return;
+      if (writeInFlight.current) return;
       const { targets, missingIds } = resolveRequestedItems(scopedIntents, ids);
       if (!targets.length) {
         setSelectedRowKeys([]);
         message.warning("所选意向已不在当前资料包中，请重新选择");
         return;
       }
+      let preparedNote: string | undefined;
       if (action === "confirm") {
-        const blocked = targets.filter(
-          (item) =>
-            item.conflict ||
-            item.confidence < 0.75 ||
-            !item.identityConfirmed ||
-            item.attitude === null,
-        );
-        if (blocked.length) {
-          message.error(
-            `${blocked.length} 条结果存在身份、冲突、未知或低置信度风险，需逐条处理`,
-          );
+        try {
+          if (
+            manualReview &&
+            (targets.length !== 1 || targets[0].version !== manualReview.version)
+          ) {
+            throw new Error("意向内容已更新，请关闭复核窗口后重新核对");
+          }
+          for (const item of targets) {
+            preparedNote = prepareIntentConfirmation(
+              item,
+              evidenceById.get(item.evidenceId),
+              manualReview
+                ? { mode: "manual", note: manualReview.note }
+                : { mode: "batch" },
+            );
+          }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : "意向确认校验失败";
+          if (manualReview) setReviewError(reason);
+          else message.error(reason);
           return;
         }
       }
 
+      writeInFlight.current = true;
       setActiveWriteAction(action);
       try {
         const persistenceResults = await Promise.allSettled(
-          targets.map((item) => updateIntentStatus(item, action)),
+          targets.map((item) => updateIntentStatus(item, action, preparedNote)),
         );
         const { failedCount: failedWrites, successCount } =
           summarizeSettledWrites(persistenceResults);
+        if (manualReview && successCount) setReviewing(undefined);
+        if (manualReview && failedWrites) {
+          const failed = persistenceResults.find((result) => result.status === "rejected");
+          setReviewError(
+            failed?.status === "rejected" && failed.reason instanceof Error
+              ? failed.reason.message
+              : "确认未写入，请核对最新数据后重试",
+          );
+        }
         await reloadDataset();
         setSelectedRowKeys([]);
         const actionMessage =
@@ -2584,11 +2666,24 @@ function InsightsPage({
           error instanceof Error ? error.message : "本地API暂不可用";
         message.error(`操作后刷新失败：${reason}。请重新加载页面核对`);
       } finally {
+        writeInFlight.current = false;
         setActiveWriteAction(undefined);
       }
     },
-    [activeWriteAction, reloadDataset, scopedIntents],
+    [evidenceById, reloadDataset, scopedIntents],
   );
+
+  const openConfirmationReview = (item: IntentObservation) => {
+    if (writeInFlight.current) return;
+    try {
+      assertIntentConfirmationEvidence(item, evidenceById.get(item.evidenceId));
+      setReviewNote("");
+      setReviewError("");
+      setReviewing(item);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "意向确认校验失败");
+    }
+  };
 
   const saveEditing = async () => {
     if (!editing) return;
@@ -2774,7 +2869,7 @@ function InsightsPage({
             size="small"
             className="intent-row-actions__confirm"
             disabled={item.status === "已确认" || Boolean(activeWriteAction)}
-            onClick={() => void applyAction([item.id], "confirm")}
+            onClick={() => openConfirmationReview(item)}
           >
             确认
           </Button>
@@ -2889,6 +2984,73 @@ function InsightsPage({
         <strong>采用阶段独立记录</strong>
         <span>态度回答“谁支持”，阶段回答“推进到哪一步”</span>
       </div>
+
+      <Modal
+        open={Boolean(reviewing)}
+        title="逐条人工复核"
+        okText="确认并写入"
+        cancelText="取消"
+        confirmLoading={activeWriteAction === "confirm"}
+        okButtonProps={{ disabled: !reviewNote.trim() || Boolean(activeWriteAction) }}
+        cancelButtonProps={{ disabled: Boolean(activeWriteAction) }}
+        closable={!activeWriteAction}
+        maskClosable={!activeWriteAction}
+        keyboard={!activeWriteAction}
+        onCancel={() => {
+          if (!writeInFlight.current) setReviewing(undefined);
+        }}
+        onOk={() => {
+          if (reviewing) {
+            void applyAction([reviewing.id], "confirm", {
+              version: reviewing.version,
+              note: reviewNote,
+            });
+          }
+        }}
+      >
+        {reviewing ? (
+          <div className="edit-intent-form">
+            <strong>{reviewing.customer} · {reviewing.technology} · {reviewing.platform}</strong>
+            {intentConfirmationRisks(reviewing).length ? (
+              <div role="note">
+                {intentConfirmationRisks(reviewing).map((risk) => (
+                  <Tag color="warning" key={risk}>{risk}</Tag>
+                ))}
+                <p>请结合原文核对当前结论，并说明接受本次结论的理由。</p>
+              </div>
+            ) : null}
+            <Descriptions size="small" column={1}>
+              <Descriptions.Item label="职能／人员">
+                {reviewing.functionName} · {reviewing.person}
+              </Descriptions.Item>
+              <Descriptions.Item label="当前态度">
+                <AttitudeBadge value={reviewing.attitude} compact />
+              </Descriptions.Item>
+              <Descriptions.Item label="采用阶段">{reviewing.adoptionStage}</Descriptions.Item>
+              <Descriptions.Item label="证据原文">
+                {evidenceById.get(reviewing.evidenceId)?.quote}
+              </Descriptions.Item>
+            </Descriptions>
+            <Button onClick={() => onEvidence(reviewing.evidenceId)}>查看完整证据</Button>
+            <label>
+              复核理由
+              <Input.TextArea
+                aria-label="复核理由"
+                value={reviewNote}
+                onChange={(event) => {
+                  setReviewNote(event.target.value);
+                  setReviewError("");
+                }}
+                placeholder="请说明依据原文确认当前态度、采用阶段及处理冲突的理由"
+                maxLength={2000}
+                rows={3}
+                disabled={Boolean(activeWriteAction)}
+              />
+            </label>
+            {reviewError ? <p role="alert">{reviewError}</p> : null}
+          </div>
+        ) : null}
+      </Modal>
 
       <Modal
         open={Boolean(editing)}

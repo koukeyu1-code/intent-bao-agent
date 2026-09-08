@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -28,10 +29,20 @@ class SubtitleSegment:
 
 
 _WINGET_PACKAGES = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
+# Repo-root bundled tools (e.g. models/ffmpeg/bin) so deployments without a
+# system-wide install or winget still resolve media binaries.
+_PROJECT_TOOL_DIRS = (
+    str(Path(__file__).resolve().parents[2] / "models" / "ffmpeg" / "bin"),
+)
 _COMMON_EXTRA_DIRS = (
     "C:/Program Files/Tesseract-OCR",
     "C:/Program Files/FFmpeg/bin",
-)
+) + _PROJECT_TOOL_DIRS
+
+
+def _resolve_media_executable(names: tuple[str, ...]) -> str | None:
+    """ffmpeg/ffprobe lookup: PATH, common dirs, bundled repo dir, WinGet."""
+    return _resolve_executable(names, _COMMON_EXTRA_DIRS)
 
 
 @functools.lru_cache(maxsize=32)
@@ -59,11 +70,11 @@ def _resolve_executable(
 
 
 def ffprobe_available() -> bool:
-    return _resolve_executable(("ffprobe",)) is not None
+    return _resolve_media_executable(("ffprobe",)) is not None
 
 
 def ffmpeg_available() -> bool:
-    return _resolve_executable(("ffmpeg",)) is not None
+    return _resolve_media_executable(("ffmpeg",)) is not None
 
 
 def tesseract_available() -> bool:
@@ -94,7 +105,7 @@ def ocr_image(path: Path, *, lang: str = "chi_sim+eng") -> str | None:
 def probe_media_duration(path: Path) -> int | None:
     """Return duration in milliseconds using ffprobe, or None if unavailable."""
 
-    ffprobe = _resolve_executable(("ffprobe",))
+    ffprobe = _resolve_media_executable(("ffprobe",))
     if ffprobe is None:
         return None
     try:
@@ -250,7 +261,7 @@ def extract_audio_track(
 ) -> bool:
     """Extract 16kHz mono WAV audio from a media file via FFmpeg."""
 
-    ffmpeg = _resolve_executable(("ffmpeg",))
+    ffmpeg = _resolve_media_executable(("ffmpeg",))
     if ffmpeg is None:
         return False
     try:
@@ -286,7 +297,7 @@ def slice_audio_segment(
     target: Path,
 ) -> bool:
     """Slice [start_ms, end_ms) from an audio file into a 16 kHz mono WAV."""
-    ffmpeg = _resolve_executable(("ffmpeg",))
+    ffmpeg = _resolve_media_executable(("ffmpeg",))
     if ffmpeg is None:
         return False
     duration_ms = max(0, end_ms - start_ms)
@@ -325,12 +336,12 @@ def extract_key_frames(
     max_frames: int = 20,
     scene_threshold: float = 0.4,
 ) -> list[dict[str, Any]]:
-    """Extract scene-change key frames with FFmpeg.
+    """Extract scene-change frames with their original playback timestamps.
 
-    Returns frame descriptors; returns an empty list when FFmpeg is missing.
+    Returns an empty list if extraction or the frame/timestamp mapping fails.
     """
 
-    ffmpeg = _resolve_executable(("ffmpeg",))
+    ffmpeg = _resolve_media_executable(("ffmpeg",))
     if ffmpeg is None or max_frames <= 0:
         return []
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -345,20 +356,35 @@ def extract_key_frames(
             [
                 ffmpeg,
                 "-y",
+                "-hide_banner",
+                "-loglevel",
+                "info",
+                "-nostats",
+                # Preserve the source timeline, shifting only the container's
+                # start offset to match player.currentTime for this file.
+                "-copyts",
+                "-start_at_zero",
                 "-i",
                 str(source),
+                "-map",
+                "0:v:0",
                 "-vf",
                 (
-                    f"select='gt(scene,{scene_threshold})',"
-                    # select keeps the source PTS of passed frames; without a
-                    # CFR re-stamp the image2 muxer and -frames:v miscount the
-                    # output and can write repeated frames from the start of
-                    # the clip.  Re-stamp passed frames to a clean timeline.
-                    "setpts=N/(25*TB),"
-                    f"scale=960:-2"
+                    # Keep the opening frame even for a static screen share.
+                    f"select='eq(n,0)+gt(scene,{scene_threshold})',"
+                    # Limit before showinfo so buffered, unencoded frames
+                    # cannot produce extra timestamp records.
+                    f"trim=end_frame={max_frames},"
+                    "showinfo=checksum=0,scale=960:-2"
                 ),
+                # One selected frame must produce exactly one numbered JPG;
+                # CFR would duplicate/drop frames across gaps between scenes.
+                "-fps_mode",
+                "passthrough",
                 "-frames:v",
                 str(max_frames),
+                "-start_number",
+                "1",
                 "-q:v",
                 "3",
                 pattern,
@@ -372,12 +398,14 @@ def extract_key_frames(
         return []
     if result.returncode != 0:
         return []
+    frame_times = _selected_frame_times(result.stderr)
+    images = sorted(target_dir.glob("frame-*.jpg"))
+    if frame_times is None or len(frame_times) != len(images):
+        return []
     frames: list[dict[str, Any]] = []
-    for image in sorted(target_dir.glob("frame-*.jpg")):
-        try:
-            time_ms = _probe_frame_time(source, image)
-        except (OSError, subprocess.SubprocessError):
-            time_ms = None
+    for index, (image, time_ms) in enumerate(zip(images, frame_times), start=1):
+        if image.name != f"frame-{index:03d}.jpg":
+            return []
         frames.append(
             {
                 "path": image,
@@ -388,28 +416,36 @@ def extract_key_frames(
     return frames
 
 
-def _probe_frame_time(source: Path, image: Path) -> int | None:
-    """Estimate the source timestamp of an extracted frame."""
+_SHOWINFO_TIME_BASE_RE = re.compile(r"config in time_base:\s*(\d+)/(\d+)")
+_SHOWINFO_FRAME_RE = re.compile(r"\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:")
 
-    if not ffprobe_available():
-        return None
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(image),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    return None
+
+def _selected_frame_times(log: str) -> list[int] | None:
+    """Read the same filter's PTS, never infer source time from JPG metadata.
+
+    Integer PTS and the rational time base retain millisecond precision even
+    for long recordings where showinfo's decimal pts_time is rounded.
+    """
+
+    time_base: Fraction | None = None
+    times: list[int] = []
+    for line in log.splitlines():
+        if "showinfo" not in line:
+            continue
+        config = _SHOWINFO_TIME_BASE_RE.search(line)
+        if config:
+            numerator, denominator = map(int, config.groups())
+            if numerator <= 0 or denominator <= 0:
+                return None
+            time_base = Fraction(numerator, denominator)
+            continue
+        frame = _SHOWINFO_FRAME_RE.search(line)
+        if frame:
+            index, pts = map(int, frame.groups())
+            if time_base is None or index != len(times):
+                return None
+            times.append(round(pts * time_base * 1000))
+    return times if time_base is not None else None
 
 
 def _file_sha256(path: Path) -> str:

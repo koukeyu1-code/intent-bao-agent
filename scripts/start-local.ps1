@@ -10,6 +10,12 @@
 
 $ErrorActionPreference = "Stop"
 
+Write-Host ""
+Write-Host "[意向宝] 正在启动本地服务。" -ForegroundColor Cyan
+Write-Host "[意向宝] 首次启动需要编译前端，通常约 1-2 分钟，请保持本窗口开启。"
+Write-Host "[意向宝] 页面准备完成后会自动打开浏览器。"
+Write-Host ""
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $backendRoot = Join-Path $projectRoot "server"
 if ([string]::IsNullOrWhiteSpace($RuntimeDir)) {
