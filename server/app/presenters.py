@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from typing import Any
 
@@ -337,6 +338,11 @@ def public_task(item: m.ProcessingTask) -> dict[str, Any]:
         "error_message": item.error_message,
         "updated_at": iso(item.updated_at),
         "version": item.version,
+        "result": (
+            json.loads(item.result_json)
+            if isinstance(item.result_json, str) and item.result_json
+            else None
+        ),
     }
 
 

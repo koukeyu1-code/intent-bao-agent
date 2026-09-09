@@ -243,6 +243,41 @@ def test_diarizer_falls_back_when_models_cache_missing(tmp_path: Path) -> None:
     assert get_diarizer(settings) is None
 
 
+def test_split_model_materials_keeps_every_item_in_bounded_batches() -> None:
+    from app.services import (
+        _estimate_material_tokens,
+        _split_model_materials_for_analysis,
+    )
+
+    items = [
+        {
+            "id": f"t-{index}",
+            "type": "转写片段",
+            "name": "转写片段",
+            "content": (
+                "客户表示Mini LED可以做样机验证，需要先确认成本和交期。"
+                * 30
+            ),
+        }
+        for index in range(180)
+    ]
+    batches = _split_model_materials_for_analysis(items)
+    assert len(batches) >= 3
+    assert sum(len(batch) for batch in batches) == len(items)
+    token_budget = int(_llm_num_ctx_for_test() * 0.85) - 3000
+    for batch in batches:
+        assert _estimate_material_tokens(batch) <= token_budget + 1000
+
+
+def _llm_num_ctx_for_test() -> int:
+    import os
+
+    try:
+        return int(os.environ.get("INTENT_BAO_LLM_NUM_CTX") or 32768)
+    except (TypeError, ValueError):
+        return 32768
+
+
 def test_model_evidence_reuses_asr_speaker_and_keeps_source_coordinates(
     tmp_path: Path,
 ) -> None:

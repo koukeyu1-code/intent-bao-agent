@@ -2,73 +2,134 @@
 
 > 让客户声音照进产品规划
 
-意向宝把客户会议材料（录音、录屏、PDF、纪要）组织成可追溯、可确认的产品规划意向地图：AI 负责"听懂、看懂并建议"，业务负责人负责"确认结论"。全部模型在本地运行，企业真实敏感数据不出本机。
+意向宝把客户会议材料（录音、录屏、PDF、纪要）组织成可追溯、可确认的产品规划意向地图：AI 负责"听懂、看懂并建议"，业务负责人负责"确认结论"。全部模型默认在本机运行，企业真实敏感数据不出本机。
 
-## 架构与双模型分工
+> **给新电脑/新成员的最短路径**：先看 [新电脑运行指南.md](新电脑运行指南.md)，本文是完整说明。
 
-后端（FastAPI）按 8 个阶段编排分析任务：文件预检 → 文档解析 → 音轨与转写 → 说话人分离 → 画面与PDF解析 → 资料对齐 → 身份辅助匹配 → 意向抽取。分析任务异步执行：接口立即返回，后台单 Worker 串行处理，前端轮询进度。
+## 一、项目能做什么
 
-| 模型 | 位置 | 用途 |
-| --- | --- | --- |
-| Qwen3-ASR-1.7B（llama.cpp） | models/qwen3-asr/ + models/llama.cpp/ | 语音转写 |
-| FunASR（fsmn-vad + cam++） | models/funasr/ | 说话人分离（谁说了什么） |
-| Qwen3.6-27B（Ollama） | 自行导入（见下） | 意向抽取、资料对齐、身份推荐 |
+上传一次会议的音频/录屏和 PPT/PDF 等材料后，系统在后台自动执行 8 个阶段：
 
-## 目录结构
+文件预检 → 文档解析 → 音轨与转写 → 说话人分离 → 画面与 PDF 解析 → 资料对齐 → 身份辅助匹配 → 意向抽取
+
+最终产出：带原文证据、说话人、五档态度、采用阶段的可确认意向记录，以及客户/技术视角看板与 CSV/Excel/Markdown 导出。
+
+## 二、模型构成（当前推荐配置）
+
+| 用途 | 模型 | 运行方式 | 文件大小 | 从哪来 |
+| --- | --- | --- | --- | --- |
+| 意向抽取 / 资料对齐 / 身份推荐 / PDF 理解 | Qwen3.5-9B（`qwen3.5:9b`） | Ollama | 下载约 6.6 GB | `ollama pull qwen3.5:9b`，仓库不含 |
+| 语音转写（主模型） | Qwen3-ASR-1.7B `Qwen3-ASR-1.7B.Q8_0.gguf` | llama.cpp server | 约 2.1 GB | Hugging Face 手动下载，仓库不含 |
+| 语音转写（多模态 mmproj） | `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf` | llama.cpp server | 约 340 MB | 随 `models` 模型包分发（GitHub Releases / 网盘） |
+| llama.cpp 运行库 | `llama-server.exe` + CUDA 运行库 | 本地进程 | 约 557 MB | 随 `models` 模型包分发（GitHub Releases / 网盘） |
+| 说话人分离（谁说了什么） | FunASR：fsmn-vad + cam++ | Python（FunASR） | 约 31 MB | 随 `models` 模型包分发；缺失时也可从 ModelScope 自动下载 |
+
+> **仓库分工**：GitHub 代码仓库只放代码，不含任何模型文件。本地运行所需的
+> llama.cpp / mmproj / FunASR（共约 900 MB）统一打成 `models-<版本>.zip`，
+> 通过 GitHub Releases 或网盘分发；`qwen3.5:9b` 与 2.1 GB 的 ASR 主模型
+> 仍需各自单独安装（见 5.2）。
+
+可选：Tesseract OCR（含简体中文 `chi_sim` 语言包），用于录屏关键帧文字识别；没有它视频画面 OCR 会跳过，不影响其他链路。
+
+> **为什么用 9B 而不是 27B**：9B（Q4）占用约 6.6 GB 显存，16 GB 显卡可完整放下，实测生成速度约 90+ token/s；27B 模型文件约 18 GB，16 GB 显存放不下会被挤到 CPU，速度大幅下降。意向抽取质量经真实长会议验证可满足使用。更早文档中的 `qwen3.6-27b` 方案已弃用，无需再导入。
+
+## 三、目录结构
 
 ```text
-app/                前端（React / Next.js）
-server/            后端（FastAPI + SQLite），依赖清单 server/requirements.txt
-models/             本地模型与运行库（随仓库分发，建议 Git LFS）
-  qwen3-asr/       Qwen3-ASR GGUF + mmproj
-  llama.cpp/       llama-server 运行时
-  funasr/          FunASR 说话人分离模型
-  ollama/          27B 大模型导入文件 Modelfile（GGUF 需自行下载）
-samples/           演示素材（唐诗朗诵、三人会议录音、演示录屏、样例 PDF）
-scripts/           启动/停止/安装/ASR 服务脚本
-runtime/           运行期目录（后端入口、日志、pid，自动生成）
-docs/              开发方案、开题报告、开发文档、验收清单
+app/                前端（React / Next.js + TypeScript）
+server/             后端（FastAPI + SQLite + SQLAlchemy），依赖 server/requirements.txt
+models/             本地模型与运行库（仓库只保留说明文件，模型本体随发布包分发）
+  qwen3-asr/        Qwen3-ASR：放置说明 + 主 GGUF / mmproj（模型包外部分发）
+  llama.cpp/        llama-server 运行时与 CUDA 库（模型包外部分发）
+  funasr/           FunASR 说话人分离模型（模型包外部分发）
+  ollama/           旧 27B Modelfile（已弃用）
+samples/            演示素材
+scripts/            安装/启动/停止/ASR 服务脚本
+runtime/            运行期目录（日志、pid，自动生成，Git 忽略）
+docs/               开发方案、开发文档、测试报告、开题报告
 ```
 
-## 环境要求
+## 四、环境要求
 
 - Windows 10/11（脚本为 PowerShell）
-- Python 3.11+（安装时勾选 Add to PATH）
-- Node.js 22+ 与 pnpm（npm install -g pnpm）
-- 推荐 NVIDIA 显卡（CUDA）；无显卡也能跑，只是慢
-- 硬盘剩余空间：约 8GB（依赖 + 内置模型）；若再导入 27B 大模型需额外约 20GB
+- Python 3.11+（建议 3.12，安装时勾选 **Add to PATH**）
+- Node.js 22.13+ 与 pnpm（`npm install -g pnpm`）
+- FFmpeg / FFprobe（安装脚本可自动用 winget 安装）
+- Ollama（[https://ollama.com/download](https://ollama.com/download)）
+- Git（用于克隆代码仓库）
+- NVIDIA 显卡建议 8 GB 显存以上，16 GB 体验最佳；无显卡可运行但速度慢
+- 硬盘剩余空间建议 ≥ 20 GB（依赖 + 全套模型）
 
-## 第一步：准备模型
+## 五、从零跑通（新电脑）
 
-### 内置模型（随仓库分发）
+### 5.1 获取代码与模型运行包
 
-models/qwen3-asr/、models/llama.cpp/、models/funasr/ 已包含运行所需文件。注意这些文件较大（GGUF 2GB、CUDA 运行库 512MB 等），从代码仓库获取时请启用 **Git LFS**（仓库已配置 .gitattributes），或从网盘/内网下载后按目录结构放回。
-
-### 27B 意向抽取大模型（需自行下载，不在仓库内）
-
-该模型原始 GGUF 约 17GB，不适合直接进代码仓库，请单独分发：
-
-1. 下载 Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-Q4_K_M.gguf（Q4_K_M 量化版）；
-2. 放入 models/ollama/ 目录；
-3. 在该目录执行：
+代码仓库不包含模型文件，先克隆代码：
 
 ```powershell
-ollama create qwen3.6-27b -f Modelfile-qwen3.6-27b
+git clone https://github.com/koukeyu1-code/intent-bao-agent.git
+cd intent-bao-agent
 ```
 
-4. 启动项目后，在页面「模型设置」中选"本地 Ollama"，模型名填 qwen3.6-27b:latest 并保存。
+再从 **GitHub Releases（或维护者提供的网盘）** 下载 `models-<版本>.zip`
+（含 llama.cpp 运行库、Qwen3-ASR mmproj、FunASR 模型，共约 900 MB），
+解压到项目根目录，使目录结构形如：
 
-> 未导入 27B 模型也不影响体验：系统仍可用内置 ASR/说话人分离跑转写与分离；意向抽取会回退到模拟结果（明确标注）。
+```text
+models/
+  qwen3-asr/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf
+  llama.cpp/llama-server.exe
+  funasr/models/...
+```
 
-## 第二步：安装依赖（新电脑）
+检查关键文件存在且大小正常（不是几百字节的空文件）：
 
-双击 首次安装依赖.bat，脚本会自动：
+```powershell
+Get-Item models\llama.cpp\llama-server.exe | Select-Object Length
+Get-Item models\qwen3-asr\mmproj-Qwen3-ASR-1.7B-Q8_0.gguf | Select-Object Length
+```
 
-1. 创建后端 Python 虚拟环境 server/.venv；
-2. 安装 PyTorch（优先 CUDA 版，失败自动回退 CPU 版）与后端依赖（server/requirements.txt）；
+如果暂时没有模型包，代码仍可启动并体验"模拟分析"界面；真实语音转写需先补齐模型包。
+
+### 5.2 安装两个仓库外的模型
+
+**（1）意向抽取大模型（Ollama）**
+
+```powershell
+ollama pull qwen3.5:9b
+ollama list   # 应看到 qwen3.5:9b
+```
+
+**（2）ASR 主模型（2.1 GB，仓库放不下）**
+
+任选一种方式，把文件下载到 `models/qwen3-asr/`：
+
+```powershell
+# 方式 A：huggingface-cli
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Qwen/Qwen3-ASR-1.7B-GGUF Qwen3-ASR-1.7B.Q8_0.gguf --local-dir models\qwen3-asr
+```
+
+或浏览器打开 [Qwen/Qwen3-ASR-1.7B-GGUF](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-GGUF)，下载 `Qwen3-ASR-1.7B.Q8_0.gguf` 后放到 `models/qwen3-asr/`。
+
+放置后应形如：
+
+```text
+models/qwen3-asr/
+  Qwen3-ASR-1.7B.Q8_0.gguf            ← 手动下载
+  mmproj-Qwen3-ASR-1.7B-Q8_0.gguf     ← 模型包解压后得到
+  !下载模型到此处.txt
+```
+
+### 5.3 安装依赖
+
+双击 **首次安装依赖.bat**，脚本会自动：
+
+1. 创建后端 Python 虚拟环境 `server/.venv`；
+2. 安装 PyTorch（优先 CUDA 版，失败自动回退 CPU 版）及后端依赖；
 3. 安装前端依赖（pnpm install）；
-4. 通过 winget 自动安装 FFmpeg（缺失时）；
-5. 检查 Tesseract OCR（中文包 chi_sim）、Ollama、内置模型，缺失时给出黄色警告与指引。
+4. 缺失时通过 winget 安装 FFmpeg；
+5. 检查 Ollama、Tesseract、模型文件并给出警告。
 
 也可以手动执行：
 
@@ -76,54 +137,135 @@ ollama create qwen3.6-27b -f Modelfile-qwen3.6-27b
 powershell -ExecutionPolicy Bypass -File scripts\setup-local.ps1
 ```
 
-## 第三步：启动与停止
+### 5.4 启动
 
-```text
-启动意向宝.bat    一键启动（自动拉起 ASR 语音服务 8099、后端 8000、前端 3000）
-停止意向宝.bat    一键停止
+双击 **启动意向宝.bat**，或执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1
 ```
 
-启动后浏览器打开 http://localhost:3000，后端接口文档在 http://127.0.0.1:8000/docs。也可手动执行 scripts/start-local.ps1 / scripts/stop-local.ps1。
+脚本会依次拉起：
 
-### 首次登录
+| 服务 | 地址 |
+| --- | --- |
+| ASR 语音服务（llama.cpp） | http://127.0.0.1:8099 |
+| 后端（FastAPI） | http://127.0.0.1:8000/docs |
+| 前端 | http://localhost:3000 |
 
-- 本地账号为 admin（管理员）与 planner（普通用户），源码不提供默认密码。
-- 可设置环境变量 INTENT_BAO_ADMIN_PASSWORD / INTENT_BAO_USER_PASSWORD 指定初始密码；未设置时后端生成强随机密码，启动窗口会提示凭据文件位置（server/data/config/initial-login-credentials/，该目录已被 Git 忽略）。
-- 凭据文件保存到个人密码管理器后请删除；账号创建后环境变量不再影响其密码。
+首次启动前端需要 1~2 分钟编译页面。启动窗口若显示黄色警告"未找到 ASR 模型"，说明 5.1/5.2 的文件没放齐。
 
-## 使用流程
+停止服务：双击 **停止意向宝.bat**（或 `scripts\stop-local.ps1`）。
 
-1. 模型设置：确认 Ollama 与 ASR（llama.cpp http://127.0.0.1:8099，模型名 qwen3-asr）已保存，健康检测"已连接"；
-2. 资料上传：新建会议资料包，上传录音/录屏/PDF/纪要；无 PDF 时填写例外原因；
-3. 启动分析：立即返回列表，任务后台执行，列表实时显示 8 阶段进度，完成后自动提示；
-4. 身份校验：对自动分离出的 Speaker A/B/C 逐个人工标注姓名、角色、组织、职能；
-5. 意向确认：逐条核对 AI 草稿的原文、证据、五档态度与采用阶段，确认后形成正式职能状态；
-6. 看板与导出：客情总览/技术/客户视角查看正式状态；资料包详情可导出 CSV/Excel/Markdown；
-7. 模型评测（可选）：用金标准对比 AI 原始输出，查看结构化准确率、证据可追溯率、未知误判率。
+### 5.5 首次登录与模型配置
 
-演示素材在 samples/：three_speakers.wav（三说话人录音，体验分离）、test_audio_tangpoems.mp3（单人唐诗朗诵）、test_screen_recording.mp4（含语音的演示录屏）、test_real_chinese_doc.pdf（中文样例 PDF）。
+代码仓库不包含默认密码。首次启动后，凭据生成在：
 
-## 测试
+```text
+server/data/config/initial-login-credentials/
+  admin.txt    系统管理员
+  planner.txt  产品规划用户
+```
+
+用其中账号登录 http://localhost:3000 后，进入 **模型设置** 页，填写并点击“测试并保存”：
+
+| 配置项 | 值 |
+| --- | --- |
+| 模型提供方 | 本地 Ollama |
+| Ollama 地址 | `http://127.0.0.1:11434` |
+| 模型名称 | `qwen3.5:9b` |
+| ASR 提供方 | llama.cpp |
+| ASR 地址 | `http://127.0.0.1:8099` |
+| ASR 模型名称 | `qwen3-asr` |
+
+保存后请把临时凭据文件保存到密码管理器并删除。若忘记密码，双击 **重置意向宝登录密码.bat**。
+
+## 六、页面使用流程
+
+1. 模型设置中确认意向模型与 ASR 均显示"已连接"；
+2. 新建会议资料包：选项目/客户，填会议标题、日期、数据级别，可先添加参会人；
+3. 上传材料：录音/录屏/PDF/人工纪要可一次上传多个；
+4. 点击"开始分析"：任务进入后台，资料包页实时显示 8 阶段进度，可随时取消；
+5. 分析完成后先到"说话人校验台"，把 Speaker A/B/C 标注为姓名/角色/组织/职能；
+6. 再到"意向确认台"逐条核对 AI 草稿的原文引用、技术、职能、五档态度、采用阶段，确认后进入正式状态；
+7. 在客户/技术视角看板查看正式意向，资料包详情页可导出 CSV/Excel/Markdown。
+
+演示素材在 `samples/`：`three_speakers.wav`（三说话人录音）、`test_audio_tangpoems.mp3`（单人朗读）、`test_screen_recording.mp4`（含语音的演示录屏）、`test_real_chinese_doc.pdf`（中文样例 PDF）。
+
+## 七、手动执行命令（不用 .bat）
+
+```powershell
+# 安装依赖
+powershell -ExecutionPolicy Bypass -File scripts\setup-local.ps1
+
+# 启动
+powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1
+
+# 停止
+powershell -ExecutionPolicy Bypass -File scripts\stop-local.ps1
+
+# 重置登录密码（admin 或 planner）
+cd server
+powershell -ExecutionPolicy Bypass -File "..\重置意向宝登录密码.bat"
+```
+
+## 八、测试
 
 ```powershell
 # 后端（在 server 目录）
 .venv\Scripts\python.exe -m pytest -q
 
-# 前端（在项目根目录，需 Node）
-node --test tests/*.test.mjs
+# 前端（在项目根目录，需 Node；会先构建再跑测试）
+npm test
 ```
 
-## 上传代码仓库时的大文件说明
+## 九、常见问题
 
-- models/ 内含超过 100MB 的文件（GGUF、CUDA DLL），GitHub/Gitee 直接 push 会失败；仓库已提供 .gitattributes，推荐用 Git LFS 托管（git lfs install 后 git add 会自动走 LFS）。
-- 17GB 的 27B GGUF 不在仓库内，按 models/ollama/Modelfile-qwen3.6-27b 说明单独分发。
-- server/data/（本地数据库、上传文件、凭据、模型设置）、node_modules/、.venv/、runtime/ 均已加入 .gitignore，不会提交。
+| 现象 | 处理 |
+| --- | --- |
+| 启动提示未找到 ASR 模型 / ASR 服务不可用 | 检查 `models/qwen3-asr/`、`models/llama.cpp/` 文件是否齐全（5.1/5.2），补齐后重新启动 |
+| 页面一直显示"模拟分析" | Ollama 未启动，或模型设置没保存成功；启动 Ollama 后重测 |
+| `ollama pull` 很慢或失败 | 先 `ollama pull` 小模型确认网络，再重试；也可设置 `OLLAMA_HOST` 等常规环境变量 |
+| 登录无默认密码 | 查看 `server/data/config/initial-login-credentials/` 或重置密码 |
+| 前端/后端端口被占用 | 停掉占用 3000/8000/8099 的进程后重启 |
+| `models/` 目录缺失或文件很小 | 未下载/解压模型包，从 GitHub Releases / 网盘获取后放回根目录 |
+| 无 NVIDIA 显卡或显存 < 8 GB | 仍可运行但慢；可把上下文调小（见下方"可选调优"） |
+| 说话人分离结果为空 | 确认已安装 FunASR 且网络可访问 ModelScope（缺失模型会自动下载一次） |
 
-## 边界与已知缺口
+### 可选调优：上下文窗口
+
+默认 `num_ctx=32768`。若显存偏小或希望更快，可在启动前设置环境变量（对 16 GB 显卡不建议改小）：
+
+```powershell
+$env:INTENT_BAO_LLM_NUM_CTX = "16384"
+启动意向宝.bat
+```
+
+## 十、仓库分工与发布说明（方案 B）
+
+- **代码仓库只放代码**：`models/llama.cpp/`、`models/funasr/`、ASR 的两个 GGUF、
+  旧 `models/ollama/` 均已在 `.gitignore` 排除，任何人不得 `git add -f` 强行加入。
+- **模型运行包**：发布新版本时，把本地 `models/llama.cpp`、
+  `models/qwen3-asr/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf`、`models/funasr`
+  打成 `models-<版本>.zip`（约 900 MB）作为 GitHub Release 附件，或放网盘并把
+  地址写进 README。打包命令（在项目根目录执行，输出放到仓库外）：
+
+  ```powershell
+  Compress-Archive -Path models\llama.cpp, `
+    models\qwen3-asr\mmproj-Qwen3-ASR-1.7B-Q8_0.gguf, `
+    models\funasr `
+    -DestinationPath D:\release\models-0.1.0.zip -CompressionLevel Optimal
+  ```
+- **仍需单独安装的模型**：`qwen3.5:9b`（Ollama）与
+  `Qwen3-ASR-1.7B.Q8_0.gguf`（Hugging Face，约 2.1 GB）。
+- `server/data/`（数据库、上传文件、初始凭据、模型设置）、`node_modules/`、`.venv/`、`runtime/` 均已被 `.gitignore` 排除，不会提交。
+
+## 十一、当前边界与已知缺口
 
 - 说话人分离为声纹聚类（FunASR），不建立跨会议声纹库；同一说话人被停顿切成多段可正确归组。
+- ASR 长会议采用分批转写：个别片段识别不清时会保留为空，不会中断整段输出。
+- "资料对齐"阶段依赖模型严格按结构契约输出，个别模型返回格式不符时该阶段会降级为 0 条对齐，不影响意向抽取。
 - 关键帧 OCR 对演示级字号效果良好，小字号正文识别率有限。
-- 分析失败重试为全量重跑（阶段产物已落库，但断点续跑未实现）。
-- retention_days 保存期限已建模，但尚无自动清理任务。
-- 前端暂不展示转写全文与音频播放（数据在后端可查）。
-- 结构化准确率不低于85% 与 60-90 分钟会议小于等于原时长 为后续真实样本验证目标，当前未宣称达标。
+- 分析失败重试为全量重跑，尚未实现断点续跑。
+- 前端提供阶段级实时进度；转写全文浏览与片段音频回放为后续增强项。
+- `retention_days` 保存期限已建模，尚无自动清理任务。

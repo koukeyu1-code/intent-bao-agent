@@ -70,6 +70,14 @@ __pycache__/
 !/runtime/intent_bao_backend_entry.py
 dev-frontend*.log
 
-# 2.1GB ASR 主模型：超过 GitHub LFS 2GB 单文件上限，不纳入版本控制。
-# 本地运行需要此文件，请按 models/qwen3-asr/!下载模型到此处.txt 自行下载放置。
+# ============================================================
+# 本地模型与运行文件：一律不进代码仓库（方案 B）
+# 仓库只保留代码；llama.cpp 运行库、Qwen3-ASR(mmproj)、FunASR
+# 模型随 GitHub Releases / 网盘发布的 models-<版本>.zip 分发，
+# 解压到项目根目录即可运行。详见 README「模型准备」。
+# ============================================================
+/models/llama.cpp/
+/models/funasr/
+/models/ollama/
 /models/qwen3-asr/Qwen3-ASR-1.7B.Q8_0.gguf
+/models/qwen3-asr/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf

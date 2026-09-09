@@ -121,7 +121,7 @@ else {
 }
 
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
-    Write-Host "[setup] 警告：未找到 Ollama（意向抽取大模型）。请从 https://ollama.com/download 安装，并按 README「模型准备」导入 qwen3.6-27b。" -ForegroundColor Yellow
+    Write-Host "[setup] 警告：未找到 Ollama（意向抽取大模型）。请从 https://ollama.com/download 安装，然后执行 ollama pull qwen3.5:9b。" -ForegroundColor Yellow
 }
 
 $asrModel = Join-Path $projectRoot "models\qwen3-asr\Qwen3-ASR-1.7B.Q8_0.gguf"

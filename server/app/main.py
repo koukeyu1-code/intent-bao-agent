@@ -218,6 +218,21 @@ def create_app(
     data_dir: str | Path | None = None,
     seed: bool = True,
 ) -> FastAPI:
+    # Make backend ASR/pipeline logs visible at INFO level in the runtime
+    # log file without duplicating handlers configured by test runners.
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    for name in (
+        "app.services",
+        "app.audio_adapters",
+        "app.diarization",
+        "app.stage_orchestrator",
+        "app.main",
+    ):
+        logging.getLogger(name).setLevel(logging.INFO)
     settings = Settings.load(database_url=database_url, data_dir=data_dir)
     model_settings = ModelSettingsStore(settings.data_dir)
     migrate_database(settings.server_dir, settings.database_url)

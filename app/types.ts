@@ -61,6 +61,7 @@ export interface ProcessingTask {
   errorMessage?: string;
   updatedAt: string;
   version: number;
+  result?: Record<string, unknown> | null;
 }
 
 export interface ModelConnectionResult {

@@ -11,6 +11,11 @@
 重置意向宝登录密码.bat     # 重置 admin/planner 密码（随机或手动）
 ```
 
+首次在未装模型的新机器运行时，还需准备（详见 `新电脑运行指南.md`）：
+1. 从 GitHub Releases / 网盘下载 `models-<版本>.zip` 并解压到项目根目录；
+2. `ollama pull qwen3.5:9b`；
+3. 从 Hugging Face 下载 `Qwen3-ASR-1.7B.Q8_0.gguf` 放入 `models/qwen3-asr/`。
+
 当前账号：admin（管理员）、planner（产品规划）。密码不写入仓库；首次启动时到
 `server/data/config/initial-login-credentials/` 查看本机生成的临时凭据，随后请通过
 `重置意向宝登录密码.bat` 轮换并删除临时凭据文件。
@@ -19,7 +24,8 @@
 
 - 前端：Next.js 16 + React 19 + TypeScript + Ant Design 6 + ECharts，构建用 vinext
 - 后端：FastAPI + SQLAlchemy + SQLite + Pydantic（`server/`，venv 在 `server/.venv`）
-- 模型：适配器模式，默认 `mock`，可切本地 Ollama；真实多模态（ASR/说话人分离/OCR）仅接口预留
+- 模型：Ollama `qwen3.5:9b`（意向抽取等）+ llama.cpp `Qwen3-ASR`（语音转写）
+  + FunASR（说话人分离）；默认 `mock` 仅用于无模型验证业务流程
 
 ## 目录与约定
 
@@ -38,8 +44,8 @@
 
 ## 当前状态和下一步
 
-- **A档（演示）**：已完成。模拟数据核心闭环可演示，8 技术维度 + 规格树 + 说话人代称已生效。录视频用 admin 登录，主线演示"客户A·MiniLED背光"。
-- **B档（8/6 真实试点）**：待办。独立 Worker、深度预检、一条非 mock 真实链路、评测框架。详见 `docs/技术维度更新数据蓝图_20260802.md`。
+- **A档（演示）**：已完成。模拟数据核心闭环可演示，8 技术维度 + 规格树 + 说话人代称已生效。
+- **B档（真实试点）**：已完成主体。8 阶段真实模型链路（ASR/说话人分离/PDF与画面解析/资料对齐/身份辅助/意向抽取）已接入并做过真实长会议验证；意向模型当前为 Ollama `qwen3.5:9b`。
 - **C档**：合规评审（真实敏感数据/声纹）需提前启动；不走公网故暂不需要 ICP 备案。
 
 变更记录见 `docs/CHANGELOG_20260802.md`，验收边界见 `docs/P0_ACCEPTANCE.md`。

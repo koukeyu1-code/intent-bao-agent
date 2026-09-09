@@ -3567,3 +3567,31 @@ button.function-attitude-item:not(:disabled):hover {
     transition-duration: 0.01ms !important;
   }
 }
+
+.stage-progress-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0 10px;
+}
+
+.stage-progress-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.stage-progress-row__name {
+  width: 96px;
+  flex: 0 0 auto;
+  color: #475467;
+  font-size: 12px;
+}
+
+.stage-progress-row em {
+  flex: 0 0 auto;
+  color: #175ea6;
+  font-size: 11px;
+  font-style: normal;
+  white-space: nowrap;
+}

@@ -4,8 +4,10 @@ import codecs
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -44,6 +46,23 @@ from .taxonomy_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+_ASR_WINDOW_MS = 30_000
+
+
+def _asr_windows(
+    start_ms: int, end_ms: int, window_ms: int = _ASR_WINDOW_MS
+) -> list[tuple[int, int]]:
+    """Split [start_ms, end_ms) into bounded windows for llama-server."""
+    if end_ms <= start_ms:
+        return []
+    windows: list[tuple[int, int]] = []
+    cursor = start_ms
+    while cursor < end_ms:
+        next_ms = min(end_ms, cursor + window_ms)
+        windows.append((cursor, next_ms))
+        cursor = next_ms
+    return windows
 
 
 class DomainError(Exception):
@@ -264,7 +283,54 @@ def _human_size(size_bytes: int) -> str:
 
 
 _DIRECT_TEXT_EXTENSIONS = {".txt", ".md", ".srt", ".vtt"}
-_MODEL_INPUT_LIMIT = 80_000
+
+
+def _llm_num_ctx() -> int:
+    try:
+        num_ctx = int(os.environ.get("INTENT_BAO_LLM_NUM_CTX") or 32768)
+    except (TypeError, ValueError):
+        num_ctx = 32768
+    return max(8192, min(131_072, num_ctx))
+
+
+def _estimate_material_tokens(items: list[dict[str, Any]]) -> float:
+    """Cheap token estimate: CJK ~1 token/char, ASCII ~0.35, JSON/item overhead."""
+    tokens = 0.0
+    for item in items:
+        content = str(item.get("content") or "")
+        ascii_chars = sum(1 for char in content if char.isascii())
+        tokens += ascii_chars * 0.35 + (len(content) - ascii_chars) * 1.0
+    tokens += len(items) * 45.0
+    return tokens
+
+
+def _split_model_materials_for_analysis(
+    model_materials: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Split long materials into multiple context-sized analysis batches.
+
+    A 90-minute meeting produces far more transcript than fits one LLM call;
+    greedily grouping the ordered material items keeps each batch inside the
+    model context while still analysing every transcript segment.
+    """
+    num_ctx = _llm_num_ctx()
+    # Reserve room for the system prompt, JSON envelope and model output.
+    token_budget = max(6000, int(num_ctx * 0.85) - 3000)
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_tokens = 0.0
+    for item in model_materials:
+        estimated = max(_estimate_material_tokens([item]), 1.0)
+        if current and current_tokens + estimated > token_budget:
+            batches.append(current)
+            current = []
+            current_tokens = 0.0
+        current.append(item)
+        current_tokens += estimated
+    if current:
+        batches.append(current)
+    return batches or [[]]
+
 _MODEL_TEXT_READ_LIMIT_BYTES = 512 * 1024
 
 # Upload limits reflect the first-stage usage profile: a screen recording may
@@ -453,7 +519,7 @@ def _build_model_materials(
 ) -> tuple[list[dict[str, Any]], set[str]]:
     materials: list[dict[str, Any]] = []
     readable_ids: set[str] = set()
-    remaining = _MODEL_INPUT_LIMIT
+    per_file_limit = 12_000
     for item in files:
         path = (settings.data_dir / item.relative_path).resolve()
         if settings.data_dir.resolve() not in path.parents or not path.is_file():
@@ -467,15 +533,14 @@ def _build_model_materials(
             "source_material_type": item.material_type,
             "source_material_name": item.safe_name,
         }
-        if content is not None and content.strip() and remaining > 0:
-            clipped = content.strip()[:remaining]
+        if content is not None and content.strip():
+            clipped = content.strip()[:per_file_limit]
             summary["content"] = clipped
-            remaining -= len(clipped)
             readable_ids.add(item.id)
         materials.append(summary)
 
-    if package.notes and package.notes.strip() and remaining > 0:
-        note = package.notes.strip()[:remaining]
+    if package.notes and package.notes.strip():
+        note = package.notes.strip()[:per_file_limit]
         materials.append(
             {
                 "id": None,
@@ -484,7 +549,6 @@ def _build_model_materials(
                 "content": note,
             }
         )
-        remaining -= len(note)
 
     if not any(item.get("content") for item in materials):
         has_media = any(
@@ -825,17 +889,16 @@ def _extend_materials_with_derived(
         for item in combined
         if item.get("source_material_file_id") or item.get("id")
     }
-    remaining = _MODEL_INPUT_LIMIT
-    for item in combined:
-        remaining -= len(str(item.get("content") or ""))
-
+    # Keep every derived item so nothing is dropped before the LLM is called.
+    # Total size is bounded later by _split_model_materials_for_analysis into
+    # several context-sized batches; each item is still capped so a single
+    # enormous segment/page cannot overflow one batch by itself.
+    item_limit = 6000
     for item in extra_materials:
-        if remaining <= 0:
-            break
-        content = str(item.get("content") or "")[:3000]
+        content = str(item.get("content") or "")
         if not content:
             continue
-        clipped = content[:remaining]
+        clipped = content[:item_limit]
         combined.append(
             {
                 **item,
@@ -843,15 +906,12 @@ def _extend_materials_with_derived(
                 "truncated": len(clipped) < len(content),
             }
         )
-        remaining -= len(clipped)
 
     for transcript in transcripts:
-        if remaining <= 0:
-            break
         content = (
             f"[{_fmt_ms(transcript.start_ms)}-{_fmt_ms(transcript.end_ms)}] "
             f"{transcript.text}"
-        )[:3000]
+        )[:item_limit]
         combined.append(
             {
                 "id": transcript.id,
@@ -876,15 +936,12 @@ def _extend_materials_with_derived(
                 "end_ms": transcript.end_ms,
             }
         )
-        remaining -= len(content)
 
     for page in pages:
-        if remaining <= 0:
-            break
-        content = page.text[:3000]
+        content = page.text[:item_limit]
         if not content:
             continue
-        clipped = content[:remaining]
+        clipped = content[:item_limit]
         combined.append(
             {
                 "id": page.id,
@@ -910,7 +967,6 @@ def _extend_materials_with_derived(
                 "page_no": page.page_no,
             }
         )
-        remaining -= len(clipped)
     return combined
 
 
@@ -1150,6 +1206,30 @@ def _run_audio_stage(
     duration_ms = probe_media_duration(audio_path)
     hotwords = _build_hotwords(session, package)
 
+    _update_task(
+        session,
+        run,
+        "音轨与转写",
+        status="处理中",
+        progress=5,
+        result_json={
+            "mode": "准备转写",
+            "transcribed": 0,
+            "total": 0,
+            "empty": 0,
+            "failed": 0,
+        },
+    )
+    _update_task(
+        session,
+        run,
+        "说话人分离",
+        status="处理中",
+        progress=5,
+        result_json={"status": "正在分离说话人"},
+    )
+    session.commit()
+
     diarized_turns: list[Any] = []
     diarization_note: dict[str, Any] = {
         "provider": None,
@@ -1171,58 +1251,191 @@ def _run_audio_stage(
             }
     except Exception as exc:
         logger.warning("说话人分离不可用，退回整段转写：%s", exc)
+    _update_task(
+        session,
+        run,
+        "说话人分离",
+        status="处理中",
+        progress=50,
+        result_json={
+            "status": (
+                "说话人已分离，开始逐段转写"
+                if diarized_turns
+                else "无可用说话人片段，整段分窗转写"
+            ),
+            "speakers": diarization_note["speakers"],
+        },
+    )
+    session.commit()
 
     transcript_model = adapter.model_name
+    segments: list[AsrSegment] = []
+    temp_dir = settings.data_dir / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build fixed-window jobs.  Speaker turns keep their label when the
+    # diarizer is available; otherwise the whole recording is chunked into
+    # bounded windows so long meetings never block llama-server with one
+    # oversized audio request.
+    jobs: list[tuple[int, int, str | None]] = []
+    mode_label = "说话人分段转写"
     if diarized_turns:
-        segments: list[AsrSegment] = []
-        temp_dir = settings.data_dir / "temp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        for turn_index, turn in enumerate(diarized_turns):
-            seg_wav = (
-                temp_dir
-                / f"{run.id}-{target.id}-diar-{turn_index}.wav"
-            )
-            if not slice_audio_segment(
-                audio_path, turn.start_ms, turn.end_ms, seg_wav
+        for turn in diarized_turns:
+            for start_ms, end_ms in _asr_windows(
+                turn.start_ms, turn.end_ms
             ):
-                continue
-            try:
+                jobs.append((start_ms, end_ms, turn.speaker_label))
+    else:
+        mode_label = "整段录音自动分窗转写"
+        for start_ms, end_ms in _asr_windows(0, duration_ms or 0):
+            jobs.append((start_ms, end_ms, None))
+
+    logger.info(
+        "ASR阶段开始 run=%s file=%s duration_ms=%s mode=%s jobs=%s",
+        run.id,
+        target.safe_name,
+        duration_ms,
+        mode_label,
+        len(jobs),
+    )
+
+    transcription_stats: dict[str, int] = {
+        "jobs": len(jobs),
+        "ok": 0,
+        "empty": 0,
+        "failed": 0,
+    }
+    total_jobs = max(len(jobs), 1)
+    hard_errors: list[str] = []
+    for job_index, (start_ms, end_ms, speaker_label) in enumerate(
+        jobs, 1
+    ):
+        done = job_index - 1
+        _update_task(
+            session,
+            run,
+            "音轨与转写",
+            status="处理中",
+            progress=5 + int(90 * done / total_jobs),
+            result_json={
+                "mode": mode_label,
+                "transcribed": done,
+                "total": total_jobs,
+                "failed": transcription_stats["failed"],
+                "empty": transcription_stats["empty"],
+            },
+        )
+        session.commit()
+
+        seg_wav = temp_dir / f"{run.id}-{target.id}-asr-{job_index}.wav"
+        sliced = slice_audio_segment(
+            audio_path, start_ms, end_ms, seg_wav
+        )
+        start_time = time.monotonic()
+        error: str | None = None
+        turn_result = None
+        try:
+            if sliced:
                 turn_result = adapter.transcribe(
                     seg_wav,
                     language="zh",
                     hotwords=hotwords,
-                    duration_ms=turn.end_ms - turn.start_ms,
+                    duration_ms=end_ms - start_ms,
                 )
-            except Exception as exc:
-                logger.warning("说话人片段转写失败，跳过：%s", exc)
-                continue
-            finally:
-                try:
-                    seg_wav.unlink(missing_ok=True)
-                except OSError:
-                    # The ASR client may still hold the file handle on
-                    # Windows; leftover temp slices are harmless.
-                    pass
+            else:
+                error = "音频切片失败"
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            try:
+                seg_wav.unlink(missing_ok=True)
+            except OSError:
+                # The ASR client may still hold the file handle on
+                # Windows; leftover temp slices are harmless.
+                pass
+
+        elapsed = time.monotonic() - start_time
+        if turn_result is not None and turn_result.segments:
             for seg in turn_result.segments:
                 segments.append(
                     AsrSegment(
-                        start_ms=turn.start_ms,
-                        end_ms=turn.end_ms,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
                         text=seg.text,
-                        speaker_label=turn.speaker_label,
+                        speaker_label=speaker_label,
                         confidence=seg.confidence,
                         language=seg.language,
                     )
                 )
-    else:
-        result = adapter.transcribe(
-            audio_path,
-            language="zh",
-            hotwords=hotwords,
-            duration_ms=duration_ms,
+            transcription_stats["ok"] += 1
+            logger.info(
+                "ASR片段完成 %s/%s [%s-%sms] %s 段文本，耗时 %.1fs",
+                job_index,
+                total_jobs,
+                start_ms,
+                end_ms,
+                len(turn_result.segments),
+                elapsed,
+            )
+        else:
+            segments.append(
+                AsrSegment(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    text="",
+                    speaker_label=speaker_label,
+                    confidence=0.0,
+                    language="zh",
+                )
+            )
+            if error and ("连接" in error or "超时" in error or "HTTP" in error):
+                hard_errors.append(error)
+                transcription_stats["failed"] += 1
+            else:
+                transcription_stats["empty"] += 1
+            logger.warning(
+                "ASR片段失败/为空 %s/%s [%s-%sms] 保留空转写片段；错误：%s",
+                job_index,
+                total_jobs,
+                start_ms,
+                end_ms,
+                error or "模型未返回文本",
+            )
+
+    _update_task(
+        session,
+        run,
+        "音轨与转写",
+        status="处理中",
+        progress=95,
+        result_json={
+            "mode": mode_label,
+            "transcribed": transcription_stats["ok"],
+            "total": total_jobs,
+            "failed": transcription_stats["failed"],
+            "empty": transcription_stats["empty"],
+        },
+    )
+    session.commit()
+
+    logger.info(
+        "ASR阶段完成 run=%s ok=%s empty=%s failed=%s 总片段=%s",
+        run.id,
+        transcription_stats["ok"],
+        transcription_stats["empty"],
+        transcription_stats["failed"],
+        len(segments),
+    )
+    if (
+        transcription_stats["ok"] == 0
+        and len(hard_errors) == total_jobs
+        and hard_errors
+    ):
+        raise DomainError(
+            502,
+            "ASR转写失败：本地语音服务不可用或持续超时"
+            f"（示例错误：{hard_errors[0]}）。请确认 ASR 服务已启动。",
         )
-        transcript_model = result.model_name
-        segments = list(result.segments)
 
     existing_clusters = session.scalars(
         select(m.SpeakerCluster).where(
@@ -1295,10 +1508,12 @@ def _run_audio_stage(
         run,
         "音轨与转写",
         status="已完成",
+        progress=100,
         result_json={
             "segments": len(transcripts),
             "duration_ms": duration_ms,
             "model": transcript_model,
+            "transcription": transcription_stats,
             **(
                 {"diarization": diarization_note}
                 if diarized_turns
@@ -1311,6 +1526,7 @@ def _run_audio_stage(
         run,
         "说话人分离",
         status="已完成",
+        progress=100,
         result_json={"speaker_labels": len(current_labels)},
     )
     return True, transcripts
@@ -2342,14 +2558,98 @@ def execute_analysis_run(
             session.commit()
 
             _raise_if_analysis_cancel_requested(session, run)
-            adapter_result = adapter.analyze(
-                ModelContext(
-                    package_id=package.id,
-                    customer_id=package.customer_id,
-                    material_summaries=model_materials,
-                    master_data=master_data,
-                )
+            batches = _split_model_materials_for_analysis(model_materials)
+            merged_observations: list[dict[str, Any]] = []
+            merged_usage: dict[str, Any] = {}
+            base_result: dict[str, Any] | None = None
+            total_batches = max(len(batches), 1)
+            _update_task(
+                session,
+                run,
+                "意向抽取",
+                status="处理中",
+                progress=5,
+                result_json={
+                    "mode": "分批分析",
+                    "batch": 0,
+                    "batches": len(batches),
+                },
             )
+            session.commit()
+            for batch_index, batch in enumerate(batches, 1):
+                _raise_if_analysis_cancel_requested(session, run)
+                _update_task(
+                    session,
+                    run,
+                    "意向抽取",
+                    status="处理中",
+                    progress=5 + int(90 * batch_index / total_batches),
+                    result_json={
+                        "mode": "分批分析",
+                        "batch": batch_index,
+                        "batches": len(batches),
+                    },
+                )
+                session.commit()
+                logger.info(
+                    "意向抽取 批次 %s/%s 材料项=%s 预估token=%.0f",
+                    batch_index,
+                    total_batches,
+                    len(batch),
+                    _estimate_material_tokens(batch),
+                )
+                batch_result = adapter.analyze(
+                    ModelContext(
+                        package_id=package.id,
+                        customer_id=package.customer_id,
+                        material_summaries=batch,
+                        master_data=master_data,
+                    )
+                )
+                observations = batch_result.get("observations") or []
+                if not isinstance(observations, list):
+                    observations = []
+                merged_observations.extend(
+                    item for item in observations if isinstance(item, dict)
+                )
+                usage = batch_result.get("usage")
+                if isinstance(usage, dict):
+                    for key, value in usage.items():
+                        if isinstance(value, (int, float)):
+                            merged_usage[key] = (
+                                merged_usage.get(key, 0) + value
+                            )
+                        else:
+                            merged_usage.setdefault(key, value)
+                base_result = batch_result
+
+            # Collapse accidental duplicates while keeping distinct quotes and
+            # interpretations (a repeated sentence can still be two records).
+            deduped: list[dict[str, Any]] = []
+            seen: set[tuple[str, str, str, Any, Any]] = set()
+            for observation in merged_observations:
+                key = (
+                    " ".join(str(observation.get("quote") or "").split()),
+                    str(observation.get("technology_id") or ""),
+                    str(observation.get("speaker_name") or ""),
+                    observation.get("attitude_level"),
+                    observation.get("function_id"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(observation)
+            if len(deduped) != len(merged_observations):
+                logger.info(
+                    "意向抽取合并去重：%s 条 -> %s 条",
+                    len(merged_observations),
+                    len(deduped),
+                )
+            adapter_result = dict(base_result or {})
+            adapter_result["observations"] = deduped
+            if merged_usage:
+                adapter_result["usage"] = merged_usage
+            adapter_result["batches"] = len(batches)
             _raise_if_analysis_cancel_requested(session, run)
             speaker_count, observation_count, unresolved = (
                 _persist_model_observations(
@@ -2367,7 +2667,12 @@ def execute_analysis_run(
                 run,
                 "意向抽取",
                 status="已完成",
-                result_json={"observations": observation_count},
+                progress=100,
+                result_json={
+                    "observations": observation_count,
+                    "batches": len(batches),
+                    "mode": "分批分析",
+                },
             )
             _raise_if_analysis_cancel_requested(session, run)
             session.commit()

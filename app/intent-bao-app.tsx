@@ -182,7 +182,7 @@ class AnalysisCancelledError extends Error {
 const waitForAnalysisCompletion = async (
   meetingId: string,
   runId: string,
-  timeoutMs = 10 * 60_000,
+  timeoutMs = 120 * 60_000,
   intervalMs = 2_000,
 ): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
@@ -1091,6 +1091,53 @@ function MeetingsPage({
     return () => window.clearInterval(timer);
   }, [watchingCount, reloadDataset]);
 
+  const [liveTasks, setLiveTasks] = useState<ProcessingTask[] | null>(null);
+  useEffect(() => {
+    if (!detail || detail.status !== "分析中") {
+      setLiveTasks(null);
+      return;
+    }
+    let alive = true;
+    const tick = async () => {
+      try {
+        const result = await loadPackageTasks(detail.id);
+        if (alive) setLiveTasks(result.items);
+      } catch {
+        // 轮询失败不打断用户操作；下一次心跳会重试。
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 2_000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [detail?.id, detail?.status]);
+
+  const liveRunTasks = useMemo(() => {
+    if (!liveTasks || !liveTasks.length) return null;
+    const groups = new Map<string, ProcessingTask[]>();
+    for (const task of liveTasks) {
+      const bucket = groups.get(task.analysisRunId) ?? [];
+      bucket.push(task);
+      groups.set(task.analysisRunId, bucket);
+    }
+    const active = [...groups.values()].find((group) =>
+      group.some(
+        (task) =>
+          task.status === "处理中" || task.status === "待处理",
+      ),
+    );
+    const newest = [...groups.values()].sort((a, b) =>
+      String(b[0]?.startedAt ?? "").localeCompare(
+        String(a[0]?.startedAt ?? ""),
+      ),
+    )[0];
+    return (active ?? newest ?? null)?.sort(
+      (a, b) => a.stageOrder - b.stageOrder,
+    ) ?? null;
+  }, [liveTasks]);
+
   const resetCreateDialog = () => {
     setCreateOpen(false);
     setCreatedPackageId(undefined);
@@ -1673,6 +1720,56 @@ function MeetingsPage({
             <div className="detail-progress">
               <strong>{detail.currentStep}</strong>
               <Progress percent={detail.progress} />
+              {liveRunTasks ? (
+                <div className="stage-progress-list">
+                  {liveRunTasks.map((task) => {
+                    const result = (task.result ?? {}) as {
+                      transcribed?: number;
+                      total?: number;
+                      empty?: number;
+                      failed?: number;
+                    };
+                    const isTranscribing =
+                      task.stage === "音轨与转写" &&
+                      task.status === "处理中";
+                    const subText = isTranscribing
+                      ? `已转写 ${result.transcribed ?? 0}/${
+                          result.total ?? 0
+                        } 段`
+                      : task.status === "处理中"
+                        ? `${task.stage} 处理中`
+                        : "";
+                    return (
+                      <div className="stage-progress-row" key={task.id}>
+                        <span className="stage-progress-row__name">
+                          {task.stage}
+                        </span>
+                        <Progress
+                          percent={task.progress}
+                          size="small"
+                          style={{ flex: 1, margin: "0 6px" }}
+                        />
+                        <Tag
+                          color={
+                            task.status === "已完成"
+                              ? "success"
+                              : task.status === "不适用"
+                                ? "default"
+                                : task.status === "处理失败"
+                                  ? "error"
+                                  : task.status === "处理中"
+                                    ? "processing"
+                                    : "default"
+                          }
+                        >
+                          {task.status}
+                        </Tag>
+                        {subText ? <em>{subText}</em> : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
               <Upload
                 accept=".mp3,.wav,.m4a,.mp4,.txt,.md,.docx,.srt,.vtt,.pdf"
                 showUploadList={false}

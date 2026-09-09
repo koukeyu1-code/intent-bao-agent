@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -74,12 +75,21 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         api_key: str | None = None,
         timeout_seconds: float = 300,
         thinking_enabled: bool = False,
+        num_ctx: int | None = None,
         transport: httpx.BaseTransport | None = None,
     ):
         self.base_url = self._normalize_base_url(base_url)
         self.model_name = validate_model_name(model_name)
         self._api_key = api_key or None
         self._thinking_enabled = thinking_enabled
+        try:
+            self._num_ctx = int(
+                num_ctx
+                or os.environ.get("INTENT_BAO_LLM_NUM_CTX")
+                or 32768
+            )
+        except (TypeError, ValueError):
+            self._num_ctx = 32768
         self._timeout = httpx.Timeout(
             timeout_seconds,
             connect=min(timeout_seconds, 5),
@@ -124,11 +134,18 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
                 body_text = exc.response.text[:400]
             except Exception:
                 body_text = ""
-            if exc.response.status_code == 400 and "grammar" in body_text.lower():
-                return ModelAdapterError(
-                    f"{label}无法解析结构化输出语法（grammar），"
-                    "当前模型可能不兼容完整JSON Schema"
-                )
+            if exc.response.status_code == 400:
+                if "grammar" in body_text.lower():
+                    return ModelAdapterError(
+                        f"{label}无法解析结构化输出语法（grammar），"
+                        "当前模型可能不兼容完整JSON Schema"
+                    )
+                if "context" in body_text.lower():
+                    return ModelAdapterError(
+                        f"{label}输入过长超过模型上下文限制；"
+                        "请缩短单次分析材料，或提高上下文"
+                        "（环境变量 INTENT_BAO_LLM_NUM_CTX）"
+                    )
             return ModelAdapterError(
                 f"{label}返回HTTP {exc.response.status_code}，请检查模型和服务状态"
             )
@@ -397,7 +414,11 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             "messages": request_messages,
             "stream": False,
             "think": self._thinking_enabled,
-            "options": {"temperature": 0, "num_predict": budget},
+            "options": {
+                "temperature": 0,
+                "num_predict": budget,
+                "num_ctx": self._num_ctx,
+            },
         }
         if use_format:
             request_body["format"] = (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -170,6 +173,11 @@ class LlamaCppAsrAdapter(AsrAdapter):
         hotwords: list[str],
         duration_ms: int | None = None,
     ) -> AsrResult:
+        logger.info(
+            "LlamaCpp ASR 请求开始 file=%s duration_ms=%s",
+            audio_path.name,
+            duration_ms,
+        )
         try:
             with self._client() as client:
                 response = client.post(
@@ -197,6 +205,11 @@ class LlamaCppAsrAdapter(AsrAdapter):
             ValueError,
         ) as exc:
             raise self._safe_error(exc) from exc
+        finally:
+            logger.info(
+                "LlamaCpp ASR 请求结束 file=%s",
+                audio_path.name,
+            )
 
         segments: list[AsrSegment] = []
         if isinstance(body, dict):
@@ -252,7 +265,17 @@ class LlamaCppAsrAdapter(AsrAdapter):
                         )
                     )
         if not segments:
+            logger.warning(
+                "LlamaCpp ASR 未返回可用转写 file=%s duration_ms=%s",
+                audio_path.name,
+                duration_ms,
+            )
             raise AsrError("ASR未返回任何可用的转写片段")
+        logger.info(
+            "LlamaCpp ASR 成功 file=%s segments=%s",
+            audio_path.name,
+            len(segments),
+        )
         return AsrResult(
             segments=segments,
             model_name=self.model_name,
