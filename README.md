@@ -26,8 +26,9 @@
 
 > **仓库分工**：GitHub 代码仓库只放代码，不含任何模型文件。本地运行所需的
 > llama.cpp / mmproj / FunASR（共约 900 MB）统一打成 `models-<版本>.zip`，
-> 通过 GitHub Releases 或网盘分发；`qwen3.5:9b` 与 2.1 GB 的 ASR 主模型
-> 仍需各自单独安装（见 5.2）。
+> 通过 [GitHub Releases](https://github.com/koukeyu1-code/intent-bao-agent/releases)
+> 分发（当前版本见下方 5.1）；`qwen3.5:9b` 与 2.1 GB 的 ASR 主模型仍需各自
+> 单独安装（见 5.2）。
 
 可选：Tesseract OCR（含简体中文 `chi_sim` 语言包），用于录屏关键帧文字识别；没有它视频画面 OCR 会跳过，不影响其他链路。
 
@@ -71,8 +72,9 @@ git clone https://github.com/koukeyu1-code/intent-bao-agent.git
 cd intent-bao-agent
 ```
 
-再从 **GitHub Releases（或维护者提供的网盘）** 下载 `models-<版本>.zip`
-（含 llama.cpp 运行库、Qwen3-ASR mmproj、FunASR 模型，共约 900 MB），
+再从 **GitHub Releases** 下载当前版本的
+[models-0.1.0.zip](https://github.com/koukeyu1-code/intent-bao-agent/releases/download/v0.1.0/models-0.1.0.zip)
+（含 llama.cpp 运行库、Qwen3-ASR mmproj、FunASR 模型，约 590 MB），
 解压到项目根目录，使目录结构形如：
 
 ```text
