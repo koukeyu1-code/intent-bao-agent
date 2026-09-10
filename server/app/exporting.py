@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import unicodedata
 from typing import Any
 
 from sqlalchemy import select
@@ -10,6 +11,34 @@ from sqlalchemy.orm import Session
 from . import models as m
 from .domain import ATTITUDE_LABELS
 from .query_visibility import visible_observation_clause
+
+
+def _spreadsheet_text(value: str) -> str:
+    # Keep readable tabs/newlines, but render other control characters
+    # explicitly so evidence cannot contain invisible XML-invalid bytes.
+    return "".join(
+        f"\\x{ord(char):02x}"
+        if unicodedata.category(char) == "Cc" and char not in "\t\r\n"
+        else char
+        for char in value
+    )
+
+
+def _csv_safe_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = _spreadsheet_text(value)
+    prefix_length = 0
+    for char in text:
+        if not (char.isspace() or unicodedata.category(char) in {"Cc", "Cf"}):
+            break
+        prefix_length += 1
+    candidate = text[prefix_length:]
+    # CSV quoting escapes delimiters only; spreadsheet readers can still
+    # execute quoted formulas, including those hidden by leading whitespace.
+    if text.startswith(("\t", "\r", "\n")) or candidate.startswith(("=", "+", "-", "@")):
+        return "'" + text
+    return text
 
 
 def _package_rows(
@@ -136,7 +165,7 @@ def export_package_csv(
     )
     writer.writeheader()
     for row in observation_rows + formal_rows:
-        writer.writerow(row)
+        writer.writerow({key: _csv_safe_value(value) for key, value in row.items()})
     return f"intent-bao-{package_id}.csv", output.getvalue()
 
 
@@ -182,26 +211,34 @@ def export_package_xlsx(
 
     observation_rows, formal_rows = _package_rows(session, package_id)
     workbook = Workbook()
-    headers = list(observation_rows[0].keys()) if observation_rows else []
+    headers = list(observation_rows[0].keys()) if observation_rows else (
+        list(formal_rows[0].keys()) if formal_rows else []
+    )
+
+    def write_values(sheet, row_index: int, values: list[Any]) -> None:
+        for column, value in enumerate(values, 1):
+            cell = sheet.cell(row_index, column)
+            if isinstance(value, str):
+                cell.value = _spreadsheet_text(value)
+                # openpyxl otherwise infers a formula from a leading '='.
+                cell.data_type = "s"
+            else:
+                cell.value = value
 
     def fill(sheet, rows: list[dict[str, Any]]) -> None:
         if headers:
-            sheet.append(headers)
+            write_values(sheet, 1, headers)
             for cell in sheet[1]:
                 cell.font = Font(bold=True)
-        for row in rows:
-            sheet.append([row.get(key, "") for key in headers])
+        for row_index, row in enumerate(rows, 2 if headers else 1):
+            write_values(sheet, row_index, [row.get(key, "") for key in headers])
 
     sheet = workbook.active
     sheet.title = "意向观察"
     fill(sheet, observation_rows)
     if formal_rows:
         sheet2 = workbook.create_sheet("正式状态")
-        sheet2.append(headers)
-        for cell in sheet2[1]:
-            cell.font = Font(bold=True)
-        for row in formal_rows:
-            sheet2.append([row.get(key, "") for key in headers])
+        fill(sheet2, formal_rows)
 
     buffer = io.BytesIO()
     workbook.save(buffer)

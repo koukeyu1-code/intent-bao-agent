@@ -37,8 +37,17 @@ function Ensure-ExternalTool {
         [string]$Hint = ""
     )
 
-    if (Get-Command $Probe -ErrorAction SilentlyContinue) {
-        return $true
+    $bundled = Join-Path $projectRoot "models\ffmpeg\bin\$Probe.exe"
+    foreach ($candidate in @($bundled, $Probe)) {
+        $executable = Find-Executable -Candidates @($candidate)
+        if (-not $executable) { continue }
+        try {
+            & $executable -version *> $null
+            if ($LASTEXITCODE -eq 0) { return $true }
+        }
+        catch {
+            Write-Host "[setup] 警告：$executable 不是可运行的 $Name 文件。" -ForegroundColor Yellow
+        }
     }
     if ($WingetId -and (Get-Command winget -ErrorAction SilentlyContinue)) {
         Write-Host "正在通过 winget 安装 $Name ..."
@@ -121,16 +130,20 @@ else {
 }
 
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
-    Write-Host "[setup] 警告：未找到 Ollama（意向抽取大模型）。请从 https://ollama.com/download 安装，然后执行 ollama pull qwen3.5:9b。" -ForegroundColor Yellow
+    Write-Host "[setup] 提示：未找到 Ollama。若使用 LM Studio 等本地 OpenAI 兼容服务，可跳过 Ollama 并在模型设置中配置该服务；若选择 Ollama，请安装后执行 ollama pull qwen3.5:9b。" -ForegroundColor Yellow
 }
 
 $asrModel = Join-Path $projectRoot "models\qwen3-asr\Qwen3-ASR-1.7B.Q8_0.gguf"
+$asrMmproj = Join-Path $projectRoot "models\qwen3-asr\mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"
 $asrServer = Join-Path $projectRoot "models\llama.cpp\llama-server.exe"
-$funasrDir = Join-Path $projectRoot "models\funasr\models"
+$speakerModel = Join-Path $projectRoot "models\funasr\models\iic--speech_campplus_sv_zh-cn_16k-common\snapshots\master\campplus_cn_common.bin"
+$vadModel = Join-Path $projectRoot "models\funasr\models\iic--speech_fsmn_vad_zh-cn-16k-common-pytorch\snapshots\master\model.pt"
 $missing = @()
 if (-not (Test-Path -LiteralPath $asrModel)) { $missing += "models/qwen3-asr（Qwen3-ASR 模型）" }
+if (-not (Test-Path -LiteralPath $asrMmproj)) { $missing += "models/qwen3-asr（ASR mmproj）" }
 if (-not (Test-Path -LiteralPath $asrServer)) { $missing += "models/llama.cpp（llama-server 运行时）" }
-if (-not (Test-Path -LiteralPath $funasrDir)) { $missing += "models/funasr（说话人分离声纹模型）" }
+if (-not (Test-Path -LiteralPath $speakerModel)) { $missing += "models/funasr（cam++ 声纹权重）" }
+if (-not (Test-Path -LiteralPath $vadModel)) { $missing += "models/funasr（fsmn-vad 权重）" }
 if ($missing.Count -gt 0) {
     Write-Host "[setup] 警告：models/ 目录缺少：$($missing -join '、')。请参照 README「模型准备」补齐后，语音转写与说话人分离才能使用。" -ForegroundColor Yellow
 }

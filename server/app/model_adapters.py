@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -17,9 +20,9 @@ from .model_settings import (
     validate_model_name,
 )
 from .schemas import OllamaAnalysisResult, OllamaStructuredOutput
+from .request_budget import estimate_tokens, split_items_for_request
 
 
-MAX_PROMPT_CONTENT_CHARS = 200_000
 MIN_OUTPUT_TOKEN_BUDGET = 1024
 MAX_OUTPUT_TOKEN_BUDGET = 2048
 
@@ -45,6 +48,10 @@ class IntentModelAdapter(ABC):
 
 class ModelAdapterError(RuntimeError):
     """Sanitized provider error safe to persist or return to a local UI."""
+
+    def __init__(self, message: str, *, category: str = "invalid_response"):
+        super().__init__(message)
+        self.category = category
 
 
 class MockIntentModelAdapter(IntentModelAdapter):
@@ -94,7 +101,36 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             timeout_seconds,
             connect=min(timeout_seconds, 5),
         )
+        # The deadline covers all attempts, including schema fallback. A read
+        # timeout alone restarts after each received network chunk.
+        self._total_timeout_seconds = max(0.01, min(timeout_seconds, 480.0))
+        self._check_cancelled: Callable[[], None] | None = None
+        self._on_progress: Callable[[dict[str, Any]], None] | None = None
+        self._request_deadline: float | None = None
+        self._request_started: float | None = None
+        self._attempt = 1
         self._transport = transport
+
+    def set_runtime_hooks(
+        self,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._check_cancelled = check_cancelled
+        self._on_progress = on_progress
+
+    def _report_activity(self, phase: str) -> None:
+        if self._check_cancelled:
+            self._check_cancelled()
+        if self._on_progress:
+            started = self._request_started or time.monotonic()
+            self._on_progress({
+                "elapsed_seconds": round(time.monotonic() - started, 1),
+                "attempt": self._attempt,
+                "phase": phase,
+                "timeout_seconds": self._total_timeout_seconds,
+            })
 
     @staticmethod
     def _normalize_base_url(value: str) -> str:
@@ -123,34 +159,43 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
     def _safe_request_error(self, exc: Exception) -> ModelAdapterError:
         label = self._service_label
         if isinstance(exc, httpx.TimeoutException):
-            return ModelAdapterError(f"连接{label}超时，请确认服务已启动并检查模型大小")
+            return ModelAdapterError(f"连接{label}超时，请确认服务已启动并检查模型大小", category="timeout")
         if isinstance(exc, httpx.ConnectError):
             return ModelAdapterError(
-                f"无法连接本地{label}，请确认服务已启动且地址、端口正确"
+                f"无法连接本地{label}，请确认服务已启动且地址、端口正确", category="connection"
             )
         if isinstance(exc, httpx.HTTPStatusError):
             body_text = ""
             try:
-                body_text = exc.response.text[:400]
+                body_text = exc.response.text[:2000]
             except Exception:
                 body_text = ""
-            if exc.response.status_code == 400:
+            if exc.response.status_code in {400, 413, 422}:
                 if "grammar" in body_text.lower():
                     return ModelAdapterError(
                         f"{label}无法解析结构化输出语法（grammar），"
-                        "当前模型可能不兼容完整JSON Schema"
+                        "当前模型可能不兼容完整JSON Schema", category="grammar"
                     )
-                if "context" in body_text.lower():
+                if "context" in body_text.lower() or "n_ctx" in body_text.lower():
+                    ctx_match = re.search(r"n_ctx[\"']?\s*[:=]?\s*(\d+)", body_text) or re.search(
+                        r"context (?:size|length)\s*\(?(\d+)", body_text, re.IGNORECASE
+                    )
+                    current = f"（服务报告 {ctx_match.group(1)} tokens）" if ctx_match else ""
+                    action = (
+                        "请在 LM Studio 或兼容服务重新加载模型，调整 Context Length 并保存加载配置；"
+                        "同时让 INTENT_BAO_LLM_NUM_CTX 与服务实际容量一致"
+                        if self.name == "openai-compatible"
+                        else "请核对 Ollama 的 num_ctx 与模型容量，并降低单批材料长度"
+                    )
                     return ModelAdapterError(
-                        f"{label}输入过长超过模型上下文限制；"
-                        "请缩短单次分析材料，或提高上下文"
-                        "（环境变量 INTENT_BAO_LLM_NUM_CTX）"
+                        f"{label}输入过长超过模型上下文限制{current}；{action}", category="context"
                     )
             return ModelAdapterError(
-                f"{label}返回HTTP {exc.response.status_code}，请检查模型和服务状态"
+                f"{label}返回HTTP {exc.response.status_code}，请检查模型和服务状态",
+                category="server" if exc.response.status_code >= 500 else "http",
             )
         if isinstance(exc, httpx.RequestError):
-            return ModelAdapterError(f"{label}请求失败，请检查本地服务状态")
+            return ModelAdapterError(f"{label}请求失败，请检查本地服务状态", category="connection")
         return ModelAdapterError(f"{label}响应格式无效")
 
     def list_models(self) -> list[dict[str, Any]]:
@@ -245,26 +290,69 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
     def _prompt_materials(
         material_summaries: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        remaining = MAX_PROMPT_CONTENT_CHARS
         prepared: list[dict[str, Any]] = []
         for material in material_summaries:
             raw_content = material.get("content")
             content = raw_content if isinstance(raw_content, str) else ""
-            included = content[:remaining]
-            truncated = len(included) < len(content)
-            remaining -= len(included)
             prepared.append(
                 {
                     "id": str(material.get("id") or ""),
                     "type": str(material.get("type") or ""),
                     "name": str(material.get("name") or ""),
-                    "content": included,
-                    "truncated": truncated,
+                    "content": content,
+                    "truncated": False,
+                    **{
+                        key: material[key] for key in (
+                            "part_index", "content_offset", "content_end",
+                            "source_material_id", "start_ms", "end_ms", "speaker_label",
+                            "source_material_file_id", "source_material_type", "source_material_name",
+                            "transcript_segment_id", "pdf_page_text_id", "page_no",
+                        ) if key in material
+                    },
                 }
             )
-            if remaining <= 0:
-                break
         return prepared
+
+    def request_fits(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        budget: int = MAX_OUTPUT_TOKEN_BUDGET,
+        generation_schema: dict[str, Any] | None = None,
+        use_format: bool = True,
+    ) -> bool:
+        # Estimate the actual complete request, rather than just material text.
+        prompt = json.dumps(self._build_chat_request_body(
+            self._prepare_request_messages(messages, use_format=use_format),
+            budget=budget,
+            use_format=use_format,
+            generation_schema=generation_schema,
+        ), ensure_ascii=False)
+        return estimate_tokens(prompt) + budget + 128 <= int(self._num_ctx * 0.85)
+
+    def split_context(self, context: ModelContext) -> list[ModelContext]:
+        def make_context(items: list[dict[str, Any]]) -> ModelContext:
+            return ModelContext(
+                package_id=context.package_id,
+                customer_id=context.customer_id,
+                material_summaries=items,
+                master_data=context.master_data,
+            )
+
+        def fits(items: list[dict[str, Any]]) -> bool:
+            messages = self._build_messages(make_context(items))
+            # Grammar rejection may switch this same batch to a JSON hint.
+            # Reserve both request shapes before assigning any source text.
+            return all(self.request_fits(messages, use_format=use_format) for use_format in (True, False))
+
+        try:
+            batches = split_items_for_request(
+                context.material_summaries,
+                fits=fits,
+            )
+        except ValueError as exc:
+            raise ModelAdapterError(str(exc), category="context") from exc
+        return [make_context(batch) for batch in batches]
 
     def _build_messages(self, context: ModelContext) -> list[dict[str, str]]:
         payload = {
@@ -432,20 +520,53 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         content = message.get("content") if isinstance(message, dict) else None
         return content if isinstance(content, str) else None
 
-    def chat_structured(
-        self,
+    async def _post_chat(self, request_body: dict[str, Any]) -> Any:
+        """Keep callbacks on the calling thread; cancel the socket on exit."""
+        owns_deadline = self._request_deadline is None
+        if owns_deadline:
+            self._request_started = time.monotonic()
+            self._request_deadline = self._request_started + self._total_timeout_seconds
+        try:
+            self._report_activity("requesting")
+            async with httpx.AsyncClient(
+                base_url=self.base_url,
+                headers=self._headers(),
+                timeout=self._timeout,
+                follow_redirects=False,
+                trust_env=False,
+                transport=self._transport,
+            ) as client:
+                pending = asyncio.create_task(client.post(self._chat_endpoint, json=request_body))
+                try:
+                    while True:
+                        remaining = self._request_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise ModelAdapterError(
+                                f"{self._service_label}请求超过总耗时上限（{self._total_timeout_seconds:g}秒），"
+                                "已停止等待，请检查模型服务或减小单批材料",
+                                category="timeout",
+                            )
+                        done, _ = await asyncio.wait({pending}, timeout=min(1.0, remaining))
+                        self._report_activity("waiting")
+                        if done:
+                            response = pending.result()
+                            response.raise_for_status()
+                            return response.json()
+                finally:
+                    if not pending.done():
+                        pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+        finally:
+            if owns_deadline:
+                self._request_deadline = None
+                self._request_started = None
+
+    @staticmethod
+    def _prepare_request_messages(
         messages: list[dict[str, str]],
         *,
-        budget: int,
         use_format: bool,
-        validation_model: type = OllamaStructuredOutput,
-        generation_schema: dict[str, Any] | None = None,
-    ) -> tuple[Any, dict[str, Any]]:
-        """POST /api/chat and validate content against ``validation_model``.
-
-        Returns ``(parsed, body)`` so callers can attach usage metadata.
-        """
-
+    ) -> list[dict[str, str]]:
         request_messages = list(messages)
         if not use_format:
             hint = (
@@ -478,7 +599,20 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             last = dict(request_messages[-1])
             last["content"] = f"{last['content']}\n{hint}"
             request_messages[-1] = last
+        return request_messages
 
+    def chat_structured(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        budget: int,
+        use_format: bool,
+        validation_model: type = OllamaStructuredOutput,
+        generation_schema: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """POST a bounded request and validate it against ``validation_model``."""
+
+        request_messages = self._prepare_request_messages(messages, use_format=use_format)
         request_body = self._build_chat_request_body(
             request_messages,
             budget=budget,
@@ -486,11 +620,14 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
             generation_schema=generation_schema,
         )
 
+        if not self.request_fits(messages, budget=budget, generation_schema=generation_schema, use_format=use_format):
+            raise ModelAdapterError(
+                "完整请求（提示词、主数据、输出格式及回答预算）超过配置的模型上下文；请先分批分析",
+                category="context",
+            )
+
         try:
-            with self._client() as client:
-                response = client.post(self._chat_endpoint, json=request_body)
-                response.raise_for_status()
-                body = response.json()
+            body = asyncio.run(self._post_chat(request_body))
         except (
             httpx.RequestError,
             httpx.HTTPStatusError,
@@ -509,7 +646,7 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         try:
             structured = validation_model.model_validate_json(extracted)
         except (ValidationError, ValueError) as exc:
-            raise ModelAdapterError("Ollama返回内容不符合结构契约") from exc
+            raise ModelAdapterError(f"{self._service_label}返回内容不符合结构契约") from exc
 
         return structured, body
 
@@ -550,29 +687,30 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         budget = self._output_token_budget(prompt_text)
         errors: list[str] = []
 
-        transient_retried = False
-        while True:
-            try:
-                structured, body = self.chat_structured(
-                    messages, budget=budget, use_format=True
-                )
-                return self._result_from(structured, body, budget=budget)
-            except ModelAdapterError as exc:
-                errors.append(f"结构化生成：{exc}")
-                if self._is_transient_error(str(exc)) and not transient_retried:
-                    transient_retried = True
-                    continue
-                break
-
+        self._request_started = time.monotonic()
+        self._request_deadline = self._request_started + self._total_timeout_seconds
+        use_format = True
         try:
-            structured, body = self.chat_structured(
-                messages, budget=budget, use_format=False
-            )
-            return self._result_from(structured, body, budget=budget)
-        except ModelAdapterError as exc:
-            errors.append(f"回退生成：{exc}")
-
-        raise ModelAdapterError("意向抽取失败：" + "；".join(errors))
+            for attempt in (1, 2):
+                self._attempt = attempt
+                try:
+                    structured, body = self.chat_structured(
+                        messages, budget=budget, use_format=use_format
+                    )
+                    return self._result_from(structured, body, budget=budget)
+                except ModelAdapterError as exc:
+                    errors.append(f"第{attempt}次生成：{exc}")
+                    # Repeating a context/timeout/HTTP 4xx error cannot fix it.
+                    if attempt == 2 or exc.category in {"context", "timeout", "http"}:
+                        raise ModelAdapterError("意向抽取失败：" + "；".join(errors), category=exc.category) from exc
+                    if exc.category in {"grammar", "invalid_response"}:
+                        use_format = False
+                    self._report_activity("retrying")
+            raise AssertionError("unreachable")
+        finally:
+            self._request_deadline = None
+            self._request_started = None
+            self._attempt = 1
 
 
 class OpenAICompatibleModelAdapter(OllamaIntentModelAdapter):
@@ -596,7 +734,8 @@ class OpenAICompatibleModelAdapter(OllamaIntentModelAdapter):
         api_key: str | None = None,
         # LM Studio / vLLM on modest hardware often CPU-offload part of the
         # model, so a real extraction can legitimately take several minutes.
-        timeout_seconds: float = 900,
+        timeout_seconds: float = 480,
+        num_ctx: int | None = None,
         transport: httpx.BaseTransport | None = None,
     ):
         super().__init__(
@@ -605,6 +744,7 @@ class OpenAICompatibleModelAdapter(OllamaIntentModelAdapter):
             api_key=api_key,
             timeout_seconds=timeout_seconds,
             thinking_enabled=False,
+            num_ctx=num_ctx,
             transport=transport,
         )
 

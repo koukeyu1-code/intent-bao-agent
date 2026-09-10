@@ -469,6 +469,7 @@ class GoldenIntentRecord(StrictRequestModel):
 
 class EvalRunRequest(StrictRequestModel):
     package_id: str = Field(min_length=1, max_length=64)
+    analysis_run_id: str | None = Field(default=None, min_length=1, max_length=64)
     golden: list[GoldenIntentRecord] = Field(
         min_length=1, max_length=500
     )

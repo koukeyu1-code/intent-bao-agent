@@ -51,6 +51,9 @@ export interface ProcessingTask {
   id: string;
   packageId: string;
   analysisRunId: string;
+  analysisRunCreatedAt?: string;
+  analysisRunStatus?: string;
+  createdAt?: string;
   stage: string;
   stageOrder: number;
   status: "待处理" | "处理中" | "已完成" | "不适用" | "已取消" | "处理失败";
@@ -102,6 +105,7 @@ export type MeetingStatus =
   | "待身份校验"
   | "待意向确认"
   | "已确认"
+  | "已取消"
   | "处理失败";
 
 export type IntentStatus =

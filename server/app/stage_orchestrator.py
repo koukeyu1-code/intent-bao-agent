@@ -240,9 +240,20 @@ def mark_stale_analysis_runs_failed(database: Database) -> int:
             ).all()
         )
         for run in stale:
+            finished_at = models_module.utcnow()
             run.status = "处理失败"
             run.error_message = "服务重启导致分析中断，请点击重试重新分析"
-            run.finished_at = run.finished_at or models_module.utcnow()
+            run.finished_at = run.finished_at or finished_at
+            open_tasks = session.scalars(
+                select(models_module.ProcessingTask).where(
+                    models_module.ProcessingTask.analysis_run_id == run.id,
+                    models_module.ProcessingTask.status.in_(("待处理", "处理中")),
+                )
+            ).all()
+            for task in open_tasks:
+                task.status = "处理失败"
+                task.error_message = run.error_message
+                task.finished_at = task.finished_at or finished_at
             package = session.get(models_module.MeetingPackage, run.package_id)
             if package is not None and package.status == "分析中":
                 package.status = "处理失败"

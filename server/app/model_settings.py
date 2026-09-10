@@ -5,7 +5,7 @@ import os
 import re
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -133,7 +133,7 @@ class RuntimeModelSettings:
     asr: AsrRuntimeSettings = field(
         default_factory=lambda: AsrRuntimeSettings(
             provider="mock",
-            base_url="http://127.0.0.1:8081",
+            base_url="http://127.0.0.1:8099",
             model_name="",
         )
     )
@@ -229,7 +229,7 @@ class ModelSettingsStore:
     @staticmethod
     def _load_asr(raw: Any) -> AsrRuntimeSettings:
         provider = "mock"
-        base_url = "http://127.0.0.1:8081"
+        base_url = "http://127.0.0.1:8099"
         model_name = ""
         if isinstance(raw, dict):
             provider = str(raw.get("provider", provider)).strip().lower()
@@ -249,6 +249,12 @@ class ModelSettingsStore:
 
     def snapshot(self) -> RuntimeModelSettings:
         with self._lock:
+            return self._settings
+
+    def clear_api_key(self) -> RuntimeModelSettings:
+        """Clear only the in-memory credential under the settings lock."""
+        with self._lock:
+            self._settings = replace(self._settings, api_key=None)
             return self._settings
 
     def public_dict(

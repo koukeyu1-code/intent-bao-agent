@@ -815,9 +815,12 @@ def test_business_queries_only_expose_legacy_or_successful_run_observations(
     assert evaluation.status_code == 200, evaluation.text
     report = evaluation.json()["evaluation"]
     assert report["total"] == 4
-    assert report["correct"] == 2
-    assert report["traceable"] == 2
-    assert report["error_count"] == 2
+    # Evaluation selects one completed run; unbatched legacy observations are
+    # still visible in business views but are not mixed into this batch.
+    assert report["analysis_run_id"] == "run-visibility-success"
+    assert report["correct"] == 1
+    assert report["traceable"] == 1
+    assert report["error_count"] == 3
 
 
 def test_env_check_endpoint(tmp_path: Path) -> None:
@@ -927,6 +930,48 @@ def test_analysis_artifacts_endpoint(tmp_path: Path) -> None:
     assert artifacts.status_code == 200
     assert "transcripts" in artifacts.json()
     assert "alignments" in artifacts.json()
+
+
+def test_partial_artifacts_are_hidden_until_run_succeeds(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    package = _create_package_with_minutes(client, "失败产物不发布")
+    with client.app.state.database.session() as session:
+        run = m.AnalysisRun(
+            package_id=package["id"], status="运行中", started_at=m.utcnow(),
+        )
+        session.add(run)
+        session.flush()
+        run_id = run.id
+        session.add(m.TranscriptSegment(
+            analysis_run_id=run_id, package_id=package["id"], order_index=0,
+            start_ms=0, end_ms=1000, text="第一个文件已成功，但全包尚未完成。",
+        ))
+        session.commit()
+
+    for status in ("运行中", "处理失败", "已取消", "已完成"):
+        with client.app.state.database.session() as session:
+            run = session.get(m.AnalysisRun, run_id)
+            run.status = status
+            run.error_message = "第二个文件转写失败" if status == "处理失败" else None
+            session.commit()
+        response = client.get(f"/api/analysis-runs/{run_id}/artifacts")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["analysis_run_id"] == run_id
+        assert body["status"] == status
+        assert body["artifacts_available"] is (status == "已完成")
+        assert len(body["transcripts"]) == (1 if status == "已完成" else 0)
+        if status == "处理失败":
+            assert body["error_message"] == "第二个文件转写失败"
+        if status != "已完成":
+            assert all(body[key] == [] for key in ("pages", "frames", "alignments"))
+
+    with client.app.state.database.session() as session:
+        session.get(m.AnalysisRun, run_id).cancel_requested_at = m.utcnow()
+        session.commit()
+    body = client.get(f"/api/analysis-runs/{run_id}/artifacts").json()
+    assert body["artifacts_available"] is False
+    assert body["transcripts"] == []
 
 
 def test_evaluation_module_marks_unknown_misjudgment(tmp_path: Path) -> None:

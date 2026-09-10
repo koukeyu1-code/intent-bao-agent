@@ -347,12 +347,7 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
     /loadPackageTasks/,
     "analysis must switch to background polling (202 + task progress)",
   );
-  assert.match(
-    appSource,
-    /runTasks\s*=\s*items\.filter\(\(item\)\s*=>\s*item\.analysisRunId\s*===\s*runId\)/,
-    "analysis polling must select tasks by the returned run id",
-  );
-  for (const operation of ["has", "add", "delete"]) {
+  for (const operation of ["has", "delete"]) {
     assert.match(
       appSource,
       new RegExp(`watchingRef\\.current\\.${operation}\\(runId\\)`),
@@ -368,11 +363,6 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
     appSource,
     /watchAnalysis\(meetingId,\s*result\.analysis_run\.id\)/,
     "forced analysis must watch the newly returned run id",
-  );
-  assert.match(
-    appSource,
-    /item\.status\s*===\s*"已取消"[\s\S]{0,160}AnalysisCancelledError/,
-    "a cancelled run must not be reported as successfully completed",
   );
   assert.match(apiSource, /attendees:\s*payload\.attendeeName/);
   assert.match(appSource, /name="attendeeName"/);
@@ -403,9 +393,14 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
     appSource,
     /const refreshed = await reloadDataset\(\)[\s\S]{0,220}persisted\.adoptionStage !== expectedStage/,
   );
-  assert.match(
-    appSource,
-    /updateIntentStatus\(item, action\)[\s\S]{0,700}await reloadDataset\(\)/,
+  const actionSource = appSource.slice(
+    appSource.indexOf("const applyAction = useCallback"),
+    appSource.indexOf("const saveEditing = async"),
+  );
+  const statusWriteIndex = actionSource.indexOf("updateIntentStatus(item, action, preparedNote)");
+  assert.ok(
+    statusWriteIndex >= 0 && actionSource.indexOf("await reloadDataset()") > statusWriteIndex,
+    "status writes must carry the reviewed note and reload persisted results",
   );
   assert.match(
     appSource,

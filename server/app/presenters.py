@@ -5,7 +5,7 @@ from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from . import models as m
 from .domain import ATTITUDE_LABELS, adoption_status_key, formal_status_key
@@ -15,6 +15,7 @@ from .query_visibility import (
     visible_speaker_clause,
 )
 from .taxonomy_service import intent_path
+from .services import ai_original_snapshot
 
 
 def iso(value: date | datetime | None) -> str | None:
@@ -66,21 +67,7 @@ def public_platform_draft(
 
 
 def _ai_original(observation: m.RawIntentObservation) -> dict[str, Any]:
-    if observation.ai_snapshot:
-        return dict(observation.ai_snapshot)
-    return {
-        "attitude_level": observation.suggested_attitude,
-        "adoption_stage": observation.suggested_adoption_stage,
-        "support_reason": observation.support_reason,
-        "resistance_reason": observation.resistance_reason,
-        "bottlenecks": list(observation.bottlenecks or []),
-        "decision_influence": observation.decision_influence,
-        "confidence": observation.confidence,
-        "analysis_run_id": observation.analysis_run_id,
-        "model_name": observation.model_name,
-        "prompt_version": observation.prompt_version,
-        "rule_version": observation.rule_version,
-    }
+    return ai_original_snapshot(observation)
 
 
 def observation_conflicts(
@@ -324,10 +311,15 @@ def public_material(item: m.MaterialFile) -> dict[str, Any]:
 
 
 def public_task(item: m.ProcessingTask) -> dict[str, Any]:
+    session = object_session(item)
+    run = session.get(m.AnalysisRun, item.analysis_run_id) if session else None
     return {
         "id": item.id,
         "package_id": item.package_id,
         "analysis_run_id": item.analysis_run_id,
+        "analysis_run_created_at": iso(run.created_at) if run else None,
+        "analysis_run_status": run.status if run else None,
+        "created_at": iso(item.created_at),
         "stage": item.stage,
         "stage_order": item.stage_order,
         "status": item.status,
@@ -860,11 +852,21 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
                 visible_observation_clause(),
             )
         ).all()
-        tasks = session.scalars(
-            select(m.ProcessingTask).where(
-                m.ProcessingTask.package_id == package.id
-            )
-        ).all()
+        latest_run = session.scalar(
+            select(m.AnalysisRun)
+            .where(m.AnalysisRun.package_id == package.id)
+            .order_by(m.AnalysisRun.created_at.desc(), m.AnalysisRun.id.desc())
+            .limit(1)
+        )
+        tasks = (
+            session.scalars(
+                select(m.ProcessingTask).where(
+                    m.ProcessingTask.analysis_run_id == latest_run.id
+                )
+            ).all()
+            if latest_run
+            else []
+        )
         technologies = sorted(
             {
                 maps["technologies"][item.technology_id].name
@@ -887,7 +889,12 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
             "人工纪要": "人工纪要",
         }
         progress = (
-            round(sum(task.progress for task in tasks) / len(tasks))
+            round(
+                sum(
+                    100 if task.status in {"已完成", "不适用"} else task.progress
+                    for task in tasks
+                ) / len(tasks)
+            )
             if tasks
             else (100 if package.status == "已确认" else 0)
         )
@@ -901,7 +908,6 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
         )
         status_map = {
             "待补资料／待标注": "待补资料",
-            "已取消": "处理失败",
         }
         meetings.append(
             {
@@ -936,7 +942,7 @@ def frontend_compat_dataset(session: Session) -> dict[str, Any]:
                 "progress": progress,
                 "currentStep": (
                     active_task.stage
-                    if active_task
+                    if active_task and package.status != "已取消"
                     else (
                         "已形成正式状态版本"
                         if package.status == "已确认"

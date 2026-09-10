@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from .model_adapters import (
@@ -121,6 +122,38 @@ class OllamaLlmStageAdapter(LlmStageAdapter):
             transport=transport,
         )
         self.model_name = model_name
+
+    def set_runtime_hooks(
+        self,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._chat.set_runtime_hooks(check_cancelled=check_cancelled, on_progress=on_progress)
+
+    def alignment_request_fits(
+        self,
+        *,
+        segments: list[dict[str, Any]],
+        pages: list[dict[str, Any]],
+        frames: list[dict[str, Any]],
+    ) -> bool:
+        return self._chat.request_fits(
+            self._build_alignment_messages(segments=segments, pages=pages, frames=frames),
+            generation_schema=_ALIGNMENT_GENERATION_SCHEMA,
+        )
+
+    def identity_request_fits(
+        self,
+        *,
+        segments: list[dict[str, Any]],
+        attendees: list[dict[str, Any]],
+        master_data: dict[str, list[dict[str, Any]]],
+    ) -> bool:
+        return self._chat.request_fits(
+            self._build_identity_messages(segments=segments, attendees=attendees, master_data=master_data),
+            generation_schema=_IDENTITY_GENERATION_SCHEMA,
+        )
 
     @staticmethod
     def _build_identity_messages(

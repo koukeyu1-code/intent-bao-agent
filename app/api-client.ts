@@ -230,6 +230,15 @@ export const saveModelSettings = async (
     ),
   );
 
+export const clearModelApiKey = async (): Promise<ModelSettings> =>
+  normalizeModelSettings(
+    await request<ModelSettingsApiResponse>(
+      "/model-settings/api-key",
+      { method: "DELETE" },
+      15_000,
+    ),
+  );
+
 export const testModelConnection = async (
   input: ModelSettingsInput,
 ): Promise<ModelConnectionResult> => {
@@ -415,6 +424,7 @@ export const loadBootstrapDataset = async (): Promise<MvpDataset> => {
 export const updateIntentStatus = async (
   intent: IntentObservation,
   action: "confirm" | "return" | "unknown",
+  reviewNote?: string,
 ) => {
   if (action === "return") {
     return request(`/intent-observations/${intent.id}`, {
@@ -436,7 +446,7 @@ export const updateIntentStatus = async (
     `/intent-observations/${intent.id}/confirm`,
     {
       method: "POST",
-      body: JSON.stringify(buildIntentConfirmPayload(intent, action)),
+      body: JSON.stringify(buildIntentConfirmPayload(intent, action, reviewNote)),
     },
   );
   if (action === "confirm") {
@@ -492,6 +502,7 @@ export const updateIntentReviewDraft = async (
       suggested_attitude: intent.attitude,
       suggested_adoption_stage: intent.adoptionStage,
       support_reason: intent.supportReason,
+      highlight_spec: intent.highlightSpec?.trim() || null,
       bottlenecks:
         intent.blocker && intent.blocker !== "暂无明确卡点"
           ? [intent.blocker]
@@ -622,6 +633,7 @@ export const uploadMeetingMaterial = async (
 
 export interface AnalyzeMeetingResult {
   task_id: string;
+  cancelled_runs?: number;
   analysis_run: {
     id: string;
     package_id: string;
@@ -649,10 +661,57 @@ export const analyzeMeetingPackage = async (
     30_000,
   );
 
+export const cancelMeetingPackageAnalysis = async (
+  meetingId: string,
+): Promise<{ package_id: string; cancelled_runs: number; message: string }> =>
+  request(`/meeting-packages/${meetingId}/analyze/cancel`, {
+    method: "POST",
+  });
+
+type ProcessingTaskApiResponse = Partial<ProcessingTask> & {
+  id: string;
+  package_id?: string;
+  analysis_run_id?: string;
+  analysis_run_created_at?: string;
+  analysis_run_status?: string;
+  created_at?: string;
+  stage_order?: number;
+  attempt_count?: number;
+  started_at?: string;
+  finished_at?: string;
+  error_message?: string;
+  updated_at?: string;
+};
+
 export const loadPackageTasks = async (
   meetingId: string,
-): Promise<{ items: ProcessingTask[]; total: number }> =>
-  request(`/meeting-packages/${meetingId}/tasks`, undefined, 10_000);
+): Promise<{ items: ProcessingTask[]; total: number }> => {
+  const response = await request<{ items: ProcessingTaskApiResponse[]; total: number }>(
+    `/meeting-packages/${meetingId}/tasks`, undefined, 10_000,
+  );
+  return {
+    total: response.total,
+    items: response.items.map((item) => ({
+      id: item.id,
+      packageId: item.package_id ?? item.packageId ?? meetingId,
+      analysisRunId: item.analysis_run_id ?? item.analysisRunId ?? "",
+      analysisRunCreatedAt: item.analysis_run_created_at ?? item.analysisRunCreatedAt,
+      analysisRunStatus: item.analysis_run_status ?? item.analysisRunStatus,
+      createdAt: item.created_at ?? item.createdAt,
+      stage: item.stage ?? "未知阶段",
+      stageOrder: item.stage_order ?? item.stageOrder ?? 0,
+      status: item.status ?? "待处理",
+      progress: item.progress ?? 0,
+      attemptCount: item.attempt_count ?? item.attemptCount ?? 0,
+      startedAt: item.started_at ?? item.startedAt,
+      finishedAt: item.finished_at ?? item.finishedAt,
+      errorMessage: item.error_message ?? item.errorMessage,
+      updatedAt: item.updated_at ?? item.updatedAt ?? "",
+      version: item.version ?? 1,
+      result: item.result,
+    })),
+  };
+};
 
 export const exportMeetingPackage = async (
   meetingId: string,
@@ -736,13 +795,16 @@ export interface GoldenIntentRecord {
 
 export interface EvaluationReport {
   package_id: string;
+  analysis_run_id: string | null;
   generated_at: string;
   total: number;
   correct: number;
+  missed: number;
   structured_accuracy: number | null;
   traceable: number;
   traceable_rate: number | null;
   unknown_total: number;
+  unknown_missed: number;
   unknown_misjudged: number;
   unknown_misjudge_rate: number | null;
   field_accuracy: {
@@ -759,12 +821,17 @@ export interface EvaluationReport {
 export const runEvaluation = async (
   packageId: string,
   golden: GoldenIntentRecord[],
+  analysisRunId?: string,
 ): Promise<{ evaluation: EvaluationReport; message: string }> =>
   request(
     "/eval/runs",
     {
       method: "POST",
-      body: JSON.stringify({ package_id: packageId, golden }),
+      body: JSON.stringify({
+        package_id: packageId,
+        golden,
+        ...(analysisRunId ? { analysis_run_id: analysisRunId } : {}),
+      }),
     },
     60_000,
   );

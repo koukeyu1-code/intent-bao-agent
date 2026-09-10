@@ -3575,6 +3575,28 @@ button.function-attitude-item:not(:disabled):hover {
   margin: 4px 0 10px;
 }
 
+.stage-progress-item {
+  padding: 8px 0;
+  border-bottom: 1px solid #eaecf0;
+}
+
+.analysis-status-meta {
+  margin: 4px 0;
+  color: #667085;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.analysis-stage-error {
+  margin: 6px 0;
+  padding: 8px;
+  color: #b42318;
+  background: #fef3f2;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .stage-progress-row {
   display: flex;
   align-items: center;

@@ -179,6 +179,12 @@ def test_ollama_text_analysis_creates_only_traceable_ai_draft(
         return original_factory(name, **kwargs)
 
     monkeypatch.setattr(main_module, "get_model_adapter", adapter_factory)
+    # This regression uses deterministic intent output; stage calls must be
+    # equally isolated instead of contacting a real local Ollama instance.
+    from types import SimpleNamespace
+    monkeypatch.setattr(main_module, "get_stage_adapter", lambda *_a, **_kw: SimpleNamespace(
+        recommend_identities=lambda **_kw: [], align_materials=lambda **_kw: [],
+    ))
     configured = test_client.put(
         "/api/model-settings",
         json={

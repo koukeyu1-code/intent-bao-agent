@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +36,11 @@ class AsrResult:
 
 class AsrError(RuntimeError):
     """Sanitized ASR provider error safe to persist or return to a local UI."""
+
+    def __init__(self, message: str, *, category: str = "invalid_response", retryable: bool = False):
+        super().__init__(message)
+        self.category = category
+        self.retryable = retryable
 
 
 _SPECIAL_TOKEN_PATTERN = r"<\|[^>]*\|>"
@@ -132,7 +140,7 @@ class LlamaCppAsrAdapter(AsrAdapter):
         *,
         base_url: str,
         model_name: str,
-        timeout_seconds: float = 1800,
+        timeout_seconds: float = 180,
         transport: httpx.BaseTransport | None = None,
     ):
         self.base_url = (base_url or "").rstrip("/")
@@ -142,6 +150,68 @@ class LlamaCppAsrAdapter(AsrAdapter):
             connect=min(timeout_seconds, 10),
         )
         self._transport = transport
+        self._total_timeout_seconds = max(0.01, timeout_seconds)
+        self._check_cancelled: Callable[[], None] | None = None
+        self._on_progress: Callable[[dict[str, Any]], None] | None = None
+
+    def set_runtime_hooks(
+        self,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._check_cancelled = check_cancelled
+        self._on_progress = on_progress
+
+    async def _post_transcription(
+        self, audio_path: Path, *, language: str | None, hotwords: list[str]
+    ) -> Any:
+        started = time.monotonic()
+        deadline = started + self._total_timeout_seconds
+
+        def report_activity(phase: str) -> None:
+            if self._check_cancelled:
+                self._check_cancelled()
+            if self._on_progress:
+                self._on_progress({
+                    "elapsed_seconds": round(time.monotonic() - started, 1),
+                    "attempt": 1,
+                    "phase": phase,
+                    "timeout_seconds": self._total_timeout_seconds,
+                })
+
+        report_activity("requesting")
+        with audio_path.open("rb") as audio_file:
+            async with httpx.AsyncClient(
+                base_url=self.base_url, timeout=self._timeout,
+                trust_env=False, transport=self._transport,
+            ) as client:
+                pending = asyncio.create_task(client.post(
+                    "/v1/audio/transcriptions",
+                    files={"file": (audio_path.name, audio_file, "audio/wav")},
+                    data={
+                        "model": self.model_name, "language": language or "zh",
+                        "hotwords": ",".join(hotwords), "response_format": "json",
+                    },
+                ))
+                try:
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise AsrError(
+                                f"ASR转写超过总耗时上限（{self._total_timeout_seconds:g}秒），已停止等待",
+                                category="timeout", retryable=True,
+                            )
+                        done, _ = await asyncio.wait({pending}, timeout=min(1.0, remaining))
+                        report_activity("waiting")
+                        if done:
+                            response = pending.result()
+                            response.raise_for_status()
+                            return response.json()
+                finally:
+                    if not pending.done():
+                        pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
 
     def _client(self) -> httpx.Client:
         return httpx.Client(
@@ -154,15 +224,24 @@ class LlamaCppAsrAdapter(AsrAdapter):
     @staticmethod
     def _safe_error(exc: Exception) -> AsrError:
         if isinstance(exc, httpx.TimeoutException):
-            return AsrError("ASR转写超时，请确认模型服务已启动")
+            return AsrError("ASR转写超时，请确认模型服务已启动", category="timeout", retryable=True)
         if isinstance(exc, httpx.ConnectError):
-            return AsrError("无法连接本地ASR服务，请检查地址和端口")
+            return AsrError("无法连接本地ASR服务，请检查地址和端口", category="connection", retryable=True)
         if isinstance(exc, httpx.HTTPStatusError):
+            # Only inspect provider details to categorize them; never persist
+            # the raw response, which can contain transcript or file contents.
+            details = exc.response.text[:2000].lower()
+            if any(marker in details for marker in ("audio too short", "audio is too short", "input is too short", "n_frames must", "zero-length", "empty audio")):
+                return AsrError("ASR输入音频过短或为空，请扩展有效音频窗口后重试", category="audio_too_short", retryable=True)
             return AsrError(
-                f"ASR服务返回HTTP {exc.response.status_code}"
+                f"ASR服务返回HTTP {exc.response.status_code}",
+                category="http",
+                retryable=exc.response.status_code >= 500,
             )
         if isinstance(exc, httpx.RequestError):
-            return AsrError("ASR请求失败，请检查本地服务状态")
+            return AsrError("ASR请求失败，请检查本地服务状态", category="connection", retryable=True)
+        if isinstance(exc, OSError):
+            return AsrError("ASR音频文件无法读取，请检查切片结果", category="file_error")
         return AsrError("ASR响应格式无效")
 
     def transcribe(
@@ -179,30 +258,13 @@ class LlamaCppAsrAdapter(AsrAdapter):
             duration_ms,
         )
         try:
-            with self._client() as client:
-                response = client.post(
-                    "/v1/audio/transcriptions",
-                    files={
-                        "file": (
-                            audio_path.name,
-                            audio_path.open("rb"),
-                            "audio/wav",
-                        )
-                    },
-                    data={
-                        "model": self.model_name,
-                        "language": language or "zh",
-                        "hotwords": ",".join(hotwords),
-                        "response_format": "json",
-                    },
-                )
-                response.raise_for_status()
-                body = response.json()
+            body = asyncio.run(self._post_transcription(audio_path, language=language, hotwords=hotwords))
         except (
             httpx.RequestError,
             httpx.HTTPStatusError,
             json.JSONDecodeError,
             ValueError,
+            OSError,
         ) as exc:
             raise self._safe_error(exc) from exc
         finally:
@@ -212,13 +274,16 @@ class LlamaCppAsrAdapter(AsrAdapter):
             )
 
         segments: list[AsrSegment] = []
+        if not isinstance(body, dict) or not ({"text", "segments"} & body.keys()):
+            raise AsrError("ASR响应格式无效", category="invalid_response")
         if isinstance(body, dict):
             raw_segments = body.get("segments")
             if isinstance(raw_segments, list):
                 for raw in raw_segments:
                     if not isinstance(raw, dict):
                         continue
-                    text = _clean_transcript_text(str(raw.get("text") or ""))
+                    raw_text = raw.get("text")
+                    text = _clean_transcript_text(raw_text if isinstance(raw_text, str) else "")
                     if not text:
                         continue
                     try:
@@ -249,10 +314,11 @@ class LlamaCppAsrAdapter(AsrAdapter):
                             ),
                         )
                     )
-            else:
+            if not segments:
                 # llama.cpp server returns a single transcript text:
                 # {"type": "transcript.text.done", "text": "...", "usage": {...}}
-                text = _clean_transcript_text(str(body.get("text") or ""))
+                raw_text = body.get("text")
+                text = _clean_transcript_text(raw_text if isinstance(raw_text, str) else "")
                 if text:
                     segments.append(
                         AsrSegment(
@@ -270,7 +336,7 @@ class LlamaCppAsrAdapter(AsrAdapter):
                 audio_path.name,
                 duration_ms,
             )
-            raise AsrError("ASR未返回任何可用的转写片段")
+            raise AsrError("ASR未返回任何可用的转写片段", category="empty_response", retryable=True)
         logger.info(
             "LlamaCpp ASR 成功 file=%s segments=%s",
             audio_path.name,

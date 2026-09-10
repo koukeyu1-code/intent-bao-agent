@@ -15,18 +15,19 @@ from typing import Any
 from xml.etree import ElementTree
 
 from fastapi import UploadFile
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from . import models as m
 from .config import Settings
-from .diarization import DiarizationUnavailable, get_diarizer
+from .diarization import DiarizationCancelled, DiarizationUnavailable, get_diarizer
 from .domain import (
     TERMINAL_OBSERVATION_STATUSES,
     adoption_status_key,
     formal_status_key,
 )
-from .audio_adapters import AsrSegment, get_asr_adapter
+from .audio_adapters import AsrAdapter, AsrSegment, get_asr_adapter
+from .asr_checkpoints import AsrCheckpoints
 from .media_processing import (
     extract_audio_track,
     extract_key_frames,
@@ -38,7 +39,11 @@ from .media_processing import (
 )
 from .model_adapters import IntentModelAdapter, ModelContext, get_model_adapter
 from .stage_adapters import get_stage_adapter
+from .request_budget import estimate_tokens, split_items_for_request
 from .schemas import IntentConfirmRequest, SpeakerConfirmRequest
+from .query_visibility import (
+    get_visible_speaker, visible_observation_clause, visible_split_provenance_clause,
+)
 from .seed import TASK_STAGES
 from .taxonomy_service import (
     capture_path_snapshot,
@@ -252,6 +257,25 @@ def request_analysis_run_cancellation(
     return True
 
 
+def cancel_active_analysis_runs(session: Session, package_id: str) -> int:
+    """Request cancellation for every queued/running run of a package.
+
+    Used by manual stop actions and by force re-runs so a new run never
+    waits behind a stale one in the serial worker queue.
+    """
+    runs = session.scalars(
+        select(m.AnalysisRun).where(
+            m.AnalysisRun.package_id == package_id,
+            m.AnalysisRun.status.in_(("排队中", "运行中")),
+        )
+    ).all()
+    cancelled = 0
+    for run in runs:
+        if request_analysis_run_cancellation(session, run):
+            cancelled += 1
+    return cancelled
+
+
 def finalize_analysis_run_cancellation(
     session: Session, run: m.AnalysisRun
 ) -> m.AnalysisRun | None:
@@ -307,29 +331,12 @@ def _estimate_material_tokens(items: list[dict[str, Any]]) -> float:
 def _split_model_materials_for_analysis(
     model_materials: list[dict[str, Any]],
 ) -> list[list[dict[str, Any]]]:
-    """Split long materials into multiple context-sized analysis batches.
-
-    A 90-minute meeting produces far more transcript than fits one LLM call;
-    greedily grouping the ordered material items keeps each batch inside the
-    model context while still analysing every transcript segment.
-    """
-    num_ctx = _llm_num_ctx()
-    # Reserve room for the system prompt, JSON envelope and model output.
-    token_budget = max(6000, int(num_ctx * 0.85) - 3000)
-    batches: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    current_tokens = 0.0
-    for item in model_materials:
-        estimated = max(_estimate_material_tokens([item]), 1.0)
-        if current and current_tokens + estimated > token_budget:
-            batches.append(current)
-            current = []
-            current_tokens = 0.0
-        current.append(item)
-        current_tokens += estimated
-    if current:
-        batches.append(current)
-    return batches or [[]]
+    """Fallback for custom adapters; production adapters budget their exact prompt."""
+    token_budget = max(1, int(_llm_num_ctx() * 0.85) - 5_000)
+    return split_items_for_request(
+        model_materials,
+        fits=lambda items: estimate_tokens(json.dumps(items, ensure_ascii=False)) <= token_budget,
+    )
 
 _MODEL_TEXT_READ_LIMIT_BYTES = 512 * 1024
 
@@ -519,12 +526,11 @@ def _build_model_materials(
 ) -> tuple[list[dict[str, Any]], set[str]]:
     materials: list[dict[str, Any]] = []
     readable_ids: set[str] = set()
-    per_file_limit = 12_000
     for item in files:
         path = (settings.data_dir / item.relative_path).resolve()
         if settings.data_dir.resolve() not in path.parents or not path.is_file():
             raise DomainError(404, f"材料文件不存在：{item.safe_name}")
-        content = _read_model_text(path)
+        content = _read_model_text(path, max_text_bytes=max(_MODEL_TEXT_READ_LIMIT_BYTES, path.stat().st_size))
         summary: dict[str, Any] = {
             "id": item.id,
             "type": item.material_type,
@@ -534,13 +540,12 @@ def _build_model_materials(
             "source_material_name": item.safe_name,
         }
         if content is not None and content.strip():
-            clipped = content.strip()[:per_file_limit]
-            summary["content"] = clipped
+            summary["content"] = content.strip()
             readable_ids.add(item.id)
         materials.append(summary)
 
     if package.notes and package.notes.strip():
-        note = package.notes.strip()[:per_file_limit]
+        note = package.notes.strip()
         materials.append(
             {
                 "id": None,
@@ -640,7 +645,7 @@ def _locate_exact_quote(
             elif material.get("frame_no") is not None:
                 priority = 1
             candidates.append(
-                (priority, material, content.count("\n", 0, offset) + 1)
+                (priority, material, content.count("\n", 0, offset) + 1 + int(material.get("_line_offset", 0)))
             )
     if not candidates:
         return None
@@ -764,7 +769,9 @@ def _update_task(
     if task is None:
         return
     task.status = status
-    if progress is not None:
+    if status in {"已完成", "不适用"}:
+        task.progress = 100
+    elif progress is not None:
         task.progress = progress
     if result_json is not None:
         task.result_json = json.dumps(result_json, ensure_ascii=False)
@@ -810,6 +817,8 @@ def _parse_document_stage(
     run: m.AnalysisRun,
     package: m.MeetingPackage,
     files: list[m.MaterialFile],
+    *,
+    parsed_pages: list[m.PdfPageText] | None = None,
 ) -> tuple[set[str], list[dict], list[m.TranscriptSegment]]:
     """Extract PDF page text and subtitle segments into derived tables."""
 
@@ -837,6 +846,8 @@ def _parse_document_stage(
                     extracted_by="pymupdf",
                 )
                 session.add(page_row)
+                if parsed_pages is not None:
+                    parsed_pages.append(page_row)
                 if page.text.strip():
                     readable.add(item.id)
                     extra_materials.append(
@@ -890,15 +901,17 @@ def _extend_materials_with_derived(
         if item.get("source_material_file_id") or item.get("id")
     }
     # Keep every derived item so nothing is dropped before the LLM is called.
-    # Total size is bounded later by _split_model_materials_for_analysis into
-    # several context-sized batches; each item is still capped so a single
-    # enormous segment/page cannot overflow one batch by itself.
-    item_limit = 6000
+    # Total size and individual long items are bounded by request splitting.
+    parsed_page_keys = {(page.material_file_id, page.page_no) for page in pages}
     for item in extra_materials:
+        if item.get("type") == "PDF页面" and (
+            item.get("source_material_file_id"), item.get("page_no")
+        ) in parsed_page_keys:
+            continue
         content = str(item.get("content") or "")
         if not content:
             continue
-        clipped = content[:item_limit]
+        clipped = content
         combined.append(
             {
                 **item,
@@ -908,10 +921,12 @@ def _extend_materials_with_derived(
         )
 
     for transcript in transcripts:
+        if not transcript.text.strip():
+            continue
         content = (
             f"[{_fmt_ms(transcript.start_ms)}-{_fmt_ms(transcript.end_ms)}] "
             f"{transcript.text}"
-        )[:item_limit]
+        )
         combined.append(
             {
                 "id": transcript.id,
@@ -938,10 +953,10 @@ def _extend_materials_with_derived(
         )
 
     for page in pages:
-        content = page.text[:item_limit]
+        content = page.text
         if not content:
             continue
-        clipped = content[:item_limit]
+        clipped = content
         combined.append(
             {
                 "id": page.id,
@@ -971,101 +986,122 @@ def _extend_materials_with_derived(
 
 
 def _run_alignment_stage(
-    session: Session,
-    stage_adapter,
-    run: m.AnalysisRun,
-    package: m.MeetingPackage,
-    transcripts: list[m.TranscriptSegment],
-    pages: list[m.PdfPageText],
+    session: Session, stage_adapter, run: m.AnalysisRun, package: m.MeetingPackage,
+    transcripts: list[m.TranscriptSegment], pages: list[m.PdfPageText],
     frames: list[m.KeyFrame],
 ) -> None:
-    if stage_adapter is None or not transcripts or not (pages or frames):
-        _update_task(
-            session,
-            run,
-            "资料对齐",
-            status="已完成",
-            result_json={"alignments": 0, "reason": "无可用片段或页面"},
-        )
-        return
-    segment_payload = [
-        {
-            "id": item.id,
-            "start_ms": item.start_ms,
-            "end_ms": item.end_ms,
-            "speaker": item.speaker_label,
-            "text": item.text,
-        }
-        for item in transcripts
-    ]
-    page_payload = [
-        {
-            "id": item.id,
-            "page_no": item.page_no,
-            "text": item.text[:2000],
-        }
-        for item in pages
-        if item.text.strip()
-    ]
-    frame_payload = [
-        {
-            "id": item.id,
-            "time_ms": item.time_ms,
-            "text": item.ocr_text or "",
-        }
-        for item in frames
-    ]
-    try:
-        alignments = stage_adapter.align_materials(
-            segments=segment_payload,
-            pages=page_payload,
-            frames=frame_payload,
-        )
-    except Exception as exc:
-        _update_task(
-            session,
-            run,
-            "资料对齐",
-            status="已完成",
-            result_json={
-                "alignments": 0,
-                "error": f"对齐调用失败：{exc}",
-            },
-        )
+    segment_payload = [{"id": row.id, "start_ms": row.start_ms,
+                        "end_ms": row.end_ms, "speaker": row.speaker_label,
+                        "text": row.text, "material_file_id": row.material_file_id}
+                       for row in transcripts if row.text.strip()]
+    targets = ([{"id": row.id, "page_no": row.page_no, "text": row.text,
+                 "kind": "pages"} for row in pages if row.text.strip()]
+               + [{"id": row.id, "time_ms": row.time_ms, "text": row.ocr_text,
+                   "kind": "frames"} for row in frames if (row.ocr_text or "").strip()])
+    if stage_adapter is None or not segment_payload or not targets:
+        _update_task(session, run, "资料对齐", status="不适用",
+                     result_json={"alignments": 0, "reason": "无可用非空片段或页面"})
         return
 
-    valid_ids = {
-        item.id for item in transcripts
-    }
-    page_ids = {item.id for item in pages}
-    frame_ids = {item.id for item in frames}
+    def payload(segment_batch, target_batch):
+        return {"segments": segment_batch,
+                "pages": [{k: v for k, v in row.items() if k != "kind"}
+                          for row in target_batch if row["kind"] == "pages"],
+                "frames": [{k: v for k, v in row.items() if k != "kind"}
+                           for row in target_batch if row["kind"] == "frames"]}
+
+    def fits(segment_batch, target_batch):
+        request = payload(segment_batch, target_batch)
+        if hasattr(stage_adapter, "alignment_request_fits"):
+            return stage_adapter.alignment_request_fits(**request)
+        return estimate_tokens(json.dumps(request, ensure_ascii=False)) < int(_llm_num_ctx() * 0.75) - 3_000
+
     persisted = 0
-    for alignment in alignments:
-        if alignment.segment_id not in valid_ids:
-            continue
-        if alignment.target_type == "pdf_page" and alignment.target_id not in page_ids:
-            continue
-        if alignment.target_type == "key_frame" and alignment.target_id not in frame_ids:
-            continue
-        session.add(
-            m.AlignmentLink(
-                analysis_run_id=run.id,
-                package_id=package.id,
-                segment_id=alignment.segment_id,
-                target_type=alignment.target_type,
-                target_id=alignment.target_id,
-                confidence=alignment.confidence,
-                reason=alignment.reason,
+    requests = []
+    completed = 0
+    try:
+        # Keep nearby speech together and reserve at least half the request for
+        # candidate pages. Page groups are revisited so long documents are not lost.
+        windows: list[list[dict]] = []
+        for item in sorted(segment_payload, key=lambda row: (row["start_ms"], row["id"])):
+            if not windows or item["start_ms"] - windows[-1][0]["start_ms"] >= 180_000:
+                windows.append([])
+            windows[-1].append(item)
+        for window in windows:
+            segment_batches = split_items_for_request(
+                window, text_key="text",
+                fits=lambda items: fits(items, []) and estimate_tokens(json.dumps(items, ensure_ascii=False)) <= int(_llm_num_ctx() * 0.30),
             )
-        )
-        persisted += 1
-    _update_task(
-        session,
-        run,
-        "资料对齐",
-        status="已完成",
-        result_json={"alignments": persisted},
-    )
+            for segment_batch in segment_batches:
+                target_batches = split_items_for_request(
+                    targets, text_key="text", fits=lambda items: fits(segment_batch, items),
+                )
+                requests.extend(payload(segment_batch, group) for group in target_batches)
+        seen = set()
+        for index, request in enumerate(requests, 1):
+            _raise_if_analysis_cancel_requested(session, run)
+            progress_data = {"batch": index, "batches": len(requests),
+                             "completed_batches": completed, "alignments": persisted,
+                             "started_at": m.utcnow().isoformat(), "last_activity_at": m.utcnow().isoformat()}
+            _update_task(session, run, "资料对齐", status="处理中",
+                         progress=int(99 * completed / len(requests)), result_json=progress_data)
+            session.commit()
+            last_write = [0.0]
+
+            def heartbeat(info):
+                if time.monotonic() - last_write[0] < 5:
+                    return
+                last_write[0] = time.monotonic()
+                _update_task(session, run, "资料对齐", status="处理中", result_json={
+                    **progress_data, **info, "last_activity_at": m.utcnow().isoformat(),
+                })
+                session.commit()
+
+            if hasattr(stage_adapter, "set_runtime_hooks"):
+                stage_adapter.set_runtime_hooks(
+                    check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
+                    on_progress=heartbeat,
+                )
+            try:
+                alignments = stage_adapter.align_materials(**request)
+            finally:
+                if hasattr(stage_adapter, "set_runtime_hooks"):
+                    stage_adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
+            _raise_if_analysis_cancel_requested(session, run)
+            valid_segments = {row["id"] for row in request["segments"]}
+            valid_targets = {"pdf_page": {row["id"] for row in request["pages"]},
+                             "key_frame": {row["id"] for row in request["frames"]}}
+            for alignment in alignments:
+                key = (alignment.segment_id, alignment.target_type, alignment.target_id)
+                if (key in seen or alignment.segment_id not in valid_segments
+                        or alignment.target_id not in valid_targets.get(alignment.target_type, set())):
+                    continue
+                seen.add(key)
+                session.add(m.AlignmentLink(
+                    analysis_run_id=run.id, package_id=package.id,
+                    segment_id=alignment.segment_id, target_type=alignment.target_type,
+                    target_id=alignment.target_id, confidence=alignment.confidence,
+                    reason=alignment.reason,
+                ))
+                persisted += 1
+            completed += 1
+        _update_task(session, run, "资料对齐", status="已完成",
+                     result_json={"alignments": persisted, "batches": len(requests),
+                                  "completed_batches": completed})
+    except _AnalysisCancellationRequested:
+        raise
+    except Exception as exc:
+        _raise_if_analysis_cancel_requested(session, run)
+        reason = f"资料对齐失败（已完成 {completed}/{len(requests)} 批）：{exc}"
+        _update_task(session, run, "资料对齐", status="处理失败",
+                     result_json={"alignments": persisted, "batches": len(requests),
+                                  "completed_batches": completed, "error": reason})
+        task = session.scalar(select(m.ProcessingTask).where(
+            m.ProcessingTask.analysis_run_id == run.id, m.ProcessingTask.stage == "资料对齐"))
+        if task:
+            task.error_message = reason
+        session.commit()
+        raise DomainError(422, reason) from exc
 
 
 def _run_identity_stage(
@@ -1081,14 +1117,14 @@ def _run_identity_stage(
             session,
             run,
             "身份辅助匹配",
-            status="已完成",
+            status="不适用",
             result_json={"recommendations": 0},
         )
         return
     speaker_ids = [item.id for item in speakers]
     observations = session.scalars(
         select(m.RawIntentObservation).where(
-            m.RawIntentObservation.package_id == package.id,
+            m.RawIntentObservation.analysis_run_id == run.id,
             m.RawIntentObservation.speaker_id.in_(speaker_ids),
         )
     ).all()
@@ -1118,23 +1154,57 @@ def _run_identity_stage(
         ).all()
     ]
     try:
-        recommendations = stage_adapter.recommend_identities(
-            segments=segments,
-            attendees=attendees,
-            master_data=master_data,
-        )
+        def fits(items):
+            if hasattr(stage_adapter, "identity_request_fits"):
+                return stage_adapter.identity_request_fits(
+                    segments=items, attendees=attendees, master_data=master_data)
+            return estimate_tokens(json.dumps({"segments": items, "attendees": attendees,
+                                               "master_data": master_data}, ensure_ascii=False)) < int(_llm_num_ctx() * .8) - 3_000
+
+        batches = split_items_for_request(segments, text_key="text", fits=fits)
+        recommendations = []
+        for index, batch in enumerate(batches, 1):
+            _raise_if_analysis_cancel_requested(session, run)
+            state = {"batch": index, "batches": len(batches), "completed_batches": index - 1,
+                     "started_at": m.utcnow().isoformat()}
+            _update_task(session, run, "身份辅助匹配", status="处理中",
+                         progress=int(99 * (index - 1) / len(batches)), result_json=state)
+            session.commit()
+            last_write = [0.0]
+
+            def heartbeat(info):
+                if time.monotonic() - last_write[0] < 5:
+                    return
+                last_write[0] = time.monotonic()
+                _update_task(session, run, "身份辅助匹配", status="处理中", result_json={
+                    **state, **info, "last_activity_at": m.utcnow().isoformat(),
+                })
+                session.commit()
+
+            if hasattr(stage_adapter, "set_runtime_hooks"):
+                stage_adapter.set_runtime_hooks(
+                    check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
+                    on_progress=heartbeat)
+            try:
+                recommendations.extend(stage_adapter.recommend_identities(
+                    segments=batch, attendees=attendees, master_data=master_data))
+            finally:
+                if hasattr(stage_adapter, "set_runtime_hooks"):
+                    stage_adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
+    except _AnalysisCancellationRequested:
+        raise
     except Exception as exc:
-        _update_task(
-            session,
-            run,
-            "身份辅助匹配",
-            status="已完成",
-            result_json={
-                "recommendations": 0,
-                "error": f"身份推荐调用失败：{exc}",
-            },
-        )
-        return
+        _raise_if_analysis_cancel_requested(session, run)
+        reason = f"身份推荐调用失败：{exc}"
+        _update_task(session, run, "身份辅助匹配", status="处理失败",
+                     result_json={"recommendations": 0, "error": reason})
+        task = session.scalar(select(m.ProcessingTask).where(
+            m.ProcessingTask.analysis_run_id == run.id, m.ProcessingTask.stage == "身份辅助匹配"))
+        if task:
+            task.error_message = reason
+        session.commit()
+        raise DomainError(422, reason) from exc
+    _raise_if_analysis_cancel_requested(session, run)
     applied = 0
     for recommendation in recommendations:
         speaker = next(
@@ -1164,6 +1234,29 @@ def _run_identity_stage(
     )
 
 
+class _AudioTranscriptionFailure(DomainError):
+    def __init__(
+        self, failures: list[dict[str, Any]], stats: dict[str, int] | None = None,
+        skipped_segments: list[dict[str, Any]] | None = None,
+    ):
+        super().__init__(422, f"{len(failures)} 个语音片段在重试后仍无法完整转写")
+        self.failures = failures
+        self.stats = stats or {}
+        self.skipped_segments = skipped_segments or []
+
+
+def _audio_result_summary(file_results: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "files": file_results,
+        "skipped_segments": [segment for item in file_results
+                             for segment in item.get("skipped_segments", [])],
+        "transcription": {
+            key: sum(item.get("transcription", {}).get(key, 0) for item in file_results)
+            for key in ("jobs", "ok", "failed", "empty", "reused", "skipped")
+        },
+    }
+
+
 def _run_audio_stage(
     session: Session,
     settings: Settings,
@@ -1185,7 +1278,104 @@ def _run_audio_stage(
         model_name=asr_settings.model_name,
     )
     transcripts: list[m.TranscriptSegment] = []
-    target = targets[0]
+    file_results: list[dict[str, Any]] = []
+    _update_task(session, run, "音轨与转写", status="处理中", progress=0)
+    _update_task(session, run, "说话人分离", status="处理中", progress=0)
+    session.commit()
+    for file_index, target in enumerate(targets):
+        _raise_if_analysis_cancel_requested(session, run)
+        try:
+            file_transcripts, summary = _run_audio_file(
+                session, settings, run, package, target, adapter,
+                file_index=file_index, file_count=len(targets),
+                order_offset=len(transcripts),
+                previous_file_results=file_results,
+                cache_config={"provider": asr_settings.provider,
+                              "base_url": asr_settings.base_url,
+                              "model": asr_settings.model_name},
+            )
+        except _AnalysisCancellationRequested:
+            raise
+        except Exception as exc:
+            _raise_if_analysis_cancel_requested(session, run)
+            failures = (
+                exc.failures if isinstance(exc, _AudioTranscriptionFailure)
+                else [{"material_file_id": target.id, "start_ms": None,
+                       "end_ms": None, "error": "音轨提取或转写失败", "attempts": 1}]
+            )
+            first_failure = failures[0]
+            location = (
+                f"（{_fmt_ms(first_failure['start_ms'])}–{_fmt_ms(first_failure['end_ms'])}）"
+                if first_failure["start_ms"] is not None
+                and first_failure["end_ms"] is not None else ""
+            )
+            reason = (
+                f"材料“{target.safe_name}”转写不完整：{len(failures)} 个片段失败"
+                f"{location}：{first_failure['error']}，请检查后重试"
+            )
+            target.parse_status = "解析失败"
+            failed_file = {
+                "material_file_id": target.id, "material_name": target.safe_name,
+                "failed_segments": failures,
+                "skipped_segments": getattr(exc, "skipped_segments", []),
+                "transcription": getattr(exc, "stats", {}),
+            }
+            _update_task(
+                session, run, "音轨与转写", status="处理失败",
+                result_json={**_audio_result_summary(file_results + [failed_file]),
+                             "failed_segments": failures, "segments": len(transcripts),
+                             "files_done": file_index, "files_total": len(targets)},
+            )
+            task = session.scalar(select(m.ProcessingTask).where(
+                m.ProcessingTask.analysis_run_id == run.id,
+                m.ProcessingTask.stage == "音轨与转写",
+            ))
+            if task is not None:
+                task.error_message = reason
+            # The outer cancellation check rolls back current-stage changes.
+            # Persist the failure coordinates before handing it control.
+            session.commit()
+            raise DomainError(422, reason) from exc
+        transcripts.extend(file_transcripts)
+        file_results.append(summary)
+        _update_task(
+            session, run, "音轨与转写", status="处理中",
+            progress=min(99, int(99 * (file_index + 1) / len(targets))),
+            result_json={**_audio_result_summary(file_results), "segments": len(transcripts),
+                         "files_done": file_index + 1, "files_total": len(targets)},
+        )
+        session.commit()
+    _raise_if_analysis_cancel_requested(session, run)
+    _update_task(
+        session, run, "音轨与转写", status="已完成", progress=100,
+        result_json={**_audio_result_summary(file_results), "segments": len(transcripts),
+                     "files_done": len(targets), "files_total": len(targets),
+                     "duration_ms": sum(item["duration_ms"] or 0 for item in file_results),
+                     "model": adapter.model_name},
+    )
+    _update_task(
+        session, run, "说话人分离", status="已完成", progress=100,
+        result_json={"speaker_labels": len({item.speaker_label for item in transcripts
+                                             if item.speaker_label})},
+    )
+    return True, transcripts
+
+
+def _run_audio_file(
+    session: Session,
+    settings: Settings,
+    run: m.AnalysisRun,
+    package: m.MeetingPackage,
+    target: m.MaterialFile,
+    adapter: AsrAdapter,
+    *,
+    file_index: int,
+    file_count: int,
+    order_offset: int,
+    cache_config: dict[str, Any] | None = None,
+    previous_file_results: list[dict[str, Any]] | None = None,
+) -> tuple[list[m.TranscriptSegment], dict[str, Any]]:
+    transcripts: list[m.TranscriptSegment] = []
     path = (settings.data_dir / target.relative_path).resolve()
     audio_path = path
     if target.material_type == "录屏":
@@ -1204,31 +1394,13 @@ def _run_audio_stage(
         audio_path = wav_path
 
     duration_ms = probe_media_duration(audio_path)
+    if not duration_ms or duration_ms <= 0:
+        raise _AudioTranscriptionFailure([{
+            "material_file_id": target.id, "start_ms": 0, "end_ms": None,
+            "error": "无法读取音频时长，请检查 FFprobe 和媒体文件", "category": "duration",
+            "attempts": 1,
+        }])
     hotwords = _build_hotwords(session, package)
-
-    _update_task(
-        session,
-        run,
-        "音轨与转写",
-        status="处理中",
-        progress=5,
-        result_json={
-            "mode": "准备转写",
-            "transcribed": 0,
-            "total": 0,
-            "empty": 0,
-            "failed": 0,
-        },
-    )
-    _update_task(
-        session,
-        run,
-        "说话人分离",
-        status="处理中",
-        progress=5,
-        result_json={"status": "正在分离说话人"},
-    )
-    session.commit()
 
     diarized_turns: list[Any] = []
     diarization_note: dict[str, Any] = {
@@ -1236,11 +1408,32 @@ def _run_audio_stage(
         "turns": 0,
         "speakers": 0,
     }
+    progress_state = {"last": 0}
+
+    def _report_audio_progress(percent: int) -> None:
+        percent = min(99, int((file_index * 100 + percent) / file_count))
+        # Throttle to ~1% steps; every write commits so polling clients see
+        # movement during the multi-minute embedding/transcription loop.
+        if percent < progress_state["last"] + 1 and percent < 99:
+            return
+        progress_state["last"] = percent
+        _update_task(
+            session, run, "音轨与转写", status="处理中", progress=percent
+        )
+        session.commit()
+
     try:
         diarizer = get_diarizer(settings)
         if diarizer is not None:
             diarized_turns = diarizer.diarize(
-                audio_path, duration_ms=duration_ms
+                audio_path,
+                duration_ms=duration_ms,
+                should_cancel=lambda: analysis_run_cancel_requested(
+                    session, run
+                ),
+                on_progress=lambda done, total: _report_audio_progress(
+                    5 + int(65 * done / total)
+                ),
             )
             diarization_note = {
                 "provider": "funasr",
@@ -1249,193 +1442,171 @@ def _run_audio_stage(
                     {turn.speaker_label for turn in diarized_turns}
                 ),
             }
+    except (DiarizationCancelled, _AnalysisCancellationRequested):
+        # Must be caught before the generic handler below, which would
+        # silently degrade a cancellation into whole-file transcription.
+        raise _AnalysisCancellationRequested
     except Exception as exc:
         logger.warning("说话人分离不可用，退回整段转写：%s", exc)
-    _update_task(
-        session,
-        run,
-        "说话人分离",
-        status="处理中",
-        progress=50,
-        result_json={
-            "status": (
-                "说话人已分离，开始逐段转写"
-                if diarized_turns
-                else "无可用说话人片段，整段分窗转写"
-            ),
-            "speakers": diarization_note["speakers"],
-        },
-    )
-    session.commit()
+    _raise_if_analysis_cancel_requested(session, run)
 
     transcript_model = adapter.model_name
-    segments: list[AsrSegment] = []
-    temp_dir = settings.data_dir / "temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    # Build fixed-window jobs.  Speaker turns keep their label when the
-    # diarizer is available; otherwise the whole recording is chunked into
-    # bounded windows so long meetings never block llama-server with one
-    # oversized audio request.
     jobs: list[tuple[int, int, str | None]] = []
-    mode_label = "说话人分段转写"
     if diarized_turns:
         for turn in diarized_turns:
-            for start_ms, end_ms in _asr_windows(
-                turn.start_ms, turn.end_ms
-            ):
-                jobs.append((start_ms, end_ms, turn.speaker_label))
+            jobs.extend((start, end, turn.speaker_label) for start, end in
+                        _asr_windows(turn.start_ms, turn.end_ms))
     else:
-        mode_label = "整段录音自动分窗转写"
-        for start_ms, end_ms in _asr_windows(0, duration_ms or 0):
-            jobs.append((start_ms, end_ms, None))
-
-    logger.info(
-        "ASR阶段开始 run=%s file=%s duration_ms=%s mode=%s jobs=%s",
-        run.id,
-        target.safe_name,
-        duration_ms,
-        mode_label,
-        len(jobs),
+        jobs = [(start, end, None) for start, end in _asr_windows(0, duration_ms)]
+    checkpoint = AsrCheckpoints(
+        settings.data_dir / "temp" / "asr-checkpoints" / package.id / target.id,
+        path, config={**(cache_config or {}), "hotwords": hotwords, "language": "zh",
+                      "window_ms": _ASR_WINDOW_MS, "jobs": jobs}, run_id=run.id,
+        check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
     )
-
-    transcription_stats: dict[str, int] = {
-        "jobs": len(jobs),
-        "ok": 0,
-        "empty": 0,
-        "failed": 0,
-    }
-    total_jobs = max(len(jobs), 1)
-    hard_errors: list[str] = []
-    for job_index, (start_ms, end_ms, speaker_label) in enumerate(
-        jobs, 1
-    ):
-        done = job_index - 1
+    segments: list[AsrSegment] = []
+    failed_segments: list[dict[str, Any]] = []
+    skipped_segments: list[dict[str, Any]] = []
+    stats = {"jobs": len(jobs), "ok": 0, "failed": 0, "empty": 0, "reused": 0, "skipped": 0}
+    consecutive_failures = 0
+    temp_dir = settings.data_dir / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    mode_label = "说话人分段转写" if diarized_turns else "整段录音自动分窗转写"
+    for job_index, job in enumerate(jobs):
+        _raise_if_analysis_cancel_requested(session, run)
+        start_ms, end_ms, speaker_label = job
+        current_file_result = {
+            "material_file_id": target.id, "material_name": target.safe_name,
+            "transcription": dict(stats), "skipped_segments": list(skipped_segments),
+        }
+        job_state = {**_audio_result_summary((previous_file_results or []) + [current_file_result]),
+                     "mode": mode_label, "transcribed": stats["ok"],
+                     "total": len(jobs), "failed": stats["failed"],
+                     "empty": stats["empty"], "reused": stats["reused"], "skipped": stats["skipped"],
+                     "current_file": target.safe_name, "start_ms": start_ms, "end_ms": end_ms,
+                     "files_done": file_index,
+                     "files_total": file_count, "current_started_at": m.utcnow().isoformat(),
+                     "last_activity_at": m.utcnow().isoformat()}
         _update_task(
-            session,
-            run,
-            "音轨与转写",
-            status="处理中",
-            progress=5 + int(90 * done / total_jobs),
-            result_json={
-                "mode": mode_label,
-                "transcribed": done,
-                "total": total_jobs,
-                "failed": transcription_stats["failed"],
-                "empty": transcription_stats["empty"],
-            },
+            session, run, "音轨与转写", status="处理中",
+            progress=min(99, int((file_index * 100 + 70 + 28 * job_index / len(jobs)) / file_count)),
+            result_json=job_state,
         )
         session.commit()
-
+        cached = checkpoint.load(job)
+        if cached:
+            segments.extend(cached)
+            stats["ok"] += 1
+            stats["reused"] += 1
+            consecutive_failures = 0
+            continue
         seg_wav = temp_dir / f"{run.id}-{target.id}-asr-{job_index}.wav"
-        sliced = slice_audio_segment(
-            audio_path, start_ms, end_ms, seg_wav
-        )
-        start_time = time.monotonic()
-        error: str | None = None
         turn_result = None
+        failure_reason, category = "语音服务转写失败", "asr"
+        used_context = (start_ms, end_ms)
+        attempt = 0
+        last_write = [0.0]
+
+        def heartbeat(info):
+            if time.monotonic() - last_write[0] < 5:
+                return
+            last_write[0] = time.monotonic()
+            _update_task(session, run, "音轨与转写", status="处理中", result_json={
+                **job_state, **info, "attempt": attempt, "last_activity_at": m.utcnow().isoformat(),
+            })
+            session.commit()
+
+        if hasattr(adapter, "set_runtime_hooks"):
+            adapter.set_runtime_hooks(
+                check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
+                on_progress=heartbeat)
         try:
-            if sliced:
-                turn_result = adapter.transcribe(
-                    seg_wav,
-                    language="zh",
-                    hotwords=hotwords,
-                    duration_ms=end_ms - start_ms,
-                )
-            else:
-                error = "音频切片失败"
-        except Exception as exc:
-            error = str(exc)
+            for attempt in range(1, 3):
+                _raise_if_analysis_cancel_requested(session, run)
+                context_start, context_end = start_ms, end_ms
+                # Only add quiet context outside this speaker turn. Never include
+                # an adjacent speaker's words and attribute them to this turn.
+                if attempt == 2 and end_ms - start_ms < 1_500 and category in {"empty_response", "audio_too_short"}:
+                    other_turns = [turn for turn in diarized_turns if not (
+                        turn.speaker_label == speaker_label
+                        and turn.start_ms <= start_ms and turn.end_ms >= end_ms)]
+                    left_limit = max((min(start_ms, turn.end_ms) for turn in other_turns
+                                      if turn.start_ms < start_ms), default=0)
+                    right_limit = min((max(end_ms, turn.start_ms) for turn in other_turns
+                                       if turn.end_ms > end_ms), default=duration_ms)
+                    context_start = max(left_limit, start_ms - 750)
+                    context_end = min(right_limit, end_ms + 750)
+                used_context = (context_start, context_end)
+                direct_file = not diarized_turns and len(jobs) == 1
+                input_path = audio_path if direct_file else seg_wav
+                try:
+                    if not direct_file and not slice_audio_segment(
+                        audio_path, context_start, context_end, seg_wav
+                    ):
+                        failure_reason, category = "音频切片失败，请检查 FFmpeg 和媒体文件", "slice"
+                        continue
+                    candidate = adapter.transcribe(
+                        input_path, language="zh", hotwords=hotwords,
+                        duration_ms=context_end - context_start,
+                    )
+                    _raise_if_analysis_cancel_requested(session, run)
+                    if not candidate.segments or any(not row.text.strip() for row in candidate.segments):
+                        failure_reason, category = "语音服务返回空转写", "empty_response"
+                        continue
+                    turn_result = candidate
+                    break
+                except _AnalysisCancellationRequested:
+                    raise
+                except Exception as exc:
+                    failure_reason = str(exc) if isinstance(exc, DomainError) or getattr(exc, "category", None) else "音频切片或语音服务转写失败"
+                    category = getattr(exc, "category", "asr")
+                    if category == "dependency" or (getattr(exc, "retryable", True) is False
+                                                   and category not in {"empty_response", "audio_too_short"}):
+                        break
+            if turn_result is None:
+                failure = {"material_file_id": target.id, "material_name": target.safe_name,
+                           "start_ms": start_ms,
+                           "end_ms": end_ms, "error": failure_reason, "category": category,
+                           "attempts": attempt, "context_start_ms": used_context[0],
+                           "context_end_ms": used_context[1]}
+                if category in {"empty_response", "audio_too_short"}:
+                    stats["empty"] += 1
+                    stats["skipped"] += 1
+                    skipped_segments.append(failure)
+                    # Keep the unrecognized interval visible without inventing
+                    # speech, identity, or successful reusable ASR evidence.
+                    segments.append(AsrSegment(
+                        start_ms=start_ms, end_ms=end_ms, text="", speaker_label=None,
+                        confidence=0.0, language="zh",
+                    ))
+                    consecutive_failures = 0
+                    continue
+                stats["failed"] += 1
+                consecutive_failures += 1
+                failed_segments.append(failure)
+                if category == "dependency" or consecutive_failures >= 3:
+                    failure["remaining_jobs"] = len(jobs) - job_index - 1
+                    failure["stopped_early"] = True
+                    break
+                continue
+            rows = [AsrSegment(
+                start_ms=start_ms, end_ms=end_ms, text=row.text.strip(),
+                speaker_label=speaker_label or row.speaker_label,
+                confidence=row.confidence, language=row.language,
+            ) for row in turn_result.segments]
+            checkpoint.save(job, rows)
+            segments.extend(rows)
+            stats["ok"] += 1
+            consecutive_failures = 0
         finally:
+            if hasattr(adapter, "set_runtime_hooks"):
+                adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
             try:
                 seg_wav.unlink(missing_ok=True)
             except OSError:
-                # The ASR client may still hold the file handle on
-                # Windows; leftover temp slices are harmless.
                 pass
-
-        elapsed = time.monotonic() - start_time
-        if turn_result is not None and turn_result.segments:
-            for seg in turn_result.segments:
-                segments.append(
-                    AsrSegment(
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                        text=seg.text,
-                        speaker_label=speaker_label,
-                        confidence=seg.confidence,
-                        language=seg.language,
-                    )
-                )
-            transcription_stats["ok"] += 1
-            logger.info(
-                "ASR片段完成 %s/%s [%s-%sms] %s 段文本，耗时 %.1fs",
-                job_index,
-                total_jobs,
-                start_ms,
-                end_ms,
-                len(turn_result.segments),
-                elapsed,
-            )
-        else:
-            segments.append(
-                AsrSegment(
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    text="",
-                    speaker_label=speaker_label,
-                    confidence=0.0,
-                    language="zh",
-                )
-            )
-            if error and ("连接" in error or "超时" in error or "HTTP" in error):
-                hard_errors.append(error)
-                transcription_stats["failed"] += 1
-            else:
-                transcription_stats["empty"] += 1
-            logger.warning(
-                "ASR片段失败/为空 %s/%s [%s-%sms] 保留空转写片段；错误：%s",
-                job_index,
-                total_jobs,
-                start_ms,
-                end_ms,
-                error or "模型未返回文本",
-            )
-
-    _update_task(
-        session,
-        run,
-        "音轨与转写",
-        status="处理中",
-        progress=95,
-        result_json={
-            "mode": mode_label,
-            "transcribed": transcription_stats["ok"],
-            "total": total_jobs,
-            "failed": transcription_stats["failed"],
-            "empty": transcription_stats["empty"],
-        },
-    )
-    session.commit()
-
-    logger.info(
-        "ASR阶段完成 run=%s ok=%s empty=%s failed=%s 总片段=%s",
-        run.id,
-        transcription_stats["ok"],
-        transcription_stats["empty"],
-        transcription_stats["failed"],
-        len(segments),
-    )
-    if (
-        transcription_stats["ok"] == 0
-        and len(hard_errors) == total_jobs
-        and hard_errors
-    ):
-        raise DomainError(
-            502,
-            "ASR转写失败：本地语音服务不可用或持续超时"
-            f"（示例错误：{hard_errors[0]}）。请确认 ASR 服务已启动。",
-        )
+    if failed_segments:
+        raise _AudioTranscriptionFailure(failed_segments, stats, skipped_segments)
 
     existing_clusters = session.scalars(
         select(m.SpeakerCluster).where(
@@ -1455,29 +1626,35 @@ def _run_audio_stage(
             )
         ).all()
     } if existing_clusters else set()
-    current_labels: set[str] = set()
     for index, segment in enumerate(segments, 1):
+        # Diarizer labels are local to one input file.  Never merge two
+        # recordings' SPEAKER_00 identities just because their labels match.
+        speaker_label = (
+            "Speaker " + hashlib.sha256(
+                f"{run.id}|{target.id}|{segment.speaker_label}".encode()
+            ).hexdigest()[:20]
+            if segment.speaker_label else None
+        )
         transcript = m.TranscriptSegment(
             analysis_run_id=run.id,
             package_id=package.id,
             material_file_id=target.id,
-            order_index=index,
+            order_index=order_offset + index,
             start_ms=segment.start_ms,
             end_ms=segment.end_ms,
             text=segment.text,
-            speaker_label=segment.speaker_label,
+            speaker_label=speaker_label,
             language=segment.language,
             confidence=segment.confidence,
         )
         session.add(transcript)
         transcripts.append(transcript)
-        if segment.speaker_label:
-            current_labels.add(segment.speaker_label)
-            cluster = label_to_cluster.get(segment.speaker_label)
+        if speaker_label and segment.text.strip():
+            cluster = label_to_cluster.get(speaker_label)
             if cluster is None:
                 cluster = m.SpeakerCluster(
                     package_id=package.id,
-                    label=segment.speaker_label,
+                    label=speaker_label,
                     recommended_name=f"待确认人员{len(label_to_cluster) + 1}",
                     confidence=0.5,
                     status="待确认",
@@ -1485,7 +1662,7 @@ def _run_audio_stage(
                 session.add(cluster)
                 # Assign the string PK before referencing it from segments.
                 session.flush()
-                label_to_cluster[segment.speaker_label] = cluster
+                label_to_cluster[speaker_label] = cluster
             segment_key = (
                 cluster.id,
                 segment.start_ms,
@@ -1503,33 +1680,16 @@ def _run_audio_stage(
                 existing_segment_keys.add(segment_key)
     session.flush()
     target.parse_status = "解析完成"
-    _update_task(
-        session,
-        run,
-        "音轨与转写",
-        status="已完成",
-        progress=100,
-        result_json={
-            "segments": len(transcripts),
-            "duration_ms": duration_ms,
-            "model": transcript_model,
-            "transcription": transcription_stats,
-            **(
-                {"diarization": diarization_note}
-                if diarized_turns
-                else {}
-            ),
-        },
-    )
-    _update_task(
-        session,
-        run,
-        "说话人分离",
-        status="已完成",
-        progress=100,
-        result_json={"speaker_labels": len(current_labels)},
-    )
-    return True, transcripts
+    return transcripts, {
+        "material_file_id": target.id,
+        "material_name": target.safe_name,
+        "segments": len(transcripts),
+        "duration_ms": duration_ms,
+        "model": transcript_model,
+        "transcription": stats,
+        "skipped_segments": skipped_segments,
+        **({"diarization": diarization_note} if diarized_turns else {}),
+    }
 
 
 def _run_visual_stage(
@@ -1544,7 +1704,9 @@ def _run_visual_stage(
         _update_task(session, run, "画面与PDF解析", status="不适用")
         return []
     frames: list[m.KeyFrame] = []
-    for item in screen[:1]:
+    _update_task(session, run, "画面与PDF解析", status="处理中", progress=0)
+    for file_index, item in enumerate(screen):
+        _raise_if_analysis_cancel_requested(session, run)
         path = (settings.data_dir / item.relative_path).resolve()
         target_dir = (
             settings.data_dir
@@ -1553,8 +1715,26 @@ def _run_visual_stage(
             / package.id
             / "derived"
             / "frames"
+            / run.id
+            / item.id
         )
         extracted = extract_key_frames(path, target_dir, max_frames=20)
+        _raise_if_analysis_cancel_requested(session, run)
+        if not extracted:
+            item.parse_status = "解析失败"
+            reason = f"录屏“{item.safe_name}”未提取到画面，请检查媒体工具或文件后重试"
+            _update_task(
+                session, run, "画面与PDF解析", status="处理失败",
+                result_json={"failed_material_file_id": item.id},
+            )
+            task = session.scalar(select(m.ProcessingTask).where(
+                m.ProcessingTask.analysis_run_id == run.id,
+                m.ProcessingTask.stage == "画面与PDF解析",
+            ))
+            if task is not None:
+                task.error_message = reason
+            session.commit()
+            raise DomainError(422, reason)
         for descriptor in extracted:
             relative = descriptor["path"].relative_to(settings.data_dir).as_posix()
             ocr = ocr_image(descriptor["path"])
@@ -1567,14 +1747,19 @@ def _run_visual_stage(
             )
             session.add(frame)
             frames.append(frame)
-        item.parse_status = "解析完成" if extracted else "待专用解析"
+        item.parse_status = "解析完成"
+        _update_task(
+            session, run, "画面与PDF解析", status="处理中",
+            progress=min(99, int(99 * (file_index + 1) / len(screen))),
+        )
     session.flush()
     _update_task(
         session,
         run,
         "画面与PDF解析",
-        status="已完成" if frames else "不适用",
-        result_json={"key_frames": len(frames)},
+        status="已完成",
+        progress=100,
+        result_json={"key_frames": len(frames), "material_files": len(screen)},
     )
     return frames
 
@@ -1689,6 +1874,9 @@ def _persist_mock_observations(
                 status="待确认",
                 model_name=adapter.model_name,
                 ai_snapshot={
+                    "quote": quote,
+                    "technology_id": technology.id,
+                    "function_id": function_id,
                     "attitude_level": attitude,
                     "adoption_stage": stage,
                     "support_reason": support,
@@ -1769,7 +1957,7 @@ def _persist_model_observations(
             unresolved.append(f"第{index}条技术无法映射到基础字典")
             continue
         quote = str(raw.get("quote") or "").strip()
-        located = _locate_exact_quote(materials, quote) if quote else None
+        located = _locate_exact_quote(raw.get("_source_scope", materials), quote) if quote else None
         if located is None:
             unresolved.append(f"第{index}条缺少可在原材料中逐字核对的证据")
             continue
@@ -1879,6 +2067,9 @@ def _persist_model_observations(
         session.add(evidence)
         session.flush()
         snapshot = {
+            "quote": quote,
+            "technology_id": technology_id,
+            "function_id": function_id,
             "attitude_level": attitude,
             "adoption_stage": adoption_stage,
             "support_reason": raw.get("support_reason"),
@@ -1936,9 +2127,16 @@ def ai_original_snapshot(
 ) -> dict[str, Any]:
     """Return the immutable model baseline, with a legacy-row fallback."""
 
-    if observation.ai_snapshot:
-        return dict(observation.ai_snapshot)
-    return {
+    if not observation.ai_snapshot and observation.version != 1:
+        return {
+            "unavailable": True,
+            "reason": "历史记录已修改，未保留AI原始快照",
+            "analysis_run_id": observation.analysis_run_id,
+        }
+    baseline = {
+        "quote": observation.raw_quote,
+        "technology_id": observation.technology_id,
+        "function_id": observation.function_id,
         "attitude_level": observation.suggested_attitude,
         "adoption_stage": observation.suggested_adoption_stage,
         "support_reason": observation.support_reason,
@@ -1951,12 +2149,19 @@ def ai_original_snapshot(
         "prompt_version": observation.prompt_version,
         "rule_version": observation.rule_version,
     }
+    if observation.ai_snapshot:
+        # Only untouched legacy rows can safely supply fields absent in older
+        # snapshots. Never infer the model's original fields after review.
+        if observation.version == 1:
+            return {**baseline, **observation.ai_snapshot}
+        return dict(observation.ai_snapshot)
+    return baseline
 
 
 def ensure_ai_snapshot(observation: m.RawIntentObservation) -> dict[str, Any]:
     """Capture the AI baseline once, before any human mutation."""
 
-    if not observation.ai_snapshot:
+    if not observation.ai_snapshot or observation.version == 1:
         observation.ai_snapshot = ai_original_snapshot(observation)
     return dict(observation.ai_snapshot)
 
@@ -2496,9 +2701,10 @@ def execute_analysis_run(
                 raise DomainError(500, "真实模型分析缺少本地数据目录配置")
             _update_task(session, run, "文件预检", status="已完成", progress=100)
 
+            pages: list[m.PdfPageText] = []
             parsed_readable, extra_materials, parsed_transcripts = (
                 _parse_document_stage(
-                session, settings, run, package, list(files)
+                    session, settings, run, package, list(files), parsed_pages=pages,
                 )
             )
             readable_material_ids |= parsed_readable
@@ -2528,15 +2734,6 @@ def execute_analysis_run(
             )
             _raise_if_analysis_cancel_requested(session, run)
             session.commit()
-            pages = list(
-                session.scalars(
-                    select(m.PdfPageText).where(
-                        m.PdfPageText.material_file_id.in_(
-                            [item.id for item in files]
-                        )
-                    )
-                ).all()
-            )
             model_materials = _extend_materials_with_derived(
                 model_materials,
                 extra_materials,
@@ -2558,7 +2755,19 @@ def execute_analysis_run(
             session.commit()
 
             _raise_if_analysis_cancel_requested(session, run)
-            batches = _split_model_materials_for_analysis(model_materials)
+            full_context = ModelContext(
+                package_id=package.id, customer_id=package.customer_id,
+                material_summaries=model_materials, master_data=master_data,
+            )
+            if not any(str(item.get("content") or "").strip() for item in model_materials):
+                # ASR can legitimately finish with only empty placeholders.
+                # File names alone are not evidence for intent extraction.
+                batches = []
+            elif hasattr(adapter, "split_context"):
+                contexts = adapter.split_context(full_context)
+                batches = [context.material_summaries for context in contexts]
+            else:
+                batches = _split_model_materials_for_analysis(model_materials)
             merged_observations: list[dict[str, Any]] = []
             merged_usage: dict[str, Any] = {}
             base_result: dict[str, Any] | None = None
@@ -2583,7 +2792,7 @@ def execute_analysis_run(
                     run,
                     "意向抽取",
                     status="处理中",
-                    progress=5 + int(90 * batch_index / total_batches),
+                    progress=5 + int(90 * (batch_index - 1) / total_batches),
                     result_json={
                         "mode": "分批分析",
                         "batch": batch_index,
@@ -2598,20 +2807,66 @@ def execute_analysis_run(
                     len(batch),
                     _estimate_material_tokens(batch),
                 )
-                batch_result = adapter.analyze(
-                    ModelContext(
-                        package_id=package.id,
-                        customer_id=package.customer_id,
-                        material_summaries=batch,
-                        master_data=master_data,
+                batch_started_at = m.utcnow().isoformat()
+                last_write = [0.0]
+
+                def heartbeat(info):
+                    if time.monotonic() - last_write[0] < 5:
+                        return
+                    last_write[0] = time.monotonic()
+                    _update_task(session, run, "意向抽取", status="处理中", result_json={
+                        "mode": "分批分析", "batch": batch_index, "batches": total_batches,
+                        "completed_batches": batch_index - 1, "started_at": batch_started_at,
+                        "last_activity_at": m.utcnow().isoformat(), **info,
+                    })
+                    session.commit()
+
+                if hasattr(adapter, "set_runtime_hooks"):
+                    adapter.set_runtime_hooks(
+                        check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
+                        on_progress=heartbeat,
                     )
-                )
+                try:
+                    batch_result = adapter.analyze(ModelContext(
+                        package_id=package.id, customer_id=package.customer_id,
+                        material_summaries=batch, master_data=master_data,
+                    ))
+                finally:
+                    if hasattr(adapter, "set_runtime_hooks"):
+                        adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
+                _raise_if_analysis_cancel_requested(session, run)
+                _update_task(session, run, "意向抽取", status="处理中",
+                             progress=5 + int(90 * batch_index / total_batches),
+                             result_json={"mode": "分批分析", "batch": batch_index,
+                                          "batches": total_batches, "completed_batches": batch_index,
+                                          "last_activity_at": m.utcnow().isoformat()})
+                session.commit()
                 observations = batch_result.get("observations") or []
                 if not isinstance(observations, list):
                     observations = []
-                merged_observations.extend(
-                    item for item in observations if isinstance(item, dict)
-                )
+                scope = []
+                for part in batch:
+                    offset = int(part.get("content_offset") or 0)
+                    source = next((item for item in model_materials
+                                   if all(item.get(key) == part.get(key) for key in
+                                          ("id", "source_material_file_id", "type", "name"))), part)
+                    scope.append({**part, "_line_offset": str(source.get("content") or "").count("\n", 0, offset)})
+                for observation in observations:
+                    if not isinstance(observation, dict):
+                        continue
+                    quote = str(observation.get("quote") or "").strip()
+                    located = _locate_exact_quote(scope, quote) if quote else None
+                    source_key = None
+                    if located:
+                        source, line_no = located
+                        source_key = (source.get("source_material_file_id"),
+                                      source.get("start_ms"), source.get("end_ms"),
+                                      source.get("page_no"), source.get("frame_no"),
+                                      int(source.get("content_offset") or 0) + str(source.get("content") or "").find(quote))
+                    # Source scope comes from the request we actually sent. Never
+                    # let a later batch cite the first identical quote in another file.
+                    merged_observations.append({**observation, "_source_scope": scope,
+                                                "_source_key": source_key})
                 usage = batch_result.get("usage")
                 if isinstance(usage, dict):
                     for key, value in usage.items():
@@ -2626,7 +2881,7 @@ def execute_analysis_run(
             # Collapse accidental duplicates while keeping distinct quotes and
             # interpretations (a repeated sentence can still be two records).
             deduped: list[dict[str, Any]] = []
-            seen: set[tuple[str, str, str, Any, Any]] = set()
+            seen: set[tuple[Any, ...]] = set()
             for observation in merged_observations:
                 key = (
                     " ".join(str(observation.get("quote") or "").split()),
@@ -2634,6 +2889,7 @@ def execute_analysis_run(
                     str(observation.get("speaker_name") or ""),
                     observation.get("attitude_level"),
                     observation.get("function_id"),
+                    observation.get("_source_key"),
                 )
                 if key in seen:
                     continue
@@ -2666,7 +2922,7 @@ def execute_analysis_run(
                 session,
                 run,
                 "意向抽取",
-                status="已完成",
+                status="已完成" if batches else "不适用",
                 progress=100,
                 result_json={
                     "observations": observation_count,
@@ -2877,6 +3133,7 @@ def merge_speakers(
             )
         ).all()
         for observation in observations:
+            ensure_ai_snapshot(observation)
             observation.speaker_id = keep.id
             observation.version += 1
         session.add(
@@ -2914,17 +3171,39 @@ def split_speaker(
     segment_ids: list[str],
     actor: str,
 ) -> m.SpeakerCluster:
-    source = session.get(m.SpeakerCluster, speaker_id)
+    source = get_visible_speaker(session, speaker_id)
     if source is None or source.package_id != package_id:
         raise DomainError(404, "说话人不存在或不属于该资料包")
-    segments = session.scalars(
+    all_segments = session.scalars(
         select(m.SpeakerSegment).where(
             m.SpeakerSegment.speaker_id == source.id,
-            m.SpeakerSegment.id.in_(segment_ids),
         )
     ).all()
-    if not segments:
-        raise DomainError(422, "没有可拆分的片段")
+    selected_ids = set(segment_ids)
+    segments = [item for item in all_segments if item.id in selected_ids]
+    if not segments or {item.id for item in segments} != selected_ids:
+        raise DomainError(422, "所选片段不存在或不属于该说话人")
+    observations = session.scalars(select(m.RawIntentObservation).where(
+        m.RawIntentObservation.speaker_id == source.id,
+        visible_observation_clause(),
+    )).all()
+    source_runs = {item.analysis_run_id for item in observations}
+    for record in session.scalars(select(m.ConfirmationRecord).where(
+        m.ConfirmationRecord.target_id == source.id,
+        visible_split_provenance_clause(),
+    )).all():
+        source_runs.add(record.after_snapshot["analysis_run_id"])
+    # Older clusters could be reused by later failed analyses and their
+    # speech rows carry no run id. Do not give those ambiguous rows a manual
+    # visibility exemption. New ASR labels are scoped to the analysis run.
+    uncertain_run = session.scalar(select(m.AnalysisRun.id).where(
+        m.AnalysisRun.package_id == package_id,
+        m.AnalysisRun.id.not_in([item for item in source_runs if item is not None]),
+        or_(m.AnalysisRun.status != "已完成", m.AnalysisRun.cancel_requested_at.is_not(None)),
+        or_(m.AnalysisRun.finished_at.is_(None), m.AnalysisRun.finished_at >= source.created_at),
+    ).limit(1))
+    if uncertain_run:
+        raise DomainError(422, "说话人可能包含未成功分析的片段，来源无法确定；请完成或重新分析后再拆分")
     label_index = _next_speaker_label(session, package_id)
     target = m.SpeakerCluster(
         package_id=package_id,
@@ -2938,17 +3217,63 @@ def split_speaker(
     moved_ids = [segment.id for segment in segments]
     for segment in segments:
         segment.speaker_id = target.id
+    moved_observations = []
+    target_runs = set()
+    attributed_segments = set()
+    for observation in observations:
+        quote = re.sub(r"\s+", "", observation.raw_quote)
+        evidence = session.get(m.EvidenceFragment, observation.evidence_id) if observation.evidence_id else None
+        matches = []
+        for segment in all_segments:
+            if not quote or quote not in re.sub(r"\s+", "", segment.transcript):
+                continue
+            if evidence and evidence.start_ms is not None and evidence.end_ms is not None:
+                if not (segment.start_ms < evidence.end_ms and evidence.start_ms < segment.end_ms):
+                    continue
+            matches.append(segment.id)
+        # Ambiguous text shared with an unselected segment stays with the source.
+        if matches and set(matches).issubset(selected_ids):
+            ensure_ai_snapshot(observation)
+            observation.speaker_id = target.id
+            observation.function_id = None
+            observation.status = "待确认"
+            observation.version += 1
+            moved_observations.append(observation.id)
+            target_runs.add(observation.analysis_run_id)
+            attributed_segments.update(matches)
+    if attributed_segments != selected_ids:
+        if len(source_runs) != 1:
+            session.rollback()
+            raise DomainError(422, "片段跨分析批次且来源不明确，无法安全拆分；请先核对证据来源")
+        target_runs = set(source_runs)
+    # A child must not inherit unrelated runs as a fallback source. Preserve
+    # an otherwise unreferenced parent for its remaining manual-review clips.
+    owners = [(target, target_runs)]
+    if len(moved_observations) == len(observations):
+        owners.append((source, source_runs))
+    for owner, run_ids in owners:
+        for run_id in run_ids:
+            session.add(m.ConfirmationRecord(
+                target_type="speaker", target_id=owner.id, action="拆分来源",
+                after_snapshot={"analysis_run_id": run_id, "source_speaker_id": source.id},
+                actor=actor,
+            ))
     session.add(
         m.ConfirmationRecord(
             target_type="speaker",
             target_id=source.id,
             action="拆分",
             before_snapshot={"segments": moved_ids},
-            after_snapshot={"created_speaker": target.id, "segments": moved_ids},
+            after_snapshot={"created_speaker": target.id, "segments": moved_ids,
+                            "observations": moved_observations},
             actor=actor,
         )
     )
     source.version += 1
+    package = session.get(m.MeetingPackage, package_id)
+    if package:
+        package.status = "待身份校验"
+        package.version += 1
     session.commit()
     session.refresh(target)
     return target
@@ -3008,6 +3333,7 @@ def confirm_speaker(
         ).all()
         for observation in observations:
             if observation.function_id is None:
+                ensure_ai_snapshot(observation)
                 observation.function_id = speaker.confirmed_function_id
                 observation.version += 1
 

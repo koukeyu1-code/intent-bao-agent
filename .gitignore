@@ -66,8 +66,7 @@ __pycache__/
 *.sqlite3
 
 # local runtime logs, process markers and generated backend entry
-/runtime/*
-!/runtime/intent_bao_backend_entry.py
+/runtime/
 dev-frontend*.log
 
 # ============================================================
@@ -76,8 +75,11 @@ dev-frontend*.log
 # 模型随 GitHub Releases / 网盘发布的 models-<版本>.zip 分发，
 # 解压到项目根目录即可运行。详见 README「模型准备」。
 # ============================================================
+/models-*.zip
+/models-*/
 /models/llama.cpp/
 /models/funasr/
 /models/ollama/
+/models/ffmpeg/
 /models/qwen3-asr/Qwen3-ASR-1.7B.Q8_0.gguf
 /models/qwen3-asr/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf

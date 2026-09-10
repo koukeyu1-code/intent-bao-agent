@@ -21,6 +21,7 @@ import {
   MenuUnfoldOutlined,
   MergeOutlined,
   PlayCircleOutlined,
+  StopOutlined,
   PlusOutlined,
   RadarChartOutlined,
   SafetyCertificateOutlined,
@@ -74,6 +75,7 @@ import {
   API_BASE,
   ApiClientError,
   analyzeMeetingPackage,
+  cancelMeetingPackageAnalysis,
   confirmSpeakerIdentity,
   commitTaxonomyImport,
   createMeetingPackage,
@@ -116,8 +118,11 @@ import {
 } from "./platform-taxonomy";
 import { canAccessView, resolveAuthorizedView } from "./view-permissions";
 import {
+  assertIntentConfirmationEvidence,
   assertIntentReadyForSave,
+  intentConfirmationRisks,
   pendingUploadIds,
+  prepareIntentConfirmation,
   preparePlatformDraftForSave,
   prepareSpeakerIdentity,
   resolveRequestedItems,
@@ -162,52 +167,14 @@ type NavigationSection = {
   items: NavigationItem[];
 };
 
-const TERMINAL_TASK_STATUSES = new Set([
-  "已完成",
-  "不适用",
-  "已取消",
-  "处理失败",
-]);
-
-class AnalysisCancelledError extends Error {
-  readonly runId: string;
-
-  constructor(runId: string) {
-    super(`分析任务已取消：${runId}`);
-    this.name = "AnalysisCancelledError";
-    this.runId = runId;
-  }
-}
-
-const waitForAnalysisCompletion = async (
-  meetingId: string,
-  runId: string,
-  timeoutMs = 120 * 60_000,
-  intervalMs = 2_000,
-): Promise<void> => {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const { items } = await loadPackageTasks(meetingId);
-    const runTasks = items.filter((item) => item.analysisRunId === runId);
-    if (
-      runTasks.length &&
-      runTasks.every((item) => TERMINAL_TASK_STATUSES.has(item.status))
-    ) {
-      const failed = runTasks.find((item) => item.status === "处理失败");
-      if (failed) {
-        throw new Error(
-          failed.errorMessage || `阶段“${failed.stage}”处理失败`,
-        );
-      }
-      if (runTasks.some((item) => item.status === "已取消")) {
-        throw new AnalysisCancelledError(runId);
-      }
-      return;
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
-  }
-  throw new Error("分析任务超时，请稍后在资料包中查看最新状态");
-};
+import {
+  analysisOutcome,
+  describeProcessingTask,
+  unrecognizedAsrSegments,
+  formatTaskTime,
+  selectAnalysisRunTasks,
+  watchAnalysisRun,
+} from "./analysis-progress";
 
 type CompetitorProductGroup = {
   key: string;
@@ -550,6 +517,7 @@ function StatusTag({ value }: { value: string }) {
     分析中: "blue",
     待补资料: "orange",
     处理失败: "error",
+    已取消: "default",
     AI草稿: "purple",
     退回补充: "warning",
     无法判断: "default",
@@ -1038,7 +1006,9 @@ function MeetingsPage({
   reloadDataset: ReloadDataset;
 }) {
   const [createOpen, setCreateOpen] = useState(false);
-  const [detail, setDetail] = useState<MeetingPackage | undefined>();
+  const [detailId, setDetailId] = useState<string>();
+  const detail = meetings.find((item) => item.id === detailId);
+  const setDetail = (meeting?: MeetingPackage) => setDetailId(meeting?.id);
   const [fileList, setFileList] = useState<UploadFile[]>([]);
   const [uploadStatuses, setUploadStatuses] = useState<
     Record<string, UploadState>
@@ -1047,96 +1017,111 @@ function MeetingsPage({
   const [submitting, setSubmitting] = useState(false);
   const [submitStage, setSubmitStage] = useState("");
   const [analysisBusyId, setAnalysisBusyId] = useState<string>();
+  const [stopBusyId, setStopBusyId] = useState<string>();
   const [supplementBusyId, setSupplementBusyId] = useState<string>();
   const [form] = Form.useForm();
-  const watchingRef = useRef<Set<string>>(new Set());
+  const watchingRef = useRef(new Map<string, { meetingId: string; controller: AbortController }>());
   const [watchingCount, setWatchingCount] = useState(0);
+  const [taskSnapshots, setTaskSnapshots] = useState<Record<string, ProcessingTask[]>>({});
+  const [pollingErrors, setPollingErrors] = useState<Record<string, string | undefined>>({});
+  const [refreshError, setRefreshError] = useState<string>();
+
+  useEffect(() => {
+    const watchers = watchingRef.current;
+    return () => {
+      for (const { controller } of watchers.values()) controller.abort();
+      watchers.clear();
+    };
+  }, []);
 
   const watchAnalysis = useCallback(
     async (meetingId: string, runId: string) => {
       if (watchingRef.current.has(runId)) return;
-      watchingRef.current.add(runId);
+      const controller = new AbortController();
+      watchingRef.current.set(runId, { meetingId, controller });
       setWatchingCount(watchingRef.current.size);
       try {
-        await waitForAnalysisCompletion(meetingId, runId);
-        await reloadDataset();
-        message.success(
-          `分析已完成，结果已更新。任务：${runId}；资料包：${meetingId}`,
-          5,
-        );
-      } catch (error) {
-        const reason =
-          error instanceof Error ? error.message : "本地API暂不可用";
-        if (error instanceof AnalysisCancelledError) {
-          await reloadDataset().catch(() => undefined);
-          message.warning(`分析任务已取消。任务：${error.runId}`, 5);
-        } else if (reason.includes("超时")) {
-          message.warning("分析仍在后台进行，可稍后在列表中查看进度", 5);
+        const outcome = await watchAnalysisRun({
+          runId,
+          signal: controller.signal,
+          load: () => loadPackageTasks(meetingId),
+          onTasks: (items) => setTaskSnapshots((current) => ({ ...current, [meetingId]: items })),
+          onConnectionError: (reason) => setPollingErrors((current) => ({ ...current, [meetingId]: reason })),
+        });
+        if (!outcome || controller.signal.aborted) return;
+        await reloadDataset().then(() => setRefreshError(undefined)).catch((error) => {
+          setRefreshError(error instanceof Error ? error.message : "列表刷新失败");
+        });
+        if (controller.signal.aborted) return;
+        if (outcome.status === "cancelled") {
+          message.warning(`分析任务已取消。任务：${runId}`, 5);
+        } else if (outcome.status === "failed") {
+          const failed = outcome.tasks.find((item) => item.status === "处理失败");
+          message.error(`分析处理失败。阶段：${failed?.stage}；原因：${failed?.errorMessage || "请查看资料包详情"}`, 6);
         } else {
-          message.error(`分析处理失败。任务：${runId}；原因：${reason}`, 6);
+          message.success(`分析已完成，结果已更新。任务：${runId}；资料包：${meetingId}`, 5);
         }
       } finally {
         watchingRef.current.delete(runId);
-        setWatchingCount(watchingRef.current.size);
+        if (!controller.signal.aborted) setWatchingCount(watchingRef.current.size);
       }
     },
     [reloadDataset],
   );
 
   useEffect(() => {
-    if (watchingCount === 0) return;
+    if (watchingCount === 0 && !meetings.some((item) => item.status === "分析中")) return;
+    let busy = false;
     const timer = window.setInterval(() => {
-      void reloadDataset().catch(() => undefined);
+      if (busy) return;
+      busy = true;
+      void reloadDataset().then(() => setRefreshError(undefined)).catch((error) => {
+        setRefreshError(error instanceof Error ? error.message : "列表刷新失败");
+      }).finally(() => { busy = false; });
     }, 4_000);
     return () => window.clearInterval(timer);
-  }, [watchingCount, reloadDataset]);
+  }, [watchingCount, meetings, reloadDataset]);
 
-  const [liveTasks, setLiveTasks] = useState<ProcessingTask[] | null>(null);
   useEffect(() => {
-    if (!detail || detail.status !== "分析中") {
-      setLiveTasks(null);
-      return;
-    }
     let alive = true;
+    for (const meeting of meetings.filter((item) => item.status === "分析中")) {
+      if ([...watchingRef.current.values()].some((watcher) => watcher.meetingId === meeting.id)) continue;
+      void loadPackageTasks(meeting.id).then(({ items }) => {
+        if (!alive) return;
+        setTaskSnapshots((current) => ({ ...current, [meeting.id]: items }));
+        const tasks = selectAnalysisRunTasks(items);
+        if (tasks.length && !analysisOutcome(tasks)) void watchAnalysis(meeting.id, tasks[0].analysisRunId);
+      }).catch((error) => {
+        if (alive) setPollingErrors((current) => ({ ...current, [meeting.id]: error instanceof Error ? error.message : "无法读取分析状态" }));
+      });
+    }
+    return () => { alive = false; };
+  }, [meetings, watchAnalysis]);
+
+  useEffect(() => {
+    if (!detailId) return;
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout>;
     const tick = async () => {
       try {
-        const result = await loadPackageTasks(detail.id);
-        if (alive) setLiveTasks(result.items);
-      } catch {
-        // 轮询失败不打断用户操作；下一次心跳会重试。
+        const { items } = await loadPackageTasks(detailId);
+        if (!alive) return;
+        setTaskSnapshots((current) => ({ ...current, [detailId]: items }));
+        setPollingErrors((current) => ({ ...current, [detailId]: undefined }));
+      } catch (error) {
+        if (alive) setPollingErrors((current) => ({ ...current, [detailId]: error instanceof Error ? error.message : "无法读取分析状态" }));
+      } finally {
+        if (alive) timer = setTimeout(() => void tick(), 2_000);
       }
     };
     void tick();
-    const timer = window.setInterval(() => void tick(), 2_000);
     return () => {
       alive = false;
-      window.clearInterval(timer);
+      clearTimeout(timer);
     };
-  }, [detail?.id, detail?.status]);
+  }, [detailId]);
 
-  const liveRunTasks = useMemo(() => {
-    if (!liveTasks || !liveTasks.length) return null;
-    const groups = new Map<string, ProcessingTask[]>();
-    for (const task of liveTasks) {
-      const bucket = groups.get(task.analysisRunId) ?? [];
-      bucket.push(task);
-      groups.set(task.analysisRunId, bucket);
-    }
-    const active = [...groups.values()].find((group) =>
-      group.some(
-        (task) =>
-          task.status === "处理中" || task.status === "待处理",
-      ),
-    );
-    const newest = [...groups.values()].sort((a, b) =>
-      String(b[0]?.startedAt ?? "").localeCompare(
-        String(a[0]?.startedAt ?? ""),
-      ),
-    )[0];
-    return (active ?? newest ?? null)?.sort(
-      (a, b) => a.stageOrder - b.stageOrder,
-    ) ?? null;
-  }, [liveTasks]);
+  const liveRunTasks = detailId ? selectAnalysisRunTasks(taskSnapshots[detailId] ?? []) : [];
 
   const resetCreateDialog = () => {
     setCreateOpen(false);
@@ -1392,7 +1377,12 @@ function MeetingsPage({
       const result = await analyzeMeetingPackage(meetingId, true);
       setDetail(undefined);
       await reloadDataset();
-      message.success("分析任务已进入后台队列，完成后会自动提示", 4);
+      message.success(
+        result.cancelled_runs
+          ? `已停止 ${result.cancelled_runs} 个进行中的分析任务，新分析已进入后台队列`
+          : "分析任务已进入后台队列，完成后会自动提示",
+        4,
+      );
       void watchAnalysis(meetingId, result.analysis_run.id);
     } catch (error) {
       const reason =
@@ -1400,6 +1390,26 @@ function MeetingsPage({
       message.error(`分析任务启动失败：${reason}`);
     } finally {
       setAnalysisBusyId(undefined);
+    }
+  };
+
+  const stopAnalysis = async (meetingId: string) => {
+    setStopBusyId(meetingId);
+    try {
+      const result = await cancelMeetingPackageAnalysis(meetingId);
+      const refreshed = await reloadDataset();
+      setDetail(refreshed.meetings.find((item) => item.id === meetingId));
+      if (result.cancelled_runs) {
+        message.success("已请求停止分析任务，正在运行的阶段将在数秒内退出", 4);
+      } else {
+        message.info("当前没有排队或运行中的分析任务");
+      }
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "本地API暂不可用";
+      message.error(`停止分析失败：${reason}`);
+    } finally {
+      setStopBusyId(undefined);
     }
   };
 
@@ -1463,6 +1473,10 @@ function MeetingsPage({
           新建会议资料包
         </Button>
       </div>
+
+      {refreshError ? (
+        <p className="warning-copy" role="status">资料包状态刷新失败：{refreshError}。正在自动重试，当前显示上次成功读取的状态。</p>
+      ) : null}
 
       <div className="workflow-strip">
         {[
@@ -1720,27 +1734,21 @@ function MeetingsPage({
             <div className="detail-progress">
               <strong>{detail.currentStep}</strong>
               <Progress percent={detail.progress} />
-              {liveRunTasks ? (
+              <p className="analysis-status-meta">资料包更新：{formatTaskTime(detail.updatedAt)}</p>
+              {pollingErrors[detail.id] || refreshError ? (
+                <p className="warning-copy" role="status">
+                  状态暂时无法刷新：{pollingErrors[detail.id] || refreshError}。保留上次结果并自动重试；当前无法据此判断后台任务是否已结束。
+                </p>
+              ) : null}
+              {liveRunTasks.length ? (
                 <div className="stage-progress-list">
+                  <p className="analysis-status-meta">分析批次：{liveRunTasks[0].analysisRunId} · {liveRunTasks[0].analysisRunStatus ?? "以阶段状态为准"}</p>
                   {liveRunTasks.map((task) => {
-                    const result = (task.result ?? {}) as {
-                      transcribed?: number;
-                      total?: number;
-                      empty?: number;
-                      failed?: number;
-                    };
-                    const isTranscribing =
-                      task.stage === "音轨与转写" &&
-                      task.status === "处理中";
-                    const subText = isTranscribing
-                      ? `已转写 ${result.transcribed ?? 0}/${
-                          result.total ?? 0
-                        } 段`
-                      : task.status === "处理中"
-                        ? `${task.stage} 处理中`
-                        : "";
+                    const subText = describeProcessingTask(task);
+                    const unrecognized = unrecognizedAsrSegments(task);
                     return (
-                      <div className="stage-progress-row" key={task.id}>
+                      <div className="stage-progress-item" key={task.id}>
+                        <div className="stage-progress-row">
                         <span className="stage-progress-row__name">
                           {task.stage}
                         </span>
@@ -1764,7 +1772,28 @@ function MeetingsPage({
                         >
                           {task.status}
                         </Tag>
-                        {subText ? <em>{subText}</em> : null}
+                        </div>
+                        {subText ? <p className="analysis-status-meta">{subText}</p> : null}
+                        {unrecognized.length ? (
+                          <details className="analysis-status-meta">
+                            <summary>查看 {unrecognized.length} 个未识别片段</summary>
+                            <p>这些片段的转写内容已留空，不用于提取意向，其余材料继续分析。</p>
+                            <ul>
+                              {unrecognized.map((segment, index) => (
+                                <li key={`${segment.location}-${index}`}>{segment.location}：{segment.reason}</li>
+                              ))}
+                            </ul>
+                          </details>
+                        ) : null}
+                        <p className="analysis-status-meta">
+                          最近更新：{formatTaskTime(task.updatedAt)}
+                          {task.finishedAt ? ` · ${task.status === "处理失败" ? "失败" : task.status === "已取消" ? "取消" : "结束"}时间：${formatTaskTime(task.finishedAt)}` : ""}
+                        </p>
+                        {task.errorMessage ? (
+                          <p className={task.status === "处理失败" ? "analysis-stage-error" : "warning-copy"} role={task.status === "处理失败" ? "alert" : "note"}>
+                            {task.stage}：{task.errorMessage}
+                          </p>
+                        ) : null}
                       </div>
                     );
                   })}
@@ -1795,6 +1824,16 @@ function MeetingsPage({
               >
                 启动／重跑AI分析
               </Button>
+              {detail.status === "分析中" ? (
+                <Button
+                  danger
+                  icon={<StopOutlined />}
+                  loading={stopBusyId === detail.id}
+                  onClick={() => void stopAnalysis(detail.id)}
+                >
+                  停止分析
+                </Button>
+              ) : null}
               <div className="detail-export-row">
                 <span>结果导出</span>
                 <Space wrap>
@@ -2447,7 +2486,7 @@ function EvaluationPage({
             disabled={!meetingObservations.length}
             onClick={fillFromAiDraft}
           >
-            从当前AI草稿生成模板
+            从当前意向生成待标注模板
           </Button>
           <Input.TextArea
             value={goldenText}
@@ -2473,7 +2512,13 @@ function EvaluationPage({
         <Card className="content-card" title="评测结果">
           {report ? (
             <>
+              <Paragraph type="secondary">
+                默认评测最近成功的分析批次；模板需独立核对后作为金标准。
+              </Paragraph>
               <Descriptions column={2} size="small" bordered>
+                <Descriptions.Item label="分析批次" span={2}>
+                  {report.analysis_run_id ?? "历史无批次记录"}
+                </Descriptions.Item>
                 <Descriptions.Item label="金标准总数">
                   {report.total}
                 </Descriptions.Item>
@@ -2488,6 +2533,12 @@ function EvaluationPage({
                 </Descriptions.Item>
                 <Descriptions.Item label="未知样本数">
                   {report.unknown_total}
+                </Descriptions.Item>
+                <Descriptions.Item label="漏检样本数">
+                  {report.missed}
+                </Descriptions.Item>
+                <Descriptions.Item label="未知样本漏检数">
+                  {report.unknown_missed}
                 </Descriptions.Item>
                 <Descriptions.Item label="未知误判率">
                   {rate(report.unknown_misjudge_rate)}
@@ -2554,6 +2605,10 @@ function InsightsPage({
   const [activeWriteAction, setActiveWriteAction] = useState<
     "confirm" | "return" | "unknown"
   >();
+  const writeInFlight = useRef(false);
+  const [reviewing, setReviewing] = useState<IntentObservation>();
+  const [reviewNote, setReviewNote] = useState("");
+  const [reviewError, setReviewError] = useState("");
   const [platformDraft, setPlatformDraft] = useState<
     PlatformCascadeSelection & {
       level2NewValue?: string;
@@ -2584,6 +2639,10 @@ function InsightsPage({
   }, [platformDraft, taxonomy]);
   const meetingByEvidence = useMemo(
     () => new Map(evidence.map((item) => [item.id, item.meetingId])),
+    [evidence],
+  );
+  const evidenceById = useMemo(
+    () => new Map(evidence.map((item) => [item.id, item])),
     [evidence],
   );
   const scopedIntents = useMemo(
@@ -2624,37 +2683,58 @@ function InsightsPage({
     async (
       ids: string[],
       action: "confirm" | "return" | "unknown",
+      manualReview?: { version: number; note: string },
     ) => {
-      if (activeWriteAction) return;
+      if (writeInFlight.current) return;
       const { targets, missingIds } = resolveRequestedItems(scopedIntents, ids);
       if (!targets.length) {
         setSelectedRowKeys([]);
         message.warning("所选意向已不在当前资料包中，请重新选择");
         return;
       }
+      let preparedNote: string | undefined;
       if (action === "confirm") {
-        const blocked = targets.filter(
-          (item) =>
-            item.conflict ||
-            item.confidence < 0.75 ||
-            !item.identityConfirmed ||
-            item.attitude === null,
-        );
-        if (blocked.length) {
-          message.error(
-            `${blocked.length} 条结果存在身份、冲突、未知或低置信度风险，需逐条处理`,
-          );
+        try {
+          if (
+            manualReview &&
+            (targets.length !== 1 || targets[0].version !== manualReview.version)
+          ) {
+            throw new Error("意向内容已更新，请关闭复核窗口后重新核对");
+          }
+          for (const item of targets) {
+            preparedNote = prepareIntentConfirmation(
+              item,
+              evidenceById.get(item.evidenceId),
+              manualReview
+                ? { mode: "manual", note: manualReview.note }
+                : { mode: "batch" },
+            );
+          }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : "意向确认校验失败";
+          if (manualReview) setReviewError(reason);
+          else message.error(reason);
           return;
         }
       }
 
+      writeInFlight.current = true;
       setActiveWriteAction(action);
       try {
         const persistenceResults = await Promise.allSettled(
-          targets.map((item) => updateIntentStatus(item, action)),
+          targets.map((item) => updateIntentStatus(item, action, preparedNote)),
         );
         const { failedCount: failedWrites, successCount } =
           summarizeSettledWrites(persistenceResults);
+        if (manualReview && successCount) setReviewing(undefined);
+        if (manualReview && failedWrites) {
+          const failed = persistenceResults.find((result) => result.status === "rejected");
+          setReviewError(
+            failed?.status === "rejected" && failed.reason instanceof Error
+              ? failed.reason.message
+              : "确认未写入，请核对最新数据后重试",
+          );
+        }
         await reloadDataset();
         setSelectedRowKeys([]);
         const actionMessage =
@@ -2681,11 +2761,24 @@ function InsightsPage({
           error instanceof Error ? error.message : "本地API暂不可用";
         message.error(`操作后刷新失败：${reason}。请重新加载页面核对`);
       } finally {
+        writeInFlight.current = false;
         setActiveWriteAction(undefined);
       }
     },
-    [activeWriteAction, reloadDataset, scopedIntents],
+    [evidenceById, reloadDataset, scopedIntents],
   );
+
+  const openConfirmationReview = (item: IntentObservation) => {
+    if (writeInFlight.current) return;
+    try {
+      assertIntentConfirmationEvidence(item, evidenceById.get(item.evidenceId));
+      setReviewNote("");
+      setReviewError("");
+      setReviewing(item);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "意向确认校验失败");
+    }
+  };
 
   const saveEditing = async () => {
     if (!editing) return;
@@ -2871,7 +2964,7 @@ function InsightsPage({
             size="small"
             className="intent-row-actions__confirm"
             disabled={item.status === "已确认" || Boolean(activeWriteAction)}
-            onClick={() => void applyAction([item.id], "confirm")}
+            onClick={() => openConfirmationReview(item)}
           >
             确认
           </Button>
@@ -2986,6 +3079,73 @@ function InsightsPage({
         <strong>采用阶段独立记录</strong>
         <span>态度回答“谁支持”，阶段回答“推进到哪一步”</span>
       </div>
+
+      <Modal
+        open={Boolean(reviewing)}
+        title="逐条人工复核"
+        okText="确认并写入"
+        cancelText="取消"
+        confirmLoading={activeWriteAction === "confirm"}
+        okButtonProps={{ disabled: !reviewNote.trim() || Boolean(activeWriteAction) }}
+        cancelButtonProps={{ disabled: Boolean(activeWriteAction) }}
+        closable={!activeWriteAction}
+        maskClosable={!activeWriteAction}
+        keyboard={!activeWriteAction}
+        onCancel={() => {
+          if (!writeInFlight.current) setReviewing(undefined);
+        }}
+        onOk={() => {
+          if (reviewing) {
+            void applyAction([reviewing.id], "confirm", {
+              version: reviewing.version,
+              note: reviewNote,
+            });
+          }
+        }}
+      >
+        {reviewing ? (
+          <div className="edit-intent-form">
+            <strong>{reviewing.customer} · {reviewing.technology} · {reviewing.platform}</strong>
+            {intentConfirmationRisks(reviewing).length ? (
+              <div role="note">
+                {intentConfirmationRisks(reviewing).map((risk) => (
+                  <Tag color="warning" key={risk}>{risk}</Tag>
+                ))}
+                <p>请结合原文核对当前结论，并说明接受本次结论的理由。</p>
+              </div>
+            ) : null}
+            <Descriptions size="small" column={1}>
+              <Descriptions.Item label="职能／人员">
+                {reviewing.functionName} · {reviewing.person}
+              </Descriptions.Item>
+              <Descriptions.Item label="当前态度">
+                <AttitudeBadge value={reviewing.attitude} compact />
+              </Descriptions.Item>
+              <Descriptions.Item label="采用阶段">{reviewing.adoptionStage}</Descriptions.Item>
+              <Descriptions.Item label="证据原文">
+                {evidenceById.get(reviewing.evidenceId)?.quote}
+              </Descriptions.Item>
+            </Descriptions>
+            <Button onClick={() => onEvidence(reviewing.evidenceId)}>查看完整证据</Button>
+            <label>
+              复核理由
+              <Input.TextArea
+                aria-label="复核理由"
+                value={reviewNote}
+                onChange={(event) => {
+                  setReviewNote(event.target.value);
+                  setReviewError("");
+                }}
+                placeholder="请说明依据原文确认当前态度、采用阶段及处理冲突的理由"
+                maxLength={2000}
+                rows={3}
+                disabled={Boolean(activeWriteAction)}
+              />
+            </label>
+            {reviewError ? <p role="alert">{reviewError}</p> : null}
+          </div>
+        ) : null}
+      </Modal>
 
       <Modal
         open={Boolean(editing)}

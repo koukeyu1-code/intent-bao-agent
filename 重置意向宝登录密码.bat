@@ -2,21 +2,21 @@
 setlocal
 cd /d "%~dp0server"
 if not exist ".venv\Scripts\python.exe" (
-  echo [意向宝] 请先运行“首次安装依赖.bat”。
+  echo [ERROR] Python venv not found. Run the dependency setup bat first.
   pause
   exit /b 1
 )
 echo.
-choice /C AP /N /M "请选择要重置的账号 [A=admin, P=planner]："
+choice /C AP /N /M "Select account to reset [A=admin, P=planner]: "
 if errorlevel 2 (
   set "INTENT_BAO_RESET_USER=planner"
 ) else (
   set "INTENT_BAO_RESET_USER=admin"
 )
 echo.
-choice /C GM /N /M "请选择设置方式 [G=生成随机强密码, M=手动设置]："
+choice /C GM /N /M "Select method [G=generate strong password, M=manual input]: "
 if errorlevel 2 (
-  echo [意向宝] 输入密码时屏幕不会显示字符，这是正常的。
+  echo [INFO] Typed characters will not show on screen. This is normal.
   ".venv\Scripts\python.exe" -m app.auth_admin "%INTENT_BAO_RESET_USER%" --data-dir "%CD%\data"
 ) else (
   ".venv\Scripts\python.exe" -m app.auth_admin "%INTENT_BAO_RESET_USER%" --data-dir "%CD%\data" --generate

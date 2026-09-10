@@ -28,6 +28,7 @@ import {
 } from "antd";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  clearModelApiKey,
   loadEnvironmentCheck,
   listAvailableModels,
   loadModelSettings,
@@ -55,7 +56,7 @@ const defaultSettings: ModelSettings = {
   baseUrl: OLLAMA_DEFAULT_URL,
   modelName: MOCK_MODEL_NAME,
   asrProvider: "mock",
-  asrBaseUrl: "http://127.0.0.1:8081",
+  asrBaseUrl: "http://127.0.0.1:8099",
   asrModelName: "",
   apiKeyConfigured: false,
   connectionStatus: "unknown",
@@ -103,8 +104,6 @@ const formatCheckedAt = (value?: string) => {
 export default function ModelSettingsPage() {
   const [form] = Form.useForm<ModelSettingsInput>();
   const provider = Form.useWatch("provider", form) ?? "mock";
-  const baseUrl = Form.useWatch("baseUrl", form);
-  const modelName = Form.useWatch("modelName", form);
   const [settings, setSettings] =
     useState<ModelSettings>(defaultSettings);
   const [loading, setLoading] = useState(true);
@@ -238,11 +237,6 @@ export default function ModelSettingsPage() {
 
   const handleProviderChange = (value: ModelProvider) => {
     setTestResult(undefined);
-    setSettings((current) => ({
-      ...current,
-      connectionStatus: "unknown",
-      lastError: undefined,
-    }));
     if (value === "mock") {
       form.setFieldsValue({
         modelName: MOCK_MODEL_NAME,
@@ -303,26 +297,34 @@ export default function ModelSettingsPage() {
   const handleTest = async () => {
     if (!beginOperation("test")) return;
     setTestResult(undefined);
-    setSettings((current) => ({
-      ...current,
-      connectionStatus: "checking",
-    }));
+    let testingSavedSettings = false;
     try {
       const input = await currentInput();
+      testingSavedSettings =
+        input.provider === settings.provider &&
+        input.baseUrl.trim().replace(/\/$/, "") ===
+          settings.baseUrl.trim().replace(/\/$/, "") &&
+        input.modelName.trim() === settings.modelName.trim() &&
+        !input.apiKey;
+      if (testingSavedSettings) {
+        setSettings((current) => ({
+          ...current,
+          connectionStatus: "checking",
+        }));
+      }
       const result = await testModelConnection(input);
       setTestResult(result);
       setModelOptions((current) =>
         Array.from(new Set([...current, ...result.models].filter(Boolean))),
       );
-      setSettings((current) => ({
-        ...current,
-        provider: result.provider,
-        baseUrl: result.baseUrl,
-        modelName: result.modelName,
-        connectionStatus: result.ok ? "connected" : "error",
-        lastCheckedAt: result.checkedAt,
-        lastError: result.ok ? undefined : result.message,
-      }));
+      if (testingSavedSettings) {
+        setSettings((current) => ({
+          ...current,
+          connectionStatus: result.ok ? "connected" : "error",
+          lastCheckedAt: result.checkedAt,
+          lastError: result.ok ? undefined : result.message,
+        }));
+      }
       if (result.ok) {
         message.success(result.message || "模型连接测试成功");
       } else {
@@ -331,11 +333,13 @@ export default function ModelSettingsPage() {
     } catch (error) {
       const reason =
         error instanceof Error ? error.message : "模型服务暂不可用";
-      setSettings((current) => ({
-        ...current,
-        connectionStatus: "error",
-        lastError: reason,
-      }));
+      if (testingSavedSettings) {
+        setSettings((current) => ({
+          ...current,
+          connectionStatus: "error",
+          lastError: reason,
+        }));
+      }
       message.error(`模型连接测试失败：${reason}`);
     } finally {
       finishOperation("test");
@@ -363,14 +367,8 @@ export default function ModelSettingsPage() {
   const handleClearApiKey = async () => {
     if (!beginOperation("clear-key")) return;
     try {
-      const input = await currentInput();
-      const next = await saveModelSettings({
-        ...input,
-        apiKey: undefined,
-        clearApiKey: true,
-      });
+      const next = await clearModelApiKey();
       setSettings(next);
-      applySettingsToForm(next);
       setTestResult(undefined);
       message.success("已清除服务端保存的 API Key");
     } catch (error) {
@@ -669,8 +667,7 @@ export default function ModelSettingsPage() {
                   cancelText="取消"
                   disabled={
                     operationBusy ||
-                    !settings.apiKeyConfigured ||
-                    provider === "mock"
+                    !settings.apiKeyConfigured
                   }
                   onConfirm={() => void handleClearApiKey()}
                 >
@@ -680,8 +677,7 @@ export default function ModelSettingsPage() {
                     loading={activeOperation === "clear-key"}
                     disabled={
                       operationBusy ||
-                      !settings.apiKeyConfigured ||
-                      provider === "mock"
+                      !settings.apiKeyConfigured
                     }
                   >
                     清除密钥
@@ -706,10 +702,10 @@ export default function ModelSettingsPage() {
               </div>
               <div>
                 <span>当前活动配置</span>
-                <strong>{providerMeta[provider].label}</strong>
+                <strong>{providerMeta[settings.provider].label}</strong>
               </div>
-              <Tag color={providerMeta[provider].color}>
-                {provider === "mock" ? "流程演示" : "本地推理"}
+              <Tag color={providerMeta[settings.provider].color}>
+                {settings.provider === "mock" ? "流程演示" : "本地推理"}
               </Tag>
             </div>
 
@@ -718,12 +714,12 @@ export default function ModelSettingsPage() {
                 <Tag color={connectionMeta.color}>{connectionMeta.label}</Tag>
               </Descriptions.Item>
               <Descriptions.Item label="当前模型">
-                {modelName || "尚未选择"}
+                {settings.modelName || "尚未选择"}
               </Descriptions.Item>
               <Descriptions.Item label="服务地址">
-                {provider === "mock"
+                {settings.provider === "mock"
                   ? "不调用外部模型服务"
-                  : baseUrl || OLLAMA_DEFAULT_URL}
+                  : settings.baseUrl || OLLAMA_DEFAULT_URL}
               </Descriptions.Item>
               <Descriptions.Item label="API Key">
                 {settings.apiKeyConfigured ? "已配置（内容已隐藏）" : "未配置"}
@@ -758,9 +754,7 @@ export default function ModelSettingsPage() {
                 </Button>
               </Descriptions.Item>
               <Descriptions.Item label="最近检测">
-                {formatCheckedAt(
-                  testResult?.checkedAt ?? settings.lastCheckedAt,
-                )}
+                {formatCheckedAt(settings.lastCheckedAt)}
               </Descriptions.Item>
             </Descriptions>
 
@@ -777,7 +771,7 @@ export default function ModelSettingsPage() {
                   <CloseCircleOutlined />
                 )}
                 <div>
-                  <strong>{testResult.message}</strong>
+                  <strong>表单配置测试：{testResult.message}</strong>
                   <span>
                     {testResult.latencyMs !== undefined
                       ? `响应耗时 ${testResult.latencyMs} ms`
@@ -797,7 +791,7 @@ export default function ModelSettingsPage() {
 
             <div className="model-settings-note">
               <strong>能力边界</strong>
-              <p>{providerMeta[provider].description}</p>
+              <p>{providerMeta[settings.provider].description}</p>
               <p>
                 连接成功只表示服务可调用，不代表意向识别准确率已经达到85%；真实结果仍需人工确认。
               </p>
