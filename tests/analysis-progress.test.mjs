@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { analysisOutcome, describeProcessingTask, selectAnalysisRunTasks, unrecognizedAsrSegments, watchAnalysisRun } from "../app/analysis-progress.ts";
+import { analysisOutcome, analysisRunStatusLabel, describeProcessingTask, hasUnalignedMaterials, processingTaskStatusLabel, selectAnalysisRunTasks, unalignedMaterialBatches, unrecognizedAsrSegments, watchAnalysisRun } from "../app/analysis-progress.ts";
 
 const task = (run, status, extras = {}) => ({
   id: `${run}-stage`, packageId: "meeting-1", analysisRunId: run,
@@ -30,6 +30,75 @@ test("completed ASR keeps unrecognized counts and timestamps without failing the
   assert.deepEqual(unrecognizedAsrSegments(task("current", "处理中", {
     result: { skipped_segments: [null, {}, { start_ms: -1, end_ms: 5 }] },
   })), []);
+});
+
+test("alignment warnings retain completed status, partial success and material details", () => {
+  const alignment = task("current", "已完成", { stage: "资料对齐", progress: 100,
+    analysisRunStatus: "已完成",
+    result: {
+      batches: 24, processed_batches: 24, completed_batches: 23, skipped_batches: 1,
+      retry_count: 6, has_warnings: true, unmatched_count: 2,
+      unaligned_batches: [{ batch: 2, segment_ids: ["segment-1", "segment-2"],
+        start_ms: 239970, end_ms: 250500, material_names: ["产品介绍.pdf", "屏幕录制.mp4"],
+        target_ids: ["page-1"], error: "输出达到上限，拆分重试后仍未完成", category: "output_limit" }],
+    },
+  });
+  const stages = [alignment, task("current", "已完成", { stage: "意向抽取" })];
+  assert.equal(analysisOutcome(stages), "completed");
+  assert.equal(analysisRunStatusLabel(stages), "已完成，有未对齐项");
+  assert.equal(processingTaskStatusLabel(alignment), "已完成，有未对齐项");
+  assert.equal(processingTaskStatusLabel(stages[1]), "已完成");
+  assert.match(describeProcessingTask(alignment), /已处理 24\/24 批 · 成功处理 23 批/);
+  assert.match(describeProcessingTask(alignment), /部分资料未对齐，涉及 2 段/);
+  assert.match(describeProcessingTask(alignment), /拆批重试 6 次/);
+  assert.doesNotMatch(describeProcessingTask(alignment), /已完成 24\/24 批/);
+  assert.deepEqual(unalignedMaterialBatches(alignment), [{
+    location: "第 2 批 · 产品介绍.pdf、屏幕录制.mp4 · 00:03:59.970–00:04:10.500",
+    reason: "输出达到上限，拆分重试后仍未完成",
+  }]);
+});
+
+test("processed alignment batches are not counted as successful and warnings never hide failure or cancellation", () => {
+  const alignment = task("current", "处理中", { stage: "资料对齐", analysisRunStatus: "运行中",
+    result: { batches: 24, processed_batches: 2, completed_batches: 1, has_warnings: true, unmatched_count: 1 },
+  });
+  assert.match(describeProcessingTask(alignment), /已处理 2\/24 批 · 成功处理 1 批/);
+  assert.equal(processingTaskStatusLabel(alignment), "处理中");
+  assert.equal(analysisRunStatusLabel([alignment]), "运行中");
+  for (const [status, outcome] of [["处理失败", "failed"], ["已取消", "cancelled"]]) {
+    const stopped = { ...alignment, status, analysisRunStatus: status };
+    assert.equal(analysisOutcome([stopped]), outcome);
+    assert.equal(processingTaskStatusLabel(stopped), status);
+    assert.equal(analysisRunStatusLabel([stopped]), status);
+  }
+});
+
+test("a successful empty alignment has no warning and prior runs cannot leak warning labels", () => {
+  const old = task("old", "已完成", { stage: "资料对齐", analysisRunStatus: "已完成",
+    analysisRunCreatedAt: "2026-09-09T00:00:00Z", result: { has_warnings: true, unmatched_count: 4 },
+  });
+  const current = task("current", "已完成", { stage: "资料对齐", analysisRunStatus: "已完成",
+    analysisRunCreatedAt: "2026-09-10T00:00:00Z",
+    result: { batches: 2, processed_batches: 2, completed_batches: 2, alignments: 0,
+      has_warnings: false, unmatched_count: 0, unaligned_batches: [] },
+  });
+  assert.equal(hasUnalignedMaterials(current), false);
+  assert.equal(processingTaskStatusLabel(current), "已完成");
+  assert.equal(analysisRunStatusLabel(selectAnalysisRunTasks([old, current])), "已完成");
+  assert.deepEqual(unalignedMaterialBatches(current), []);
+  assert.doesNotMatch(describeProcessingTask(current), /未对齐/);
+  assert.equal(hasUnalignedMaterials({ ...old, stage: "音轨与转写" }), false);
+});
+
+test("unaligned material details tolerate incomplete stored diagnostics without inventing time ranges", () => {
+  const alignment = task("current", "已完成", { stage: "资料对齐",
+    result: { unaligned_batches: [null, "bad", {
+      batch: 3, start_ms: -1, end_ms: 500, material_names: [null, "", "材料.pdf"], error: "连接超时",
+    }] },
+  });
+  assert.equal(hasUnalignedMaterials(alignment), true);
+  assert.deepEqual(unalignedMaterialBatches(alignment), [{ location: "第 3 批 · 材料.pdf", reason: "连接超时" }]);
+  assert.deepEqual(unalignedMaterialBatches({ ...alignment, result: { unaligned_batches: "bad" } }), []);
 });
 
 test("latest queued run wins over older active or recently cancelled tasks and stages stay ordered", () => {

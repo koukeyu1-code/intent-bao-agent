@@ -520,6 +520,33 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         content = message.get("content") if isinstance(message, dict) else None
         return content if isinstance(content, str) else None
 
+    def _check_output_limit(self, body: Any, *, budget: int) -> None:
+        if not isinstance(body, dict):
+            return
+        choices = body.get("choices")
+        first = choices[0] if isinstance(choices, list) and choices else None
+        finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
+        if body.get("done_reason") != "length" and finish_reason != "length":
+            return
+
+        # A syntactically complete object can still omit truncated array items.
+        # Persist only numeric usage, never the response or reasoning text.
+        details = [f"输出预算 {budget} token"]
+        usage = body.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        output_tokens = usage.get("completion_tokens", body.get("eval_count"))
+        if type(output_tokens) is int and output_tokens >= 0:
+            details.append(f"实际输出 {output_tokens} token")
+        token_details = usage.get("completion_tokens_details")
+        if isinstance(token_details, dict):
+            reasoning_tokens = token_details.get("reasoning_tokens")
+            if type(reasoning_tokens) is int and reasoning_tokens >= 0:
+                details.append(f"思考 {reasoning_tokens} token")
+        raise ModelAdapterError(
+            f"{self._service_label}达到输出上限，结果不完整（{'；'.join(details)}）",
+            category="output_limit",
+        )
+
     async def _post_chat(self, request_body: dict[str, Any]) -> Any:
         """Keep callbacks on the calling thread; cancel the socket on exit."""
         owns_deadline = self._request_deadline is None
@@ -636,6 +663,7 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         ) as exc:
             raise self._safe_request_error(exc) from exc
 
+        self._check_output_limit(body, budget=budget)
         content = self._content_from_response(body)
         if not isinstance(content, str) or not content.strip():
             raise ModelAdapterError(
@@ -700,8 +728,8 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
                     return self._result_from(structured, body, budget=budget)
                 except ModelAdapterError as exc:
                     errors.append(f"第{attempt}次生成：{exc}")
-                    # Repeating a context/timeout/HTTP 4xx error cannot fix it.
-                    if attempt == 2 or exc.category in {"context", "timeout", "http"}:
+                    # These failures require different inputs or service settings.
+                    if attempt == 2 or exc.category in {"context", "timeout", "http", "output_limit"}:
                         raise ModelAdapterError("意向抽取失败：" + "；".join(errors), category=exc.category) from exc
                     if exc.category in {"grammar", "invalid_response"}:
                         use_format = False

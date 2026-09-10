@@ -9,6 +9,7 @@ import re
 import shutil
 import time
 import zipfile
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -37,7 +38,7 @@ from .media_processing import (
     probe_media_duration,
     slice_audio_segment,
 )
-from .model_adapters import IntentModelAdapter, ModelContext, get_model_adapter
+from .model_adapters import IntentModelAdapter, ModelAdapterError, ModelContext, get_model_adapter
 from .stage_adapters import get_stage_adapter
 from .request_budget import estimate_tokens, split_items_for_request
 from .schemas import IntentConfirmRequest, SpeakerConfirmRequest
@@ -53,6 +54,10 @@ from .taxonomy_service import (
 logger = logging.getLogger(__name__)
 
 _ASR_WINDOW_MS = 30_000
+_ALIGNMENT_MAX_SEGMENTS = 4
+_ALIGNMENT_MAX_TARGETS = 8
+_ALIGNMENT_MAX_ATTEMPTS = 7
+_ALIGNMENT_BATCH_TIMEOUT_SECONDS = 480.0
 
 
 def _asr_windows(
@@ -1019,83 +1024,177 @@ def _run_alignment_stage(
     persisted = 0
     requests = []
     completed = 0
+    processed = 0
+    retry_count = 0
+    unaligned_batches: list[dict[str, Any]] = []
+    seen = set()
+    material_ids = {row.material_file_id for row in transcripts + pages + frames if row.material_file_id}
+    material_names = dict(session.execute(select(m.MaterialFile.id, m.MaterialFile.original_name).where(
+        m.MaterialFile.id.in_(material_ids))).all())
+    segment_sources = {row.id: row.material_file_id for row in transcripts}
+    target_sources = {row.id: row.material_file_id for row in pages + frames}
+
+    def summary():
+        return {"alignments": persisted, "batches": len(requests),
+                "processed_batches": processed, "completed_batches": completed,
+                "retry_count": retry_count, "skipped_batches": len(unaligned_batches),
+                "has_warnings": bool(unaligned_batches),
+                "unmatched_count": len({sid for row in unaligned_batches for sid in row["segment_ids"]}),
+                "unaligned_batches": list(unaligned_batches)}
+
+    def record_unaligned(request, batch, error):
+        segments = request["segments"]
+        candidate_ids = sorted({row["id"] for row in request["pages"] + request["frames"]})
+        source_ids = ({segment_sources.get(row["id"]) for row in segments}
+                      | {target_sources.get(target_id) for target_id in candidate_ids})
+        unaligned_batches.append({
+            "batch": batch, "segment_ids": sorted({row["id"] for row in segments}),
+            "start_ms": min(row["start_ms"] for row in segments),
+            "end_ms": max(row["end_ms"] for row in segments),
+            "material_names": sorted({material_names[mid] for mid in source_ids if mid in material_names}),
+            "target_ids": candidate_ids, "error": str(error), "category": error.category,
+        })
+
+    def split_request(request):
+        segments = request["segments"]
+        if len(segments) > 1:
+            middle = len(segments) // 2
+            return [{**request, "segments": group} for group in (segments[:middle], segments[middle:])]
+        candidates = ([{**row, "kind": "pages"} for row in request["pages"]]
+                      + [{**row, "kind": "frames"} for row in request["frames"]])
+        if len(candidates) > 1:
+            middle = len(candidates) // 2
+            return [payload(segments, group) for group in (candidates[:middle], candidates[middle:])]
+        return []
+
     try:
-        # Keep nearby speech together and reserve at least half the request for
-        # candidate pages. Page groups are revisited so long documents are not lost.
+        _update_task(session, run, "资料对齐", status="处理中", progress=0,
+                     result_json={"phase": "preparing", "started_at": m.utcnow().isoformat()})
+        session.commit()
+        # Bound potential output as well as input, keeping every source and
+        # revisiting page groups rather than dropping long documents.
         windows: list[list[dict]] = []
         for item in sorted(segment_payload, key=lambda row: (row["start_ms"], row["id"])):
             if not windows or item["start_ms"] - windows[-1][0]["start_ms"] >= 180_000:
                 windows.append([])
             windows[-1].append(item)
         for window in windows:
-            segment_batches = split_items_for_request(
-                window, text_key="text",
-                fits=lambda items: fits(items, []) and estimate_tokens(json.dumps(items, ensure_ascii=False)) <= int(_llm_num_ctx() * 0.30),
-            )
-            for segment_batch in segment_batches:
-                target_batches = split_items_for_request(
-                    targets, text_key="text", fits=lambda items: fits(segment_batch, items),
-                )
-                requests.extend(payload(segment_batch, group) for group in target_batches)
-        seen = set()
-        for index, request in enumerate(requests, 1):
             _raise_if_analysis_cancel_requested(session, run)
-            progress_data = {"batch": index, "batches": len(requests),
-                             "completed_batches": completed, "alignments": persisted,
-                             "started_at": m.utcnow().isoformat(), "last_activity_at": m.utcnow().isoformat()}
-            _update_task(session, run, "资料对齐", status="处理中",
-                         progress=int(99 * completed / len(requests)), result_json=progress_data)
-            session.commit()
+            try:
+                segment_batches = split_items_for_request(
+                    window, text_key="text",
+                    fits=lambda items: len(items) <= _ALIGNMENT_MAX_SEGMENTS and fits(items, [])
+                    and estimate_tokens(json.dumps(items, ensure_ascii=False)) <= int(_llm_num_ctx() * 0.30),
+                )
+            except ValueError:
+                requests.append((payload(window, targets), ModelAdapterError(
+                    "转写材料无法在保留来源的情况下装入模型上下文", category="context")))
+                continue
+            for segment_batch in segment_batches:
+                _raise_if_analysis_cancel_requested(session, run)
+                try:
+                    target_batches = split_items_for_request(
+                        targets, text_key="text",
+                        fits=lambda items: len(items) <= _ALIGNMENT_MAX_TARGETS and fits(segment_batch, items),
+                    )
+                except ValueError:
+                    requests.append((payload(segment_batch, targets), ModelAdapterError(
+                        "候选资料无法在保留来源的情况下装入模型上下文", category="context")))
+                    continue
+                requests.extend((payload(segment_batch, group), None) for group in target_batches)
+        for index, (request, planning_error) in enumerate(requests, 1):
+            _raise_if_analysis_cancel_requested(session, run)
+            deadline = time.monotonic() + _ALIGNMENT_BATCH_TIMEOUT_SECONDS
+            attempts = 0
+            batch_started = m.utcnow().isoformat()
             last_write = [0.0]
 
-            def heartbeat(info):
-                if time.monotonic() - last_write[0] < 5:
+            def heartbeat(info, *, force=False):
+                if not force and time.monotonic() - last_write[0] < 5:
                     return
                 last_write[0] = time.monotonic()
-                _update_task(session, run, "资料对齐", status="处理中", result_json={
-                    **progress_data, **info, "last_activity_at": m.utcnow().isoformat(),
-                })
+                _update_task(session, run, "资料对齐", status="处理中",
+                             progress=int(99 * processed / len(requests)), result_json={
+                                 **summary(), **info, "batch": index, "attempt": attempts,
+                                 "started_at": batch_started, "last_activity_at": m.utcnow().isoformat(),
+                             })
                 session.commit()
 
-            if hasattr(stage_adapter, "set_runtime_hooks"):
-                stage_adapter.set_runtime_hooks(
-                    check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
-                    on_progress=heartbeat,
-                )
-            try:
-                alignments = stage_adapter.align_materials(**request)
-            finally:
+            def execute_request(part):
+                nonlocal attempts, retry_count, persisted
+                _raise_if_analysis_cancel_requested(session, run)
+                remaining = deadline - time.monotonic()
+                if attempts >= _ALIGNMENT_MAX_ATTEMPTS or remaining <= 0:
+                    error = ModelAdapterError(
+                        "资料对齐已达到本批重试次数或总耗时上限，保留为未对齐",
+                        category="output_limit" if remaining > 0 else "timeout")
+                    record_unaligned(part, index, error)
+                    heartbeat({"phase": "skipped"}, force=True)
+                    return False
+                if attempts:
+                    retry_count += 1
+                attempts += 1
+                heartbeat({"phase": "requesting"}, force=True)
                 if hasattr(stage_adapter, "set_runtime_hooks"):
-                    stage_adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
-            _raise_if_analysis_cancel_requested(session, run)
-            valid_segments = {row["id"] for row in request["segments"]}
-            valid_targets = {"pdf_page": {row["id"] for row in request["pages"]},
-                             "key_frame": {row["id"] for row in request["frames"]}}
-            for alignment in alignments:
-                key = (alignment.segment_id, alignment.target_type, alignment.target_id)
-                if (key in seen or alignment.segment_id not in valid_segments
-                        or alignment.target_id not in valid_targets.get(alignment.target_type, set())):
-                    continue
-                seen.add(key)
-                session.add(m.AlignmentLink(
-                    analysis_run_id=run.id, package_id=package.id,
-                    segment_id=alignment.segment_id, target_type=alignment.target_type,
-                    target_id=alignment.target_id, confidence=alignment.confidence,
-                    reason=alignment.reason,
-                ))
-                persisted += 1
-            completed += 1
+                    stage_adapter.set_runtime_hooks(
+                        check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
+                        on_progress=heartbeat)
+                failure = None
+                try:
+                    limit = (stage_adapter.request_time_limit(deadline - time.monotonic())
+                             if hasattr(stage_adapter, "request_time_limit") else nullcontext())
+                    with limit:
+                        alignments = stage_adapter.align_materials(**part)
+                except ModelAdapterError as exc:
+                    failure = exc
+                finally:
+                    if hasattr(stage_adapter, "set_runtime_hooks"):
+                        stage_adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
+                _raise_if_analysis_cancel_requested(session, run)
+                if failure is not None:
+                    children = split_request(part) if failure.category == "output_limit" else []
+                    if children and attempts < _ALIGNMENT_MAX_ATTEMPTS and time.monotonic() < deadline:
+                        # Evaluate both halves even when one fails so the other
+                        # half can still contribute verified evidence.
+                        outcomes = [execute_request(child) for child in children]
+                        return all(outcomes)
+                    record_unaligned(part, index, failure)
+                    heartbeat({"phase": "skipped"}, force=True)
+                    return False
+                valid_segments = {row["id"] for row in part["segments"]}
+                valid_targets = {"pdf_page": {row["id"] for row in part["pages"]},
+                                 "key_frame": {row["id"] for row in part["frames"]}}
+                for alignment in alignments:
+                    key = (alignment.segment_id, alignment.target_type, alignment.target_id)
+                    if (key in seen or alignment.segment_id not in valid_segments
+                            or alignment.target_id not in valid_targets.get(alignment.target_type, set())):
+                        continue
+                    seen.add(key)
+                    session.add(m.AlignmentLink(
+                        analysis_run_id=run.id, package_id=package.id,
+                        segment_id=alignment.segment_id, target_type=alignment.target_type,
+                        target_id=alignment.target_id, confidence=alignment.confidence,
+                        reason=alignment.reason,
+                    ))
+                    persisted += 1
+                heartbeat({"phase": "received"}, force=True)
+                return True
+
+            if planning_error is not None:
+                record_unaligned(request, index, planning_error)
+            elif execute_request(request):
+                completed += 1
+            processed += 1
+            heartbeat({"phase": "processed"}, force=True)
         _update_task(session, run, "资料对齐", status="已完成",
-                     result_json={"alignments": persisted, "batches": len(requests),
-                                  "completed_batches": completed})
+                     result_json=summary())
     except _AnalysisCancellationRequested:
         raise
     except Exception as exc:
         _raise_if_analysis_cancel_requested(session, run)
         reason = f"资料对齐失败（已完成 {completed}/{len(requests)} 批）：{exc}"
         _update_task(session, run, "资料对齐", status="处理失败",
-                     result_json={"alignments": persisted, "batches": len(requests),
-                                  "completed_batches": completed, "error": reason})
+                     result_json={**summary(), "error": reason})
         task = session.scalar(select(m.ProcessingTask).where(
             m.ProcessingTask.analysis_run_id == run.id, m.ProcessingTask.stage == "资料对齐"))
         if task:

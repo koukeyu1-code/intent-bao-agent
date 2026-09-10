@@ -169,7 +169,11 @@ type NavigationSection = {
 
 import {
   analysisOutcome,
+  analysisRunStatusLabel,
   describeProcessingTask,
+  hasUnalignedMaterials,
+  processingTaskStatusLabel,
+  unalignedMaterialBatches,
   unrecognizedAsrSegments,
   formatTaskTime,
   selectAnalysisRunTasks,
@@ -1058,6 +1062,8 @@ function MeetingsPage({
         } else if (outcome.status === "failed") {
           const failed = outcome.tasks.find((item) => item.status === "处理失败");
           message.error(`分析处理失败。阶段：${failed?.stage}；原因：${failed?.errorMessage || "请查看资料包详情"}`, 6);
+        } else if (outcome.tasks.some(hasUnalignedMaterials)) {
+          message.warning(`分析已完成，有未对齐项。已保留成功结果，请在资料包详情查看未对齐原因。任务：${runId}`, 6);
         } else {
           message.success(`分析已完成，结果已更新。任务：${runId}；资料包：${meetingId}`, 5);
         }
@@ -1733,6 +1739,12 @@ function MeetingsPage({
             </div>
             <div className="detail-progress">
               <strong>{detail.currentStep}</strong>
+              {liveRunTasks.some(hasUnalignedMaterials) ? (
+                <p className="warning-copy" role="status">
+                  {analysisOutcome(liveRunTasks) === "completed" ? "已完成，有未对齐项。" : "部分资料未对齐。"}
+                  已成功的对齐结果保留，未完成的对齐不作为证据；详情见“资料对齐”阶段。
+                </p>
+              ) : null}
               <Progress percent={detail.progress} />
               <p className="analysis-status-meta">资料包更新：{formatTaskTime(detail.updatedAt)}</p>
               {pollingErrors[detail.id] || refreshError ? (
@@ -1742,10 +1754,11 @@ function MeetingsPage({
               ) : null}
               {liveRunTasks.length ? (
                 <div className="stage-progress-list">
-                  <p className="analysis-status-meta">分析批次：{liveRunTasks[0].analysisRunId} · {liveRunTasks[0].analysisRunStatus ?? "以阶段状态为准"}</p>
+                  <p className="analysis-status-meta">分析批次：{liveRunTasks[0].analysisRunId} · {analysisRunStatusLabel(liveRunTasks)}</p>
                   {liveRunTasks.map((task) => {
                     const subText = describeProcessingTask(task);
                     const unrecognized = unrecognizedAsrSegments(task);
+                    const unaligned = unalignedMaterialBatches(task);
                     return (
                       <div className="stage-progress-item" key={task.id}>
                         <div className="stage-progress-row">
@@ -1760,7 +1773,7 @@ function MeetingsPage({
                         <Tag
                           color={
                             task.status === "已完成"
-                              ? "success"
+                              ? hasUnalignedMaterials(task) ? "warning" : "success"
                               : task.status === "不适用"
                                 ? "default"
                                 : task.status === "处理失败"
@@ -1770,7 +1783,7 @@ function MeetingsPage({
                                     : "default"
                           }
                         >
-                          {task.status}
+                          {processingTaskStatusLabel(task)}
                         </Tag>
                         </div>
                         {subText ? <p className="analysis-status-meta">{subText}</p> : null}
@@ -1781,6 +1794,17 @@ function MeetingsPage({
                             <ul>
                               {unrecognized.map((segment, index) => (
                                 <li key={`${segment.location}-${index}`}>{segment.location}：{segment.reason}</li>
+                              ))}
+                            </ul>
+                          </details>
+                        ) : null}
+                        {unaligned.length ? (
+                          <details className="analysis-status-meta">
+                            <summary>查看 {unaligned.length} 个未完成对齐的子批</summary>
+                            <p>以下片段与部分资料的对齐未完成；已成功的对齐保留，后续分析继续。未完成的对齐不作为证据。</p>
+                            <ul>
+                              {unaligned.map((batch, index) => (
+                                <li key={`${batch.location}-${index}`}>{batch.location}：{batch.reason}</li>
                               ))}
                             </ul>
                           </details>

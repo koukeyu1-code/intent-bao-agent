@@ -26,6 +26,23 @@ export function analysisOutcome(tasks: ProcessingTask[]) {
   return "completed" as const;
 }
 
+export function hasUnalignedMaterials(task: ProcessingTask) {
+  if (task.stage !== "资料对齐") return false;
+  const result = task.result ?? {};
+  return result.has_warnings === true || Number(result.unmatched_count) > 0
+    || (Array.isArray(result.unaligned_batches) && result.unaligned_batches.length > 0);
+}
+
+export function processingTaskStatusLabel(task: ProcessingTask) {
+  return task.status === "已完成" && hasUnalignedMaterials(task)
+    ? "已完成，有未对齐项" : task.status;
+}
+
+export function analysisRunStatusLabel(tasks: ProcessingTask[]) {
+  return analysisOutcome(tasks) === "completed" && tasks.some(hasUnalignedMaterials)
+    ? "已完成，有未对齐项" : tasks[0]?.analysisRunStatus ?? "以阶段状态为准";
+}
+
 function nextPoll(signal: AbortSignal) {
   return new Promise<void>((resolve) => {
     const finish = () => {
@@ -92,9 +109,19 @@ export function describeProcessingTask(task: ProcessingTask, now = Date.now()) {
     if (reused > 0) parts.push(`复用缓存 ${reused} 段`);
   }
   if (typeof result.batches === "number") {
-    parts.push(`已完成 ${result.completed_batches ?? 0}/${result.batches} 批`);
+    if (typeof result.processed_batches === "number") {
+      parts.push(`已处理 ${result.processed_batches}/${result.batches} 批`);
+      parts.push(`成功处理 ${result.completed_batches ?? 0} 批`);
+    } else {
+      parts.push(`已完成 ${result.completed_batches ?? 0}/${result.batches} 批`);
+    }
     if (result.batch) parts.push(`${task.status === "处理失败" ? "失败于" : "最近处理"}第 ${result.batch} 批`);
   }
+  if (hasUnalignedMaterials(task)) {
+    const count = Number(result.unmatched_count);
+    parts.push(`部分资料未对齐${count > 0 ? `，涉及 ${count} 段` : ""}`);
+  }
+  if (Number(result.retry_count) > 0) parts.push(`拆批重试 ${result.retry_count} 次`);
   if (result.current_file) parts.push(`文件：${result.current_file}`);
   if (Number(result.retry) > 0) parts.push(`重试 ${result.retry} 次`);
   const started = result.current_started_at ?? result.started_at ?? task.startedAt;
@@ -105,6 +132,35 @@ export function describeProcessingTask(task: ProcessingTask, now = Date.now()) {
   return parts.join(" · ");
 }
 
+function formatSegmentTime(value: number) {
+  const milliseconds = Math.floor(value);
+  const seconds = Math.floor(milliseconds / 1000);
+  return `${String(Math.floor(seconds / 3600)).padStart(2, "0")}:${String(Math.floor(seconds / 60) % 60).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}.${String(milliseconds % 1000).padStart(3, "0")}`;
+}
+
+export function unalignedMaterialBatches(task: ProcessingTask) {
+  const rows = task.result?.unaligned_batches;
+  if (task.stage !== "资料对齐" || !Array.isArray(rows)) return [];
+  return rows.flatMap((row) => {
+    if (!row || typeof row !== "object") return [];
+    const { start_ms: start, end_ms: end, material_names: names, batch, error } = row;
+    const location: string[] = [];
+    if (typeof batch === "number" && batch > 0) location.push(`第 ${batch} 批`);
+    if (Array.isArray(names)) {
+      const materialNames = names.filter((name): name is string => typeof name === "string" && Boolean(name.trim()));
+      if (materialNames.length) location.push(materialNames.join("、"));
+    }
+    if (typeof start === "number" && typeof end === "number"
+      && Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start) {
+      location.push(`${formatSegmentTime(start)}–${formatSegmentTime(end)}`);
+    }
+    return [{
+      location: location.join(" · ") || "未完成对齐的资料",
+      reason: typeof error === "string" && error.trim() ? error : "资料对齐未完成",
+    }];
+  });
+}
+
 export function unrecognizedAsrSegments(task: ProcessingTask) {
   const rows = task.result?.skipped_segments;
   if (!Array.isArray(rows)) return [];
@@ -112,12 +168,8 @@ export function unrecognizedAsrSegments(task: ProcessingTask) {
     if (!row || typeof row !== "object") return [];
     const { start_ms: start, end_ms: end, material_name: name, error } = row;
     if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start) return [];
-    const stamp = (value: number) => {
-      const seconds = Math.floor(value / 1000);
-      return `${String(Math.floor(seconds / 3600)).padStart(2, "0")}:${String(Math.floor(seconds / 60) % 60).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}.${String(value % 1000).padStart(3, "0")}`;
-    };
     return [{
-      location: `${typeof name === "string" ? `${name} · ` : ""}${stamp(start)}–${stamp(end)}`,
+      location: `${typeof name === "string" ? `${name} · ` : ""}${formatSegmentTime(start)}–${formatSegmentTime(end)}`,
       reason: typeof error === "string" ? error : "未识别出文字",
     }];
   });
