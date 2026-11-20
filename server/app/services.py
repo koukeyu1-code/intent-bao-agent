@@ -740,7 +740,7 @@ def _finish_analysis_tasks(
     *,
     adapter_name: str,
 ) -> None:
-    text_only_skips = {"音轨与转写", "说话人分离", "画面与PDF解析"}
+    text_only_skips = {"音轨与转写", "说话人分离", "录屏解析"}
     for task in tasks:
         task.status = (
             "不适用"
@@ -1819,10 +1819,10 @@ def _run_visual_stage(
 ) -> list[m.KeyFrame]:
     screen = [item for item in files if item.material_type == "录屏"]
     if not screen:
-        _update_task(session, run, "画面与PDF解析", status="不适用")
+        _update_task(session, run, "录屏解析", status="不适用")
         return []
     frames: list[m.KeyFrame] = []
-    _update_task(session, run, "画面与PDF解析", status="处理中", progress=0)
+    _update_task(session, run, "录屏解析", status="处理中", progress=0)
     for file_index, item in enumerate(screen):
         _raise_if_analysis_cancel_requested(session, run)
         path = (settings.data_dir / item.relative_path).resolve()
@@ -1842,12 +1842,12 @@ def _run_visual_stage(
             item.parse_status = "解析失败"
             reason = f"录屏“{item.safe_name}”未提取到画面，请检查媒体工具或文件后重试"
             _update_task(
-                session, run, "画面与PDF解析", status="处理失败",
+                session, run, "录屏解析", status="处理失败",
                 result_json={"failed_material_file_id": item.id},
             )
             task = session.scalar(select(m.ProcessingTask).where(
                 m.ProcessingTask.analysis_run_id == run.id,
-                m.ProcessingTask.stage == "画面与PDF解析",
+                m.ProcessingTask.stage == "录屏解析",
             ))
             if task is not None:
                 task.error_message = reason
@@ -1867,14 +1867,14 @@ def _run_visual_stage(
             frames.append(frame)
         item.parse_status = "解析完成"
         _update_task(
-            session, run, "画面与PDF解析", status="处理中",
+            session, run, "录屏解析", status="处理中",
             progress=min(99, int(99 * (file_index + 1) / len(screen))),
         )
     session.flush()
     _update_task(
         session,
         run,
-        "画面与PDF解析",
+        "录屏解析",
         status="已完成",
         progress=100,
         result_json={"key_frames": len(frames), "material_files": len(screen)},

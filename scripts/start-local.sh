@@ -152,6 +152,9 @@ export INTENT_BAO_ASR_TIMEOUT_SECONDS="${INTENT_BAO_ASR_TIMEOUT_SECONDS:-60}"
 # 意向模型单次生成输出上限（token）。长会议的身份匹配/意向抽取 JSON 较大，
 # 默认 2048 可能截断；这里放宽到 6144（约 2 分钟内生成完毕，HTTP 超时 300 秒内）。
 export INTENT_BAO_LLM_MAX_OUTPUT_TOKENS="${INTENT_BAO_LLM_MAX_OUTPUT_TOKENS:-6144}"
+# 模型上下文窗口。6144 的输出预留需要更大的上下文配额，否则预算校验会
+# 误报"完整请求超过模型上下文"；9B 模型原生 256K，65K 在 36GB 内存内安全。
+export INTENT_BAO_LLM_NUM_CTX="${INTENT_BAO_LLM_NUM_CTX:-65536}"
 BACKEND_PID=""
 if ! health_ok "$BACKEND_URL"; then
   info "正在启动后端服务（端口 ${BACKEND_PORT}）..."

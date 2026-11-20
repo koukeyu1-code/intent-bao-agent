@@ -248,7 +248,7 @@ def test_all_recordings_keep_their_own_key_frames(pipeline, monkeypatch):
         stored_image = pipeline.settings.data_dir / frame.image_relative_path
         assert stored_image.read_text("utf-8") == source.safe_name
         assert frame.ocr_text == source.safe_name
-    assert pipeline.task("画面与PDF解析").status == "已完成"
+    assert pipeline.task("录屏解析").status == "已完成"
 
 
 @pytest.mark.parametrize("all_fail", [False, True])
@@ -439,7 +439,7 @@ def test_missing_frames_fail_the_visual_stage(pipeline, monkeypatch):
             pipeline.session, pipeline.settings, pipeline.run, pipeline.package,
             [material],
         )
-    assert pipeline.task("画面与PDF解析").status == "处理失败"
+    assert pipeline.task("录屏解析").status == "处理失败"
     assert material.parse_status == "解析失败"
 
 

@@ -686,14 +686,6 @@ type ProcessingTaskApiResponse = Partial<ProcessingTask> & {
 export const loadPackageTasks = async (
   meetingId: string,
 ): Promise<{ items: ProcessingTask[]; total: number }> => {
-  // 阶段显示名映射：后端与数据库仍沿用历史名称"画面与PDF解析"，
-  // 该阶段实际只处理录屏材料，展示层统一显示为"录屏解析"。
-  // （后端全量改名待分析运行结束后进行，含 DB 迁移。）
-  const stageDisplayNames: Record<string, string> = {
-    "画面与PDF解析": "录屏解析",
-  };
-  const displayStageName = (stage: string): string =>
-    stageDisplayNames[stage] ?? stage;
   const response = await request<{ items: ProcessingTaskApiResponse[]; total: number }>(
     `/meeting-packages/${meetingId}/tasks`, undefined, 10_000,
   );
@@ -706,7 +698,7 @@ export const loadPackageTasks = async (
       analysisRunCreatedAt: item.analysis_run_created_at ?? item.analysisRunCreatedAt,
       analysisRunStatus: item.analysis_run_status ?? item.analysisRunStatus,
       createdAt: item.created_at ?? item.createdAt,
-      stage: displayStageName(item.stage ?? "") || "未知阶段",
+      stage: item.stage ?? "未知阶段",
       stageOrder: item.stage_order ?? item.stageOrder ?? 0,
       status: item.status ?? "待处理",
       progress: item.progress ?? 0,
