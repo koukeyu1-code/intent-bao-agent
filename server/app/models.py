@@ -295,6 +295,8 @@ class MeetingPackage(Base, AuditColumns):
     )
     pdf_exception_reason: Mapped[str | None] = mapped_column(Text)
     retention_days: Mapped[int | None] = mapped_column(Integer)
+    # 客户端幂等键（同一逻辑提交的超时重试按此去重）
+    client_request_id: Mapped[str | None] = mapped_column(String(64), index=True)
     notes: Mapped[str | None] = mapped_column(Text)
     last_error: Mapped[str | None] = mapped_column(Text)
     confirmed_by: Mapped[str | None] = mapped_column(String(100))

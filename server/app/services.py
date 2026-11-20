@@ -45,12 +45,14 @@ from .model_adapters import (
     ModelContext,
     _max_output_token_budget,
     get_model_adapter,
+    intent_output_budget,
 )
 from .stage_adapters import get_stage_adapter
 from .request_budget import estimate_tokens, split_items_for_request
 from .schemas import IntentConfirmRequest, SpeakerConfirmRequest
 from .query_visibility import (
-    get_visible_speaker, visible_observation_clause, visible_split_provenance_clause,
+    get_visible_speaker, visible_observation_clause, visible_speaker_clause,
+    visible_split_provenance_clause,
 )
 from .seed import TASK_STAGES
 from .taxonomy_service import (
@@ -269,17 +271,24 @@ def request_analysis_run_cancellation(
     return True
 
 
-def cancel_active_analysis_runs(session: Session, package_id: str) -> int:
+def cancel_active_analysis_runs(
+    session: Session, package_id: str, *, exclude_run_id: str | None = None
+) -> int:
     """Request cancellation for every queued/running run of a package.
 
     Used by manual stop actions and by force re-runs so a new run never
-    waits behind a stale one in the serial worker queue.
+    waits behind a stale one in the serial worker queue.  ``exclude_run_id``
+    keeps a freshly created run out of scope when the caller cancels after
+    validation succeeded.
     """
+    conditions = [
+        m.AnalysisRun.package_id == package_id,
+        m.AnalysisRun.status.in_(("排队中", "运行中")),
+    ]
+    if exclude_run_id is not None:
+        conditions.append(m.AnalysisRun.id != exclude_run_id)
     runs = session.scalars(
-        select(m.AnalysisRun).where(
-            m.AnalysisRun.package_id == package_id,
-            m.AnalysisRun.status.in_(("排队中", "运行中")),
-        )
+        select(m.AnalysisRun).where(*conditions)
     ).all()
     cancelled = 0
     for run in runs:
@@ -347,7 +356,7 @@ def _split_model_materials_for_analysis(
     token_budget = max(1, int(_llm_num_ctx() * 0.85) - 5_000)
 
     def fits(items: list[dict[str, Any]]) -> bool:
-        output_need = len(items) * INTENT_OUTPUT_TOKENS_PER_ITEM + 512
+        output_need = intent_output_budget(items)
         if output_need > _max_output_token_budget():
             return False
         return estimate_tokens(json.dumps(items, ensure_ascii=False)) + output_need <= token_budget
@@ -2149,7 +2158,13 @@ def _persist_model_observations(
             continue
 
         speaker_label = str(
-            material.get("speaker_label") or f"Speaker {index}"
+            material.get("speaker_label")
+            # 文本材料没有分离器标签，回退名必须带任务作用域（与音频链路的
+            # run 级哈希一致）：跨运行复用 "Speaker {序号}" 会把新观察挂到
+            # 上一次已人工确认的说话人身上，绕过身份校验。
+            or "Speaker " + hashlib.sha256(
+                f"{run.id}|text|{index}".encode("utf-8")
+            ).hexdigest()[:20]
         ).strip()
         speaker = speakers_by_label.get(speaker_label)
         if speaker is None:
@@ -2984,26 +2999,57 @@ def execute_analysis_run(
                                 package_id=package.id, customer_id=package.customer_id,
                                 material_summaries=batch_items, master_data=master_data,
                             ),
-                            # 输出预算与分批口径一致：观察列表按材料项数估算，
+                            # 输出预算与分批口径一致（按项数与内容长度取大），
                             # 避免 num_predict 截断（output_limit 硬失败）。
-                            output_budget=len(batch_items) * INTENT_OUTPUT_TOKENS_PER_ITEM + 512,
+                            output_budget=intent_output_budget(batch_items),
                         )
                     finally:
                         if hasattr(adapter, "set_runtime_hooks"):
                             adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
 
+                def _split_single_material_item(item):
+                    """把单条材料按句子边界对半切开（保留来源 id 与偏移）。"""
+                    content = str(item.get("content") or "")
+                    if len(content) < 200:
+                        return []
+                    midpoint = len(content) // 2
+                    window_start = max(0, midpoint - 120)
+                    cut = 0
+                    window = content[window_start:midpoint + 120]
+                    for separator in ("。", "！", "？", "；", "\n", ". "):
+                        index = window.rfind(separator)
+                        if index != -1:
+                            cut = max(cut, window_start + index + len(separator))
+                    if cut <= 0:
+                        cut = midpoint
+                    base_offset = int(item.get("content_offset") or 0)
+                    return [
+                        {**item, "content": content[:cut]},
+                        {**item, "content": content[cut:],
+                         "content_offset": base_offset + cut},
+                    ]
+
                 def run_intent_batch_splitting(batch_items):
                     # done_reason=length 说明该批次的观察输出超出 num_predict：
-                    # 按材料项二分重试并合并观察，直至每片都能完整生成。
-                    # 对每项输出的估算误差免疫。
+                    # 先按材料项二分；单项（如整份纪要）仍超限时按文本对半
+                    # 切开重试，直至每片都能完整生成。对估算误差免疫。
                     try:
                         return run_intent_batch(batch_items)
                     except ModelAdapterError as exc:
-                        if exc.category != "output_limit" or len(batch_items) <= 1:
+                        if exc.category != "output_limit":
                             raise
-                        mid = len(batch_items) // 2
-                        left = run_intent_batch_splitting(batch_items[:mid])
-                        right = run_intent_batch_splitting(batch_items[mid:])
+                        halves = None
+                        if len(batch_items) > 1:
+                            mid = len(batch_items) // 2
+                            halves = (batch_items[:mid], batch_items[mid:])
+                        elif len(batch_items) == 1:
+                            fragments = _split_single_material_item(batch_items[0])
+                            if fragments:
+                                halves = (fragments[:1], fragments[1:])
+                        if not halves:
+                            raise
+                        left = run_intent_batch_splitting(halves[0])
+                        right = run_intent_batch_splitting(halves[1])
                         merged = dict(left)
                         merged["observations"] = (
                             list(left.get("observations") or [])
@@ -3177,6 +3223,21 @@ def execute_analysis_run(
         )
         if completion.rowcount != 1:
             raise _AnalysisCancellationRequested
+        # 新任务成功后，同包旧任务的未确认草稿被本次结果取代，避免新旧
+        # 两套观察同时进入待确认列表、导出与计数；已人工确认/无法判断的
+        # 历史行保持原状（审计留痕）。
+        session.execute(
+            update(m.RawIntentObservation)
+            .where(
+                m.RawIntentObservation.package_id == package.id,
+                m.RawIntentObservation.analysis_run_id != run.id,
+                ~m.RawIntentObservation.status.in_(
+                    TERMINAL_OBSERVATION_STATUSES
+                ),
+            )
+            .values(status="已被后续版本取代")
+            .execution_options(synchronize_session=False)
+        )
         package.status = (
             "待身份校验" if observation_count > 0 else "待意向确认"
         )
@@ -3196,6 +3257,10 @@ def execute_analysis_run(
         failed_run = session.get(m.AnalysisRun, run.id)
         failed_package = session.get(m.MeetingPackage, package.id)
         if failed_run:
+            # 与取消同样清理本次任务的草稿：失败运行产出的观察/证据/对齐/
+            # 转写不清理会留在库里成为隐藏行，既占空间又容易被无可见性
+            # 过滤的查询误统计。已确认与正式状态引用的行受保护不动。
+            _cleanup_cancelled_analysis_run_artifacts(session, failed_run)
             failed_run.status = "处理失败"
             failed_run.error_message = str(exc)
             failed_run.finished_at = m.utcnow()
@@ -3550,6 +3615,8 @@ def confirm_speaker(
     )
 
     package = session.get(m.MeetingPackage, speaker.package_id)
+    # 只统计可见的说话人：失败/被取消运行留下的隐藏簇不参与“全部确认完”
+    # 的判定，否则资料包永远到不了“待意向确认”。
     pending_count = session.scalar(
         select(func.count())
         .select_from(m.SpeakerCluster)
@@ -3557,6 +3624,7 @@ def confirm_speaker(
             m.SpeakerCluster.package_id == speaker.package_id,
             m.SpeakerCluster.status != "已确认",
             m.SpeakerCluster.id != speaker.id,
+            visible_speaker_clause(),
         )
     )
     if package and is_confirmed and pending_count == 0:
@@ -3958,6 +4026,8 @@ def confirm_observation(
     # audit records rather than being written back into the AI suggestion.
     observation.version += 1
 
+    # 只统计可见的观察：失败/被取消运行留下的隐藏草稿不参与“全部确认完”
+    # 的判定，否则资料包永远到不了“已确认”。
     pending_count = session.scalar(
         select(func.count())
         .select_from(m.RawIntentObservation)
@@ -3965,6 +4035,7 @@ def confirm_observation(
             m.RawIntentObservation.package_id == package.id,
             ~m.RawIntentObservation.status.in_(TERMINAL_OBSERVATION_STATUSES),
             m.RawIntentObservation.id != observation.id,
+            visible_observation_clause(),
         )
     )
     if pending_count == 0:

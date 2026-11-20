@@ -49,6 +49,9 @@ class MeetingPackageCreate(StrictRequestModel):
     notes: str | None = Field(default=None, max_length=4000)
     pdf_exception_reason: str | None = Field(default=None, max_length=1000)
     attendees: list[AttendeeInput] = Field(default_factory=list)
+    # 客户端幂等键：同一逻辑提交超时重试时复用，服务端按
+    # (project_id, client_request_id) 去重并返回已创建的资料包。
+    client_request_id: str | None = Field(default=None, max_length=64)
 
 
 class MeetingPackageUpdate(StrictRequestModel):

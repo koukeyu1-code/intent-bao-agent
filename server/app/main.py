@@ -633,6 +633,18 @@ def create_app(
     ) -> dict:
         _get_or_404(session, m.Project, payload.project_id, "项目")
         _get_or_404(session, m.Customer, payload.customer_id, "客户")
+        # 幂等重试：同一逻辑提交（同 project + client_request_id）在超时
+        # 重发时返回已创建的资料包，而不是重复建包。
+        if payload.client_request_id:
+            existing = session.scalar(
+                select(m.MeetingPackage).where(
+                    m.MeetingPackage.project_id == payload.project_id,
+                    m.MeetingPackage.client_request_id
+                    == payload.client_request_id,
+                )
+            )
+            if existing is not None:
+                return public_package(session, existing)
         for attendee in payload.attendees:
             if attendee.function_id:
                 _get_or_404(
@@ -648,6 +660,7 @@ def create_app(
             material_completeness="待检查",
             pdf_exception_reason=payload.pdf_exception_reason,
             retention_days=payload.retention_days,
+            client_request_id=payload.client_request_id,
             notes=payload.notes,
         )
         session.add(item)
@@ -764,12 +777,9 @@ def create_app(
             except (ModelSettingsError, ValueError) as exc:
                 raise DomainError(422, str(exc)) from exc
         # A force re-run replaces whatever is queued/running so the new run
-        # never waits behind a stale one in the serial worker.
-        cancelled_runs = (
-            cancel_active_analysis_runs(session, package_id)
-            if payload.force
-            else 0
-        )
+        # never waits behind a stale one in the serial worker.  取消发生在
+        # 全部校验（含 create_analysis_run 的资料校验）通过之后：先取消
+        # 再校验会在校验失败（422）时把正在跑的任务也杀掉，两头落空。
         run = create_analysis_run(
             session,
             package,
@@ -779,6 +789,13 @@ def create_app(
             adapter=adapter,
             stage_adapter=stage_adapter,
             asr_settings=active_model.asr,
+        )
+        cancelled_runs = (
+            cancel_active_analysis_runs(
+                session, package_id, exclude_run_id=run.id
+            )
+            if payload.force
+            else 0
         )
         reused = (
             run.status == "已完成"
@@ -935,9 +952,6 @@ def create_app(
         package = _get_or_404(
             session, m.MeetingPackage, original.package_id, "会议资料包"
         )
-        # Replace any queued/running run (including the retried one itself)
-        # so the fresh run starts instead of queueing behind it.
-        cancel_active_analysis_runs(session, package.id)
         active_model = model_settings.snapshot()
         adapter_name = active_model.provider
         adapter = None
@@ -967,6 +981,11 @@ def create_app(
             adapter=adapter,
             stage_adapter=stage_adapter,
             asr_settings=active_model.asr,
+        )
+        # 与分析接口同一原则：校验通过、新任务落库之后再取消旧任务
+        #（含被重试的那个），避免校验失败时把还在跑的任务一并杀掉。
+        cancelled = cancel_active_analysis_runs(
+            session, package.id, exclude_run_id=run.id
         )
         app.state.analysis_queue.enqueue(
             run.id,
@@ -1703,4 +1722,10 @@ def create_app(
     return app
 
 
-app = create_app()
+# 注意：不要在此处写 `app = create_app()`。模块级实例化会在任何
+# `import app.main`（包括 pytest 收集）时对默认目录 server/data 执行
+# 迁移、种子和建用户——测试进程的公开测试密码会写进正式库。
+# uvicorn 通过启动脚本生成的入口文件（intent_bao_backend_entry.py）
+# 显式调用工厂并传入 data_dir；如需直接指向本模块，用
+# `uvicorn --factory "app.main:create_app"` 并通过
+# INTENT_BAO_DATA_DIR / INTENT_BAO_DATABASE_URL 控制落点。

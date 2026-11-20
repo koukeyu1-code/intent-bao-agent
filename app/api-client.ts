@@ -60,13 +60,28 @@ const customerIdByName: Record<string, string> = {
   客户E: "customer-e",
 };
 
+// 读请求默认超时；写请求（POST/PATCH/PUT/DELETE）默认放宽到 20 秒——
+// 本机模型分析期间后端响应变慢，3.5 秒会在服务端已写入的情况下提示
+// "创建失败"，诱发重复建包或版本冲突。
+const DEFAULT_READ_TIMEOUT_MS = 8000;
+const DEFAULT_WRITE_TIMEOUT_MS = 20_000;
+
+const defaultTimeoutFor = (init?: RequestInit): number => {
+  const method = (init?.method ?? "GET").toUpperCase();
+  return method === "GET" || method === "HEAD"
+    ? DEFAULT_READ_TIMEOUT_MS
+    : DEFAULT_WRITE_TIMEOUT_MS;
+};
+
 const request = async <T>(
   path: string,
   init?: RequestInit,
-  timeoutMs = 3500,
+  timeoutMs?: number,
 ): Promise<T> => {
+  const method = (init?.method ?? "GET").toUpperCase();
+  const effectiveTimeout = timeoutMs ?? defaultTimeoutFor(init);
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  const timer = window.setTimeout(() => controller.abort(), effectiveTimeout);
 
   try {
     const response = await fetch(`${API_BASE}${path}`, {
@@ -95,6 +110,18 @@ const request = async <T>(
       throw new ApiClientError(reason, response.status);
     }
     return (await response.json()) as T;
+  } catch (error) {
+    // 超时中止：写请求的结果未知（服务端可能已写入），必须提示用户
+    // 刷新核对而不是引导盲目重试；读请求重试是安全的。
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new ApiClientError(
+        method === "GET" || method === "HEAD"
+          ? `请求超时（${Math.round(effectiveTimeout / 1000)}秒），请稍后刷新重试`
+          : `请求超时（${Math.round(effectiveTimeout / 1000)}秒）：服务可能已处理，结果未知，请刷新核对后再操作`,
+        0,
+      );
+    }
+    throw error;
   } finally {
     window.clearTimeout(timer);
   }
@@ -377,7 +404,7 @@ export const loadBootstrapDataset = async (): Promise<MvpDataset> => {
         meeting_packages?: { items?: MeetingPackage[] };
         master_data?: DictionaryCollection;
       }
-    >("/bootstrap"),
+    >("/bootstrap", undefined, 30_000),
     request<{ items: FormalStatusApiItem[]; total: number }>(
       "/formal-intent-statuses?current_only=true",
     ),
@@ -551,19 +578,25 @@ export const confirmSpeakerIdentity = async (
     }),
   });
 
-export const createMeetingPackage = async (payload: {
-  title: string;
-  customer: string;
-  date: string;
-  dataClass: string;
-  attendeeName?: string;
-  attendeeRole?: string;
-  attendeeOrganization?: string;
-  attendeeFunction?: string;
-}): Promise<{ id: string }> =>
+export const createMeetingPackage = async (
+  payload: {
+    title: string;
+    customer: string;
+    date: string;
+    dataClass: string;
+    attendeeName?: string;
+    attendeeRole?: string;
+    attendeeOrganization?: string;
+    attendeeFunction?: string;
+  },
+  clientRequestId?: string,
+): Promise<{ id: string }> =>
   request<{ id: string }>("/meeting-packages", {
     method: "POST",
     body: JSON.stringify({
+      // 幂等键：超时后用户重试同一逻辑提交时复用同一个键，服务端
+      // 返回已创建的资料包而不是重复建包。
+      client_request_id: clientRequestId ?? null,
       project_id: "project-mnt",
       customer_id: customerIdByName[payload.customer] ?? payload.customer,
       title: payload.title,

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from . import models as m
 from .config import Settings
-from .taxonomy_excel import normalize_menu_value
+from .taxonomy_excel import normalize_taxonomy_key
 
 
 TASK_STAGES = [
@@ -105,7 +105,11 @@ def _seed_platform_taxonomy(session: Session, tech_id: str) -> None:
             id=f"menu-val-{tech_id}-L2-{index}",
             definition_id=defs[2].id,
             value=raw,
-            normalized_value=normalize_menu_value(raw),
+            # 与导入服务（taxonomy_service）同一规范化键：大小写折叠。
+            # 此前用保留大小写的 normalize_menu_value，种子得到 "27QHD"
+            # 而导入得到 "27qhd"，原样重导入会新建重复规格值，把 3×3
+            # 矩阵膨胀成 6×6（红线 5）。
+            normalized_value=normalize_taxonomy_key(raw),
             sort_order=index,
             status="active",
             source="seed",
@@ -119,7 +123,7 @@ def _seed_platform_taxonomy(session: Session, tech_id: str) -> None:
             id=f"menu-val-{tech_id}-L3-{index}",
             definition_id=defs[3].id,
             value=raw,
-            normalized_value=normalize_menu_value(raw),
+            normalized_value=normalize_taxonomy_key(raw),
             sort_order=index,
             status="active",
             source="seed",
@@ -133,9 +137,12 @@ def _seed_platform_taxonomy(session: Session, tech_id: str) -> None:
     for l2 in values[2]:
         for l3 in values[3]:
             display_name = f"{l2.value} {l3.value}"
+            # ID 用原始展示值构建（27QHD/240Hz 保持大写稳定），与
+            # normalized_value 的规范化键（大小写折叠）解耦——观测、客户
+            # 项目和前端都用这些可读 ID 做外键，不能随键方案变化。
             platform = m.GenericPlatform(
-                id=f"platform-{tech_id}-{l2.normalized_value}-{l3.normalized_value}",
-                code=f"{tech_id}_{l2.normalized_value}_{l3.normalized_value}",
+                id=f"platform-{tech_id}-{l2.value}-{l3.value}",
+                code=f"{tech_id}_{l2.value}_{l3.value}",
                 name=display_name,
                 product_series="演示平台",
                 active=True,
@@ -144,7 +151,7 @@ def _seed_platform_taxonomy(session: Session, tech_id: str) -> None:
             session.flush()
             session.add(
                 m.PlatformVariant(
-                    id=f"variant-{tech_id}-{l2.normalized_value}-{l3.normalized_value}",
+                    id=f"variant-{tech_id}-{l2.value}-{l3.value}",
                     technology_id=tech_id,
                     level2_value_id=l2.id,
                     level3_value_id=l3.id,
@@ -212,9 +219,9 @@ def seed_demo_data(session: Session, settings: Settings) -> None:
 
     # Customer projects anchor observations to a concrete customer platform.
     # Reuse the first technology's 27QHD/240Hz leaf as the demonstration
-    # platform so the evidence trail resolves to a mapped leaf.  The normalized
-    # value preserves the original letter case (only decimal trims change), so
-    # the referenced IDs must match the taxonomy IDs exactly.
+    # platform so the evidence trail resolves to a mapped leaf.  Platform IDs
+    # are built from the raw display values (27QHD/240Hz), so the referenced
+    # IDs must match the taxonomy IDs exactly.
     platform_led_27_240 = "platform-tech-mini-led-backlight-27QHD-240Hz"
     platform_gaming_27_240 = "platform-tech-pro-gaming-27QHD-240Hz"
     platform_color_27_240 = "platform-tech-wide-gamut-color-27QHD-240Hz"

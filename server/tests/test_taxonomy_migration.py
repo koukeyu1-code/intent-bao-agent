@@ -12,7 +12,7 @@ from app.schema_migrations import SchemaMigrationError, migrate_database
 
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
-REVISION = "0007_stage_screen_rename"
+REVISION = "0009_package_client_request_id"
 REVISION_TABLES = {
     "app_users",
     "app_sessions",

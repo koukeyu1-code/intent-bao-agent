@@ -507,6 +507,12 @@ def test_sqlite_copy_restore_and_small_query_latency(isolated, tmp_path: Path) -
     backup_dir.mkdir()
     backup_db = backup_dir / "intent-bao.db"
     shutil.copy2(db_path, backup_db)
+    # WAL 模式下最近提交可能还在 -wal 侧车文件里；手工文件备份必须把
+    # 侧车一并拷走（或改用 sqlite backup API），否则恢复后缺最近数据。
+    for suffix in ("-wal", "-shm"):
+        sidecar = db_path.with_name(db_path.name + suffix)
+        if sidecar.exists():
+            shutil.copy2(sidecar, backup_db.with_name(backup_db.name + suffix))
     restored = create_app(
         database_url=f"sqlite:///{backup_db.as_posix()}",
         data_dir=tmp_path / "restored-data",

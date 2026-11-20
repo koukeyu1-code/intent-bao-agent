@@ -156,6 +156,37 @@ def test_intent_output_limit_splits_batch_and_merges(pipeline, monkeypatch):
     assert max(calls) == 6
 
 
+def test_intent_output_limit_splits_single_material_text(pipeline, monkeypatch):
+    """回归：整份纪要作为单条材料触发 output_limit 时，按文本对半切开
+    重试并合并观察，而不是因无法按项二分而整场失败。"""
+    pipeline.add_file("minutes.wav")
+    from test_media_completeness import _install_diarization, _install_asr, FakeAsr, FakeIntent, _transcript
+    _install_diarization(monkeypatch)
+    long_text = "客户明确要求样机验证。" * 400
+    _install_asr(monkeypatch, FakeAsr(lambda path, **_kw: _transcript(long_text, duration_ms=30_000)))
+    seen_lengths = []
+
+    class SingleItemLimitIntent(FakeIntent):
+        def analyze(self, context, output_budget=None):
+            transcript_items = [item for item in context.material_summaries
+                                if item.get("type") == "转写片段"]
+            if not transcript_items:
+                return {"observations": []}
+            content = str(transcript_items[0]["content"])
+            seen_lengths.append(len(content))
+            if len(content) > 2000:
+                raise ModelAdapterError("达到输出上限", category="output_limit")
+            return {"observations": [{"material_id": "minutes"}]}
+
+    intent = SingleItemLimitIntent()
+    assert pipeline.execute(intent).status == "已完成"
+    assert seen_lengths[0] > 2000
+    # 递归二分：内容长度单调下降，最终每片都 ≤ 2000 并成功生成
+    assert min(seen_lengths) <= 2000
+    assert max(seen_lengths) == seen_lengths[0]
+    assert len(seen_lengths) >= 3  # 整批失败 + 至少两片成功
+
+
 def test_completed_retry_reuses_success_and_retries_empty_interval(pipeline, monkeypatch):
     material = pipeline.add_file("retry-empty.wav")
     _install_diarization(monkeypatch)

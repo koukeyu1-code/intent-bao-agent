@@ -6,7 +6,8 @@ def create_app(*args, **kwargs):
 
     Importing a utility such as ``app.filesystem_security`` must not create the
     default database, seed accounts or touch the real data directory as a side
-    effect.  Uvicorn still imports ``app.main:app`` explicitly for startup.
+    effect.  Startup uses the generated entry file that calls this factory with
+    an explicit data directory (see scripts/start-local.*).
     """
 
     from .main import create_app as factory

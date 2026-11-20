@@ -11,6 +11,7 @@ import pytest
 from app.audio_adapters import AsrError, LlamaCppAsrAdapter
 from app.model_adapters import ModelAdapterError, ModelContext, OllamaIntentModelAdapter, OpenAICompatibleModelAdapter
 from app.request_budget import estimate_tokens, split_items_for_request
+from app.model_adapters import intent_output_budget
 from app.stage_adapters import (
     _IDENTITY_GENERATION_SCHEMA,
     _identity_output_budget,
@@ -177,6 +178,22 @@ def test_intent_split_bounds_output_budget(monkeypatch):
     per_predict = [r.get("max_tokens") for r in requests]
     assert all(value is not None and value <= 10240 for value in per_predict)
     assert len(per_predict) == len(batches)
+
+
+
+def test_intent_output_budget_takes_max_of_item_count_and_content_length():
+    """回归：整份纪要作为单条材料（1 项）时，按项数估算只有 732 token，
+    约 3 条观察就截断。预算必须取按内容长度估算的较大值。"""
+    single_minutes = [{"id": "minutes", "content": "客户明确要求安排样机验证。" * 200}]
+    per_item_only = 1 * 220 + 512
+    assert intent_output_budget(single_minutes) > per_item_only
+    # 内容估算：2600 个中文字符 × 1.5 = 3900 token ÷ 8 + 512
+    from app.request_budget import estimate_tokens as _est
+    expected = int(_est(single_minutes[0]["content"]) // 8) + 512
+    assert intent_output_budget(single_minutes) == expected > per_item_only
+    # 多项短片段场景仍按项数主导
+    segments = [{"id": f"s{i}", "content": "短发言"} for i in range(20)]
+    assert intent_output_budget(segments) == 20 * 220 + 512
 
 
 def test_master_data_alone_too_large_is_explicit_error():

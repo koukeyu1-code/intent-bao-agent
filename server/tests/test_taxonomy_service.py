@@ -167,6 +167,45 @@ def test_import_diff_is_zero_write_and_commit_materializes_four_leaves(
         )
 
 
+
+
+def test_seeded_catalogue_reimport_is_zero_diff(database: Database) -> None:
+    """回归（CODE_REVIEW P1-6）：种子数据的 normalized_value 与导入服务同键。
+
+    种子曾用保留大小写的 normalize_menu_value（"27QHD"），导入用折叠键
+    （"27qhd"），原样重导入会新建重复规格值，把 3×3 矩阵膨胀成 6×6。"""
+    from app.seed import LEVEL2_VALUES, LEVEL3_VALUES, TECHNOLOGY_SPECS, _seed_platform_taxonomy
+
+    with database.session() as session:
+        for tech_id, _code, name, *_rest in TECHNOLOGY_SPECS:
+            session.add(m.Technology(id=tech_id, code=tech_id, name=name,
+                                     category="演示", description="", active=True))
+        session.flush()
+        for tech_id, *_rest in TECHNOLOGY_SPECS:
+            _seed_platform_taxonomy(session, tech_id)
+        session.commit()
+
+        # 与第一个技术完全相同的目录原样导入：不得新建任何值或平台
+        payload = {
+            "technologies": [
+                {
+                    "name": TECHNOLOGY_SPECS[0][2],
+                    "level2": {"name": "尺寸&分辨率", "values": list(LEVEL2_VALUES)},
+                    "level3": {"name": "刷新率", "values": list(LEVEL3_VALUES)},
+                }
+            ]
+        }
+        preview = import_diff(session, payload)
+        counts = preview["counts"]
+        assert counts["valuesToCreate"] == 0, preview
+        assert counts["platformsToCreate"] == 0, preview
+        assert counts["technologiesToCreate"] == 0, preview
+        # 平台 ID 仍用展示值（27QHD 大写），客户项目等外键不受键方案影响
+        platform_ids = session.scalars(select(m.GenericPlatform.id)).all()
+        assert any("27QHD-240Hz" in pid for pid in platform_ids)
+
+
+
 @pytest.mark.skipif(
     not SAMPLE_WORKBOOK.exists(),
     reason="项目外部参考工作簿未随测试环境提供",

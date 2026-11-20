@@ -1018,6 +1018,8 @@ function MeetingsPage({
     Record<string, UploadState>
   >({});
   const [createdPackageId, setCreatedPackageId] = useState<string>();
+  // 同一创建弹窗会话的幂等键：超时重试复用，服务端去重防重复建包。
+  const [createRequestId, setCreateRequestId] = useState<string>();
   const [submitting, setSubmitting] = useState(false);
   const [submitStage, setSubmitStage] = useState("");
   const [analysisBusyId, setAnalysisBusyId] = useState<string>();
@@ -1132,6 +1134,7 @@ function MeetingsPage({
   const resetCreateDialog = () => {
     setCreateOpen(false);
     setCreatedPackageId(undefined);
+    setCreateRequestId(undefined);
     setFileList([]);
     setUploadStatuses({});
     setSubmitStage("");
@@ -1157,7 +1160,13 @@ function MeetingsPage({
     try {
       if (!createdId) {
         setSubmitStage("正在创建资料包…");
-        const created = await createMeetingPackage(values);
+        // 每个逻辑提交一个幂等键；同弹窗内重试（如超时后）复用同一个键。
+        const requestId =
+          createRequestId ??
+          (globalThis.crypto?.randomUUID?.() ??
+            `pkg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+        setCreateRequestId(requestId);
+        const created = await createMeetingPackage(values, requestId);
         createdId = created.id;
         setCreatedPackageId(created.id);
       }

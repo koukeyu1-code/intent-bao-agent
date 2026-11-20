@@ -307,7 +307,7 @@ test("keeps P0 planning views on formal statuses and persists workflow actions",
     "formal competitor comparisons must exclude records without a concrete platform mapping",
   );
 
-  const createIndex = appSource.indexOf("createMeetingPackage(values)");
+  const createIndex = appSource.indexOf("createMeetingPackage(values, requestId)");
   const uploadIndex = appSource.indexOf(
     "uploadMeetingMaterial(createdId, selected as File)",
   );

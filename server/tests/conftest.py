@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 
 # These values exist only inside the disposable pytest process. Production
@@ -13,6 +15,13 @@ os.environ["INTENT_BAO_USER_PASSWORD"] = "test-only-planner-6d3b70e5"
 # icacls for every isolated test database; the ACL command itself has focused
 # unit coverage in test_filesystem_security.py.
 os.environ["INTENT_BAO_SKIP_WINDOWS_ACL_HARDENING"] = "1"
+
+# 防御性兜底：任何遗漏显式 data_dir 的导入或调用（包括对 app.main 的
+# 模块级副作用）都必须落到一次性临时目录，绝不允许测试进程触碰
+# 仓库内的 server/data 正式库。同时清除可能继承的数据库地址。
+os.environ.pop("INTENT_BAO_DATABASE_URL", None)
+_TESTS_TMP_ROOT = Path(tempfile.mkdtemp(prefix="intent-bao-tests-"))
+os.environ.setdefault("INTENT_BAO_DATA_DIR", str(_TESTS_TMP_ROOT / "data"))
 
 
 def wait_for_analysis(client, package_id, run_id=None, timeout=30.0):

@@ -22,7 +22,7 @@ class Database:
             future=True,
         )
         if url.startswith("sqlite"):
-            event.listen(self.engine, "connect", self._enable_sqlite_foreign_keys)
+            event.listen(self.engine, "connect", self._tune_sqlite_connection)
         self.session_factory = sessionmaker(
             bind=self.engine,
             autoflush=False,
@@ -32,9 +32,18 @@ class Database:
         )
 
     @staticmethod
-    def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    def _tune_sqlite_connection(dbapi_connection, _connection_record) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        # WAL + busy_timeout：本地分析期间后台 Worker 与 API 并发读写，
+        # 默认的回滚日志模式会让写事务立刻抛 "database is locked"。
+        # WAL 允许读写并存；busy_timeout 让写方排队等待（5 秒）而不是失败。
+        # wal_autocheckpoint 收紧到 128 页（约 512KB）：WAL 侧车文件保持
+        # 很小，手工文件备份只拷主文件时丢失的最近写入窗口随之最小化
+        #（完整做法仍是拷贝 *.db 时一并拷贝 -wal/-shm 或用 backup API）。
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA wal_autocheckpoint=128")
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
 
     def create_all(self) -> None:

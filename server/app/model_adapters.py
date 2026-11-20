@@ -30,6 +30,23 @@ MAX_OUTPUT_TOKEN_BUDGET = 2048
 INTENT_OUTPUT_TOKENS_PER_ITEM = 220
 
 
+def intent_output_budget(items: list[dict[str, Any]]) -> int:
+    """意向观察输出需求：取“按材料项数”与“按内容长度”估算的较大值。
+
+    - 按项数：每项材料约 220 token，512 为包裹结构预留；
+    - 按内容：单条长纪要（TXT/DOCX 整文件）只算 1 项，但可抽出的观察
+      远多于 220 token——按内容 token 的 1/8 兜底（约每 8 个源 token
+      对应一条观察的输出预算），避免整份纪要一批就截断。
+    返回值不封顶，由调用方与服务输出上限比较后决定是否继续切分。
+    """
+    per_item = len(items) * INTENT_OUTPUT_TOKENS_PER_ITEM + 512
+    content_tokens = sum(
+        estimate_tokens(str(item.get("content") or "")) for item in items
+    )
+    per_content = int(content_tokens // 8) + 512
+    return max(per_item, per_content)
+
+
 def _max_output_token_budget() -> int:
     """生成输出上限可用 INTENT_BAO_LLM_MAX_OUTPUT_TOKENS 覆盖（默认 2048）。
 
@@ -358,9 +375,8 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         return estimate_tokens(prompt) + budget + 128 <= int(self._num_ctx * 0.85)
 
     def _intent_output_budget(self, items: list[dict[str, Any]]) -> int:
-        """意向观察输出需求：每项材料约 220 token，512 为结构预留（不封顶，
-        由调用方与服务输出上限比较后决定是否继续切分）。"""
-        return len(items) * INTENT_OUTPUT_TOKENS_PER_ITEM + 512
+        """意向观察输出需求（见模块级 intent_output_budget 的口径说明）。"""
+        return intent_output_budget(items)
 
     def split_context(self, context: ModelContext) -> list[ModelContext]:
         def make_context(items: list[dict[str, Any]]) -> ModelContext:
