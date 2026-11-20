@@ -69,6 +69,63 @@ def test_more_than_three_empty_intervals_do_not_stop_later_speech(pipeline, monk
     assert json.loads(pipeline.task("音轨与转写").result_json)["transcription"]["skipped"] == 4
 
 
+def test_retryable_timeout_is_blank_and_pipeline_continues(pipeline, monkeypatch):
+    """Retryable timeouts (e.g. music looping the ASR model) blank their
+    interval and let the remaining speech reach intent extraction."""
+    material = pipeline.add_file("music-intro.wav")
+    _install_diarization(monkeypatch)
+    calls = Counter()
+
+    def transcribe(path, **_kwargs):
+        start = int(path.read_text("utf-8"))
+        calls[start] += 1
+        if start == 5000:
+            raise AsrError("ASR转写超过总耗时上限（60秒），已停止等待", category="timeout", retryable=True)
+        return _transcript("需要安排客户样机验证")
+
+    _install_asr(monkeypatch, FakeAsr(transcribe))
+    intent = FakeIntent()
+    assert pipeline.execute(intent).status == "已完成"
+    assert calls == {0: 1, 5000: 2}
+    rows = pipeline.session.scalars(select(m.TranscriptSegment).order_by(m.TranscriptSegment.order_index)).all()
+    assert [(row.start_ms, row.end_ms, row.text) for row in rows] == [
+        (0, 3000, "需要安排客户样机验证"), (5000, 8000, ""),
+    ]
+    result = json.loads(pipeline.task("音轨与转写").result_json)
+    assert result["transcription"] == {
+        "jobs": 2, "ok": 1, "failed": 0, "empty": 0, "reused": 0, "skipped": 1,
+    }
+    skipped = result["skipped_segments"][0]
+    assert skipped["category"] == "timeout"
+    assert skipped["attempts"] == 2
+    assert len(intent.calls) == 1
+
+
+def test_three_consecutive_timeouts_still_stop_the_material(pipeline, monkeypatch):
+    """A hanging ASR service must not silently blank an entire meeting."""
+    material = pipeline.add_file("all-hang.wav")
+    turns = [SpeakerTurn(index * 2000, index * 2000 + 2000, f"S{index}") for index in range(5)]
+    _install_diarization(monkeypatch)
+    monkeypatch.setattr(services, "probe_media_duration", lambda _: 10_000)
+    monkeypatch.setattr(services, "get_diarizer", lambda _: SimpleNamespace(diarize=lambda *_a, **_kw: turns))
+    calls = Counter()
+
+    def transcribe(path, **_kwargs):
+        calls[int(path.read_text("utf-8"))] += 1
+        raise AsrError("ASR转写超过总耗时上限（60秒），已停止等待", category="timeout", retryable=True)
+
+    _install_asr(monkeypatch, FakeAsr(transcribe))
+    intent = FakeIntent()
+    with pytest.raises(services.DomainError):
+        pipeline.execute(intent)
+    assert pipeline.run.status == "处理失败" and not intent.calls
+    assert calls == {0: 2, 2000: 2, 4000: 2}
+    result = json.loads(pipeline.task("音轨与转写").result_json)
+    assert result["transcription"]["failed"] == 1
+    assert result["transcription"]["skipped"] == 3
+    assert result["failed_segments"][0]["stopped_early"] is True
+
+
 def test_completed_retry_reuses_success_and_retries_empty_interval(pipeline, monkeypatch):
     material = pipeline.add_file("retry-empty.wav")
     _install_diarization(monkeypatch)

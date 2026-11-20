@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from abc import ABC, abstractmethod
@@ -140,9 +141,19 @@ class LlamaCppAsrAdapter(AsrAdapter):
         *,
         base_url: str,
         model_name: str,
-        timeout_seconds: float = 180,
+        timeout_seconds: float | None = None,
         transport: httpx.BaseTransport | None = None,
     ):
+        if timeout_seconds is None:
+            # 默认 180 秒；可用 INTENT_BAO_ASR_TIMEOUT_SECONDS 覆盖。长音频里的
+            # 非语音段（配乐/转场）会让 ASR 长时间不返回，调小可加快置空跳过。
+            try:
+                timeout_seconds = float(
+                    os.environ.get("INTENT_BAO_ASR_TIMEOUT_SECONDS") or 180
+                )
+            except (TypeError, ValueError):
+                timeout_seconds = 180.0
+        timeout_seconds = max(10.0, float(timeout_seconds))
         self.base_url = (base_url or "").rstrip("/")
         self.model_name = model_name
         self._timeout = httpx.Timeout(

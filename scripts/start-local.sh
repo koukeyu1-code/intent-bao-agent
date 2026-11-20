@@ -146,6 +146,9 @@ else
 fi
 
 # ---- 2) 后端服务 ----
+# ASR 单次转写耗时上限（秒）。非语音段（配乐/转场）会让 ASR 迟迟不返回，
+# 收紧上限可加快“置空跳过”速度；如需恢复默认 180 秒，导出同名变量即可。
+export INTENT_BAO_ASR_TIMEOUT_SECONDS="${INTENT_BAO_ASR_TIMEOUT_SECONDS:-60}"
 BACKEND_PID=""
 if ! health_ok "$BACKEND_URL"; then
   info "正在启动后端服务（端口 ${BACKEND_PORT}）..."

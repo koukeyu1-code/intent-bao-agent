@@ -1620,6 +1620,7 @@ def _run_audio_file(
                 check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
                 on_progress=heartbeat)
         try:
+            last_retryable = True
             for attempt in range(1, 3):
                 _raise_if_analysis_cancel_requested(session, run)
                 context_start, context_end = start_ms, end_ms
@@ -1659,6 +1660,7 @@ def _run_audio_file(
                 except Exception as exc:
                     failure_reason = str(exc) if isinstance(exc, DomainError) or getattr(exc, "category", None) else "音频切片或语音服务转写失败"
                     category = getattr(exc, "category", "asr")
+                    last_retryable = getattr(exc, "retryable", True)
                     if category == "dependency" or (getattr(exc, "retryable", True) is False
                                                    and category not in {"empty_response", "audio_too_short"}):
                         break
@@ -1668,8 +1670,20 @@ def _run_audio_file(
                            "end_ms": end_ms, "error": failure_reason, "category": category,
                            "attempts": attempt, "context_start_ms": used_context[0],
                            "context_end_ms": used_context[1]}
-                if category in {"empty_response", "audio_too_short"}:
-                    stats["empty"] += 1
+                if category in {"empty_response", "audio_too_short"} or (
+                    category == "timeout" and last_retryable
+                ):
+                    if category == "timeout":
+                        # A retryable timeout that survives its attempts is the
+                        # signature of non-speech audio (music, jingles) looping
+                        # the ASR model. Blank it like an empty interval so the
+                        # remaining pipeline continues, but keep counting toward
+                        # the consecutive-failure guard in case the whole ASR
+                        # service is hanging instead.
+                        consecutive_failures += 1
+                    else:
+                        stats["empty"] += 1
+                        consecutive_failures = 0
                     stats["skipped"] += 1
                     skipped_segments.append(failure)
                     # Keep the unrecognized interval visible without inventing
@@ -1678,7 +1692,12 @@ def _run_audio_file(
                         start_ms=start_ms, end_ms=end_ms, text="", speaker_label=None,
                         confidence=0.0, language="zh",
                     ))
-                    consecutive_failures = 0
+                    if category == "timeout" and consecutive_failures >= 3:
+                        failure["remaining_jobs"] = len(jobs) - job_index - 1
+                        failure["stopped_early"] = True
+                        stats["failed"] += 1
+                        failed_segments.append(failure)
+                        break
                     continue
                 stats["failed"] += 1
                 consecutive_failures += 1
