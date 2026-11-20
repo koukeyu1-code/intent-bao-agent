@@ -11,7 +11,11 @@ import pytest
 from app.audio_adapters import AsrError, LlamaCppAsrAdapter
 from app.model_adapters import ModelAdapterError, ModelContext, OllamaIntentModelAdapter, OpenAICompatibleModelAdapter
 from app.request_budget import estimate_tokens, split_items_for_request
-from app.stage_adapters import _IDENTITY_GENERATION_SCHEMA, OpenAICompatibleLlmStageAdapter
+from app.stage_adapters import (
+    _IDENTITY_GENERATION_SCHEMA,
+    _identity_output_budget,
+    OpenAICompatibleLlmStageAdapter,
+)
 
 
 def context(content: str = "客户支持新产品。", master_data: dict | None = None) -> ModelContext:
@@ -98,53 +102,48 @@ def test_stage_budget_matches_actual_stage_schema_request(stage_name):
 
 
 def test_identity_fits_uses_dynamic_budget_consistent_with_generation(monkeypatch):
-    """回归：批次预估曾固定用 2048 预算，而生成校验用动态预算（6144），
-    导致预估判"装得下"的大批次到生成时才报"超过模型上下文"。两者必须
-    使用同一预算口径。"""
+    """回归：身份匹配的批次预估与生成校验预算口径不一致（2048 vs 动态），
+    且输出预算未按片段数估算——大会议大批次生成时在输出上限处截断
+    （done_reason=length → 硬失败）。修复后：fits 按片段数估算预算并
+    限制批内片段数，生成 num_predict 与 fits 完全同值。"""
     monkeypatch.setenv("INTENT_BAO_LLM_MAX_OUTPUT_TOKENS", "6144")
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        assert estimate_tokens(json.dumps(body, ensure_ascii=False)) + body["max_tokens"] + 128 <= int(65536 * 0.85)
+        return response(json.dumps({"speakers": []}))
+
     service = OpenAICompatibleLlmStageAdapter(base_url="http://127.0.0.1:1234", model_name="unit",
-                                              transport=httpx.MockTransport(lambda request: response(json.dumps({"speakers": []}))))
+                                              transport=httpx.MockTransport(handler))
     service._chat._num_ctx = 65536
     fixed = {"attendees": [], "master_data": {}}
-    schema = _IDENTITY_GENERATION_SCHEMA
-    limit = int(65536 * 0.85)
+    segments = [{"id": f"s{index}", "speaker_label": "A", "text": "会议发言内容" * 67}
+                for index in range(16)]
 
-    # 自校准：放大批次让完整请求落入“动态口径判 False、旧静态 2048 口径判
-    # True”的判定窗口，精确复现生产故障的批次形态。
-    repeat_count = 300
-    for _ in range(40):
-        segments = [{"id": f"s{index}", "speaker_label": "A", "text": "会议发言内容" * repeat_count}
-                    for index in range(16)]
-        messages = service._build_identity_messages(segments=segments, **fixed)
-        budget = service._chat._output_token_budget(messages[-1]["content"])
-        body = json.dumps(service._chat._build_chat_request_body(
-            service._chat._prepare_request_messages(messages, use_format=True), budget=budget,
-            use_format=True, generation_schema=schema), ensure_ascii=False)
-        est = estimate_tokens(body)
-        if est + budget + 128 > limit:
-            assert est + 2048 + 128 <= limit, (
-                f"校准失败：首个动态失败点 est={est} 已超过旧口径上限，"
-                f"limit={limit} repeat={repeat_count}"
-            )
-            break
-        repeat_count += 5
-    else:
-        raise AssertionError(f"校准失败：40 次步进内未触发动态口径失败，repeat={repeat_count}")
+    # 1) 批内片段数超过上限 → fits 判 False，驱动分批
+    oversized = segments + [{"id": "extra", "speaker_label": "B", "text": "会议发言内容"}]
+    assert service.identity_request_fits(segments=oversized, **fixed) is False
 
-    # 不变量：批次预估（identity_request_fits）必须与生成校验同一判定
-    assert service.identity_request_fits(segments=segments, **fixed) is False
-    assert service._chat.request_fits(messages, budget=budget, generation_schema=schema) is False
-    # 复现生产故障：旧静态口径在相同批次上判 True
-    assert service._chat.request_fits(messages, budget=2048, generation_schema=schema) is True
-    # 按动态口径分批：每组两种口径都判 True，生成不再报错
-    groups = split_items_for_request(segments, text_key="text",
+    # 2) 批内 ≤ 上限且输入装得下 → fits True，预算 = 16×250+320 = 4320
+    budget = _identity_output_budget(segments)
+    assert budget == 4320
+    assert service.identity_request_fits(segments=segments, **fixed) is True
+
+    # 3) 生成请求的 num_predict 与 fits 预算同值（口径一致，不会截断）
+    assert service.recommend_identities(segments=segments, **fixed) == []
+    assert len(requests) == 1
+    assert requests[0]["max_tokens"] == budget
+
+    # 4) 超大批次被分批器按 fits 切碎，每组仍通过 fits
+    many = [{"id": f"m{index}", "speaker_label": "A", "text": "会议发言内容" * 400}
+            for index in range(40)]
+    groups = split_items_for_request(many, text_key="text",
                                      fits=lambda items: service.identity_request_fits(segments=items, **fixed))
     assert len(groups) > 1
     for group in groups:
-        group_messages = service._build_identity_messages(segments=group, **fixed)
-        group_budget = service._chat._output_token_budget(group_messages[-1]["content"])
         assert service.identity_request_fits(segments=group, **fixed) is True
-        assert service._chat.request_fits(group_messages, budget=group_budget, generation_schema=schema) is True
 
 
 def test_master_data_alone_too_large_is_explicit_error():

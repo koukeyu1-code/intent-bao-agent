@@ -10,6 +10,7 @@ from .model_adapters import (
     ModelAdapterError,
     OllamaIntentModelAdapter,
     OpenAICompatibleModelAdapter,
+    _max_output_token_budget,
 )
 from .schemas import (
     IdentityRecommendationOutput,
@@ -20,6 +21,17 @@ from .schemas import (
 
 
 ALIGNMENT_OUTPUT_TOKEN_BUDGET = 2048
+
+# 身份推荐的输出体积与批内片段数成正比（模型可能逐片段输出映射条目），
+# 因此身份批次必须限制片段数，并按片段数估算输出预算——否则大会议的
+# 大批次会在 2048/6144 上限处截断（done_reason=length → 硬失败）。
+IDENTITY_MAX_SEGMENTS_PER_BATCH = 16
+IDENTITY_OUTPUT_TOKENS_PER_SEGMENT = 250
+
+
+def _identity_output_budget(segments: list[dict[str, Any]]) -> int:
+    needed = len(segments) * IDENTITY_OUTPUT_TOKENS_PER_SEGMENT + 320
+    return max(1024, min(_max_output_token_budget(), needed))
 
 
 _IDENTITY_GENERATION_SCHEMA: dict[str, Any] = {
@@ -168,8 +180,11 @@ class OllamaLlmStageAdapter(LlmStageAdapter):
         attendees: list[dict[str, Any]],
         master_data: dict[str, list[dict[str, Any]]],
     ) -> bool:
+        if len(segments) > IDENTITY_MAX_SEGMENTS_PER_BATCH:
+            return False
         return self._chat.request_fits(
             self._build_identity_messages(segments=segments, attendees=attendees, master_data=master_data),
+            budget=_identity_output_budget(segments),
             generation_schema=_IDENTITY_GENERATION_SCHEMA,
         )
 
@@ -213,7 +228,9 @@ class OllamaLlmStageAdapter(LlmStageAdapter):
             attendees=attendees,
             master_data=master_data,
         )
-        budget = self._chat._output_token_budget(messages[-1]["content"])
+        # 与 identity_request_fits 同口径：按片段数估算输出预算，
+        # 确保批量打包时的 fits 判定与生成时的 num_predict 一致。
+        budget = _identity_output_budget(segments)
         parsed, _body = self._chat.chat_structured(
             messages,
             budget=budget,
