@@ -27,6 +27,22 @@ MIN_OUTPUT_TOKEN_BUDGET = 1024
 MAX_OUTPUT_TOKEN_BUDGET = 2048
 
 
+def _max_output_token_budget() -> int:
+    """生成输出上限可用 INTENT_BAO_LLM_MAX_OUTPUT_TOKENS 覆盖（默认 2048）。
+
+    长会议的"身份辅助匹配/意向抽取"一批次需要为多条片段输出推荐 JSON，
+    2048 token 可能装不下而被截断；调大后请求预算函数会同步缩小批次。
+    """
+    try:
+        configured = int(
+            os.environ.get("INTENT_BAO_LLM_MAX_OUTPUT_TOKENS")
+            or MAX_OUTPUT_TOKEN_BUDGET
+        )
+    except (TypeError, ValueError):
+        configured = MAX_OUTPUT_TOKEN_BUDGET
+    return max(MIN_OUTPUT_TOKEN_BUDGET, min(configured, 65_536))
+
+
 @dataclass
 class ModelContext:
     package_id: str
@@ -473,7 +489,7 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         """Bound generated tokens so a looping model always terminates."""
 
         estimated = max(MIN_OUTPUT_TOKEN_BUDGET, len(prompt_text) // 6)
-        return min(MAX_OUTPUT_TOKEN_BUDGET, estimated)
+        return min(_max_output_token_budget(), estimated)
 
     @staticmethod
     def _extract_json_object(content: str) -> str:

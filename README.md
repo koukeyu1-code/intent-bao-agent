@@ -316,6 +316,11 @@ $env:INTENT_BAO_LLM_NUM_CTX = "16384"
 Ollama 请求会携带这个值。OpenAI 兼容服务的实际上下文必须在模型服务中设置，环境变量不会替 LM Studio 重新加载模型；两侧应保持一致。
 程序按完整提示、材料、主数据、结构约束、格式回退提示和输出预留保守估算 token，并分批处理超长单项；估算不是服务端精确 tokenizer，服务端仍拒绝时会显示明确的上下文错误。
 
+其他可选环境变量（macOS 的 `scripts/start-local.sh` 已默认分别设为 6144 / 60）：
+
+- `INTENT_BAO_LLM_MAX_OUTPUT_TOKENS`：意向模型单次生成输出上限（默认 2048）。长会议的"身份辅助匹配/意向抽取"单批 JSON 较大时调大，可避免"达到输出上限"截断。
+- `INTENT_BAO_ASR_TIMEOUT_SECONDS`：ASR 单次转写等待上限（默认 180）。非语音段（配乐/转场）会让 ASR 迟迟不返回，调小可加快这类片段的"置空跳过"。
+
 ## 十、仓库分工与发布说明（方案 B）
 
 - **代码仓库只放代码**：`models/llama.cpp/`、`models/funasr/`、ASR 的两个 GGUF、

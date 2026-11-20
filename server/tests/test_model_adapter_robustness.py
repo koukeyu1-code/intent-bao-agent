@@ -128,6 +128,24 @@ def test_output_token_budget_is_bounded() -> None:
     assert MIN_OUTPUT_TOKEN_BUDGET <= huge <= MAX_OUTPUT_TOKEN_BUDGET
 
 
+def test_output_token_budget_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("INTENT_BAO_LLM_MAX_OUTPUT_TOKENS", "6144")
+    huge = OllamaIntentModelAdapter._output_token_budget("x" * 10_000_000)
+    assert huge == 6144
+    small = OllamaIntentModelAdapter._output_token_budget("")
+    assert small == MIN_OUTPUT_TOKEN_BUDGET
+    monkeypatch.setenv("INTENT_BAO_LLM_MAX_OUTPUT_TOKENS", "not-a-number")
+    assert (
+        OllamaIntentModelAdapter._output_token_budget("x" * 10_000_000)
+        == MAX_OUTPUT_TOKEN_BUDGET
+    )
+    monkeypatch.setenv("INTENT_BAO_LLM_MAX_OUTPUT_TOKENS", "50")
+    assert (
+        OllamaIntentModelAdapter._output_token_budget("x" * 10_000_000)
+        == MIN_OUTPUT_TOKEN_BUDGET
+    )
+
+
 @pytest.mark.parametrize(
     "content,expected",
     [

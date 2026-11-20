@@ -149,6 +149,9 @@ fi
 # ASR 单次转写耗时上限（秒）。非语音段（配乐/转场）会让 ASR 迟迟不返回，
 # 收紧上限可加快“置空跳过”速度；如需恢复默认 180 秒，导出同名变量即可。
 export INTENT_BAO_ASR_TIMEOUT_SECONDS="${INTENT_BAO_ASR_TIMEOUT_SECONDS:-60}"
+# 意向模型单次生成输出上限（token）。长会议的身份匹配/意向抽取 JSON 较大，
+# 默认 2048 可能截断；这里放宽到 6144（约 2 分钟内生成完毕，HTTP 超时 300 秒内）。
+export INTENT_BAO_LLM_MAX_OUTPUT_TOKENS="${INTENT_BAO_LLM_MAX_OUTPUT_TOKENS:-6144}"
 BACKEND_PID=""
 if ! health_ok "$BACKEND_URL"; then
   info "正在启动后端服务（端口 ${BACKEND_PORT}）..."
