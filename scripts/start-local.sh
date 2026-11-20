@@ -123,9 +123,9 @@ if [ -n "$LLAMA_SERVER" ] && [ -f "$ASR_MODEL" ] && [ -f "$ASR_MMPROJ" ]; then
 fi
 
 if health_ok "$ASR_URL"; then
-  ok "ASR 语音服务已在运行（端口 $ASR_PORT）。"
+  ok "ASR 语音服务已在运行（端口 ${ASR_PORT}）。"
 elif [ "$ASR_AVAILABLE" = 1 ]; then
-  info "正在启动 ASR 语音服务（端口 $ASR_PORT）..."
+  info "正在启动 ASR 语音服务（端口 ${ASR_PORT}）..."
   (
     cd "$(dirname "$LLAMA_SERVER")"
     nohup "$LLAMA_SERVER" -m "$ASR_MODEL" --mmproj "$ASR_MMPROJ" \
@@ -148,7 +148,7 @@ fi
 # ---- 2) 后端服务 ----
 BACKEND_PID=""
 if ! health_ok "$BACKEND_URL"; then
-  info "正在启动后端服务（端口 $BACKEND_PORT）..."
+  info "正在启动后端服务（端口 ${BACKEND_PORT}）..."
   # 用 Python 自己生成入口文件，避免 shell 转义路径出问题（与 Windows 版行为一致）
   "$VENV_PYTHON" - "$DATA_DIR" "$BACKEND_ROOT" "$RUNTIME_DIR/intent_bao_backend_entry.py" <<'PY'
 import pathlib
@@ -179,7 +179,7 @@ fi
 # ---- 3) 前端服务 ----
 FRONTEND_PID=""
 if ! health_ok "$FRONTEND_URL"; then
-  info "正在启动前端服务（端口 $FRONTEND_PORT）..."
+  info "正在启动前端服务（端口 ${FRONTEND_PORT}）..."
   (
     cd "$PROJECT_ROOT"
     NEXT_PUBLIC_INTENT_BAO_API_BASE="http://127.0.0.1:$BACKEND_PORT/api" \
@@ -195,12 +195,12 @@ fi
 if ! wait_url "$BACKEND_URL" 90; then
   [ -n "$BACKEND_PID" ] && tail -20 "$LOG_DIR/backend.err.log" 2>/dev/null || true
   rollback_started
-  fail "后端未就绪（$BACKEND_URL）。请确认端口 $BACKEND_PORT 未被占用，并查看 $LOG_DIR/backend.err.log"
+  fail "后端未就绪（${BACKEND_URL}）。请确认端口 ${BACKEND_PORT} 未被占用，并查看 $LOG_DIR/backend.err.log"
 fi
 if ! wait_url "$FRONTEND_URL" 180; then
   [ -n "$FRONTEND_PID" ] && tail -20 "$LOG_DIR/frontend.err.log" 2>/dev/null || true
   rollback_started
-  fail "前端未就绪（$FRONTEND_URL）。请确认端口 $FRONTEND_PORT 未被占用，并查看 $LOG_DIR/frontend.err.log"
+  fail "前端未就绪（${FRONTEND_URL}）。请确认端口 ${FRONTEND_PORT} 未被占用，并查看 $LOG_DIR/frontend.err.log"
 fi
 
 write_pid_meta "$BACKEND_PID" "$BACKEND_PID_FILE" "$RUNTIME_DIR/backend.meta.json" "$BACKEND_URL"

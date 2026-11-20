@@ -27,7 +27,7 @@ for candidate in "${PYTHON_CANDIDATES[@]}"; do
   fi
 done
 [ -n "$PYTHON_BIN" ] || fail "未找到 Python 3.11+。请先安装：brew install python@3.12（或从 python.org 下载安装包），或设置 PYTHON 环境变量指向可执行文件。"
-ok "Python: $("$PYTHON_BIN" --version 2>&1)（$PYTHON_BIN）"
+ok "Python: $("$PYTHON_BIN" --version 2>&1)（${PYTHON_BIN}）"
 
 # 2) 后端虚拟环境
 if [ ! -x "$VENV_PYTHON" ]; then

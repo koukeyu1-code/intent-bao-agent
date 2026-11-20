@@ -53,8 +53,8 @@ docs/               开发方案、开发文档、测试报告、开题报告
 
 ## 四、环境要求
 
-- Windows 10/11（脚本为 PowerShell）
-- Python 3.11+（建议 3.12，安装时勾选 **Add to PATH**）
+- Windows 10/11（脚本为 PowerShell）或 macOS 12+ / Apple Silicon（脚本为 Bash）
+- Python 3.11+（建议 3.12，Windows 安装时勾选 **Add to PATH**）
 - Node.js 22.13+ 与 pnpm（`npm install -g pnpm`）
 - FFmpeg / FFprobe（安装脚本可自动用 winget 安装）
 - 意向模型服务：Ollama（[下载](https://ollama.com/download)）或本地 OpenAI 兼容服务（例如 LM Studio，二选一）
@@ -146,6 +146,15 @@ models/qwen3-asr/
 powershell -ExecutionPolicy Bypass -File scripts\setup-local.ps1
 ```
 
+**macOS（Apple Silicon）**：先安装系统组件，再运行 Bash 版脚本（行为与 Windows 版一致：
+创建 `server/.venv`、安装 PyTorch（macOS 版自带 MPS 加速）与后端依赖、`pnpm install`，并检查
+Ollama / llama-server / 模型文件）：
+
+```bash
+brew install python@3.12 node pnpm ffmpeg llama.cpp   # 关键帧 OCR 另需：brew install tesseract tesseract-lang
+scripts/setup-local.sh
+```
+
 ### 5.4 启动
 
 先确认媒体工具可运行。未安装系统 FFmpeg 时，可从 [FFmpeg 官网列出的 Windows 构建](https://ffmpeg.org/download.html#build-windows)
@@ -176,6 +185,11 @@ powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1
 首次启动前端需要 1~2 分钟编译页面。启动窗口若显示黄色警告"未找到 ASR 模型"，说明 5.1/5.2 的文件没放齐。
 
 停止服务：双击 **停止意向宝.bat**（或 `scripts\stop-local.ps1`）。
+
+macOS 上启动用 `scripts/start-local.sh`（或双击 **启动意向宝.command**），三个服务的地址与上表一致；
+停止用 `scripts/stop-local.sh`（或 **停止意向宝.command**）。可选参数：`--no-browser`、
+`--backend-port`、`--frontend-port`、`--asr-port`。macOS 的 ASR 运行时来自 Homebrew 的
+`llama-server`（`brew install llama.cpp`），模型 GGUF 文件与 Windows 通用，放在相同位置即可。
 
 ### 5.5 首次登录与模型配置
 
@@ -241,6 +255,22 @@ powershell -ExecutionPolicy Bypass -File scripts\stop-local.ps1
 # 重置登录密码（admin 或 planner）
 cd server
 powershell -ExecutionPolicy Bypass -File "..\重置意向宝登录密码.bat"
+```
+
+macOS（Bash）等价命令：
+
+```bash
+# 安装依赖
+scripts/setup-local.sh
+
+# 启动（可加 --no-browser）
+scripts/start-local.sh
+
+# 停止
+scripts/stop-local.sh
+
+# 重置登录密码（admin 或 planner，--generate 生成强密码）
+scripts/reset-password.sh admin --generate
 ```
 
 ## 八、测试

@@ -35,9 +35,9 @@ for entry in "${SERVICES[@]}"; do
     sleep 0.3
     kill -9 "$pid" >/dev/null 2>&1 || true
     rm -f "$pid_path" "$meta_path"
-    ok "$label 服务已停止（pid $pid）。"
+    ok "$label 服务已停止（pid ${pid}）。"
   else
-    warn "$label 服务的 pid 记录无法通过可信校验（期望 $expected，实际 ${name:-无}），未停止任何进程。请人工核对后清理 $pid_path。"
+    warn "$label 服务的 pid 记录无法通过可信校验（期望 ${expected}，实际 ${name:-无}），未停止任何进程。请人工核对后清理 ${pid_path}。"
   fi
 done
 
