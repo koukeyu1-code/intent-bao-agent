@@ -211,7 +211,7 @@ class BrokenAdapter(IntentModelAdapter):
     name = "broken-for-test"
     model_name = "broken-for-test"
 
-    def analyze(self, _context):
+    def analyze(self, _context, output_budget=None):
         raise RuntimeError("intentional isolated analysis failure")
 
 
@@ -223,7 +223,7 @@ class SlowAdapter(IntentModelAdapter):
         self.started = Event()
         self.release = Event()
 
-    def analyze(self, _context):
+    def analyze(self, _context, output_budget=None):
         self.started.set()
         if not self.release.wait(timeout=10.0):
             raise RuntimeError("slow adapter was not released by the test")

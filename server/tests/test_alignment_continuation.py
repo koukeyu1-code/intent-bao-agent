@@ -365,7 +365,7 @@ def test_all_alignment_failures_allow_real_pipeline_to_reach_intent(pipeline, mo
     )
 
     class ContinuingIntent(FakeIntent):
-        def analyze(self, context):
+        def analyze(self, context, output_budget=None):
             self.calls.append(context)
             return {"observations": [{
                 "technology_id": technology.id, "quote": "安排样机验证",

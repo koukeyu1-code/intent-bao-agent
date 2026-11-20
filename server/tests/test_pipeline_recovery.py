@@ -219,7 +219,7 @@ def test_identical_quotes_from_separate_batches_keep_distinct_evidence_sources(p
                                  material_summaries=[item], master_data=context.master_data)
                     for item in context.material_summaries]
 
-        def analyze(self, context):
+        def analyze(self, context, output_budget=None):
             return {"observations": [{"technology_id": technology.id, "quote": quote,
                                       "attitude_level": 3, "confidence": .9}]}
 
@@ -249,7 +249,7 @@ def test_split_text_evidence_locator_uses_original_line_numbers(pipeline):
                                                      "content_offset": item["content"].index(quote)}],
                                  master_data=context.master_data)]
 
-        def analyze(self, context):
+        def analyze(self, context, output_budget=None):
             return {"observations": [{"technology_id": technology.id, "quote": quote,
                                       "attitude_level": 3, "confidence": .9}]}
 
@@ -274,7 +274,7 @@ def test_pdf_retry_uses_only_current_pages_without_duplicate_materials(pipeline,
 
     class TrackingIntent(FakeIntent):
         fail = True
-        def analyze(self, context):
+        def analyze(self, context, output_budget=None):
             self.calls.append(context)
             if self.fail:
                 raise RuntimeError("controlled model failure")
@@ -316,7 +316,7 @@ def test_same_pdf_location_in_separate_batches_produces_one_intent(pipeline, mon
                                  material_summaries=[{**page, "id": f"copy-{index}"}],
                                  master_data=context.master_data) for index in range(2)]
 
-        def analyze(self, context):
+        def analyze(self, context, output_budget=None):
             return {"observations": [{"technology_id": technology.id, "quote": quote,
                                       "attitude_level": 3, "confidence": .9}]}
 

@@ -18,7 +18,7 @@ class FixedOllamaAdapter(IntentModelAdapter):
     name = "ollama"
     model_name = "qwen-test:latest"
 
-    def analyze(self, _context):
+    def analyze(self, _context, output_budget=None):
         return {
             "mode": "ollama",
             "model": self.model_name,

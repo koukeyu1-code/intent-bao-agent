@@ -38,7 +38,14 @@ from .media_processing import (
     probe_media_duration,
     slice_audio_segment,
 )
-from .model_adapters import IntentModelAdapter, ModelAdapterError, ModelContext, get_model_adapter
+from .model_adapters import (
+    INTENT_OUTPUT_TOKENS_PER_ITEM,
+    IntentModelAdapter,
+    ModelAdapterError,
+    ModelContext,
+    _max_output_token_budget,
+    get_model_adapter,
+)
 from .stage_adapters import get_stage_adapter
 from .request_budget import estimate_tokens, split_items_for_request
 from .schemas import IntentConfirmRequest, SpeakerConfirmRequest
@@ -338,9 +345,16 @@ def _split_model_materials_for_analysis(
 ) -> list[list[dict[str, Any]]]:
     """Fallback for custom adapters; production adapters budget their exact prompt."""
     token_budget = max(1, int(_llm_num_ctx() * 0.85) - 5_000)
+
+    def fits(items: list[dict[str, Any]]) -> bool:
+        output_need = len(items) * INTENT_OUTPUT_TOKENS_PER_ITEM + 512
+        if output_need > _max_output_token_budget():
+            return False
+        return estimate_tokens(json.dumps(items, ensure_ascii=False)) + output_need <= token_budget
+
     return split_items_for_request(
         model_materials,
-        fits=lambda items: estimate_tokens(json.dumps(items, ensure_ascii=False)) <= token_budget,
+        fits=fits,
     )
 
 _MODEL_TEXT_READ_LIMIT_BYTES = 512 * 1024
@@ -2945,10 +2959,15 @@ def execute_analysis_run(
                         on_progress=heartbeat,
                     )
                 try:
-                    batch_result = adapter.analyze(ModelContext(
-                        package_id=package.id, customer_id=package.customer_id,
-                        material_summaries=batch, master_data=master_data,
-                    ))
+                    batch_result = adapter.analyze(
+                        ModelContext(
+                            package_id=package.id, customer_id=package.customer_id,
+                            material_summaries=batch, master_data=master_data,
+                        ),
+                        # 输出预算与分批口径一致：观察列表按材料项数估算，
+                        # 避免 num_predict 截断（output_limit 硬失败）。
+                        output_budget=len(batch) * INTENT_OUTPUT_TOKENS_PER_ITEM + 512,
+                    )
                 finally:
                     if hasattr(adapter, "set_runtime_hooks"):
                         adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)

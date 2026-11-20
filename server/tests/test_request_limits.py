@@ -42,7 +42,10 @@ def test_complete_prompt_budget_splits_single_material_without_losing_tail():
     assert {item["id"] for item in fragments} == {"material"}
     assert fragments[0]["content_offset"] == 0
     assert fragments[-1]["content_end"] == len(original.material_summaries[0]["content"])
-    assert all(service.request_fits(service._build_messages(batch)) for batch in batches)
+    for batch in batches:
+        # 与意向生成同一预算口径（按材料项数估算输出需求）：
+        need = len(batch.material_summaries) * 220 + 512
+        assert service.request_fits(service._build_messages(batch), budget=need)
 
 
 @pytest.mark.parametrize("adapter_type", [OllamaIntentModelAdapter, OpenAICompatibleModelAdapter])
@@ -68,9 +71,11 @@ def test_full_batches_reserve_json_fallback_and_really_send_it(adapter_type):
     assert "".join(item["content"] for batch in batches for item in batch.material_summaries) == original.material_summaries[0]["content"]
     for batch in batches:
         messages = service._build_messages(batch)
-        assert service.request_fits(messages, use_format=True)
-        assert service.request_fits(messages, use_format=False)
-        assert service.analyze(batch)["observations"] == []
+        # 与意向生成同一预算口径（按材料项数估算输出需求）：
+        need = len(batch.material_summaries) * 220 + 512
+        assert service.request_fits(messages, budget=need, use_format=True)
+        assert service.request_fits(messages, budget=need, use_format=False)
+        assert service.analyze(batch, output_budget=need)["observations"] == []
     assert len(requests) == len(batches) * 2
 
 
@@ -144,6 +149,34 @@ def test_identity_fits_uses_dynamic_budget_consistent_with_generation(monkeypatc
     assert len(groups) > 1
     for group in groups:
         assert service.identity_request_fits(segments=group, **fixed) is True
+
+
+def test_intent_split_bounds_output_budget(monkeypatch):
+    """回归：意向观察输出与材料项数成正比（52 项≈12K token 输出需求）。
+    split_context 必须在输出需求超过服务上限时继续切分，且每批的
+    num_predict 与该项数预算一致（生成不再 output_limit 截断）。"""
+    monkeypatch.setenv("INTENT_BAO_LLM_MAX_OUTPUT_TOKENS", "10240")
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        assert estimate_tokens(json.dumps(body, ensure_ascii=False)) + body["max_tokens"] + 128 <= int(65536 * 0.85)
+        return response('{"observations":[]}')
+
+    service = adapter(handler, num_ctx=65536)
+    items = [{"id": f"m{index}", "content": "会议发言内容" * 600} for index in range(52)]
+    batches = service.split_context(ModelContext("package", "customer", items, {}))
+    assert len(batches) >= 2
+    for batch in batches:
+        need = len(batch.material_summaries) * 220 + 512
+        assert need <= 10240
+        messages = service._build_messages(batch)
+        assert service.request_fits(messages, budget=need) is True
+        assert service.analyze(batch, output_budget=need)["observations"] == []
+    per_predict = [r.get("max_tokens") for r in requests]
+    assert all(value is not None and value <= 10240 for value in per_predict)
+    assert len(per_predict) == len(batches)
 
 
 def test_master_data_alone_too_large_is_explicit_error():

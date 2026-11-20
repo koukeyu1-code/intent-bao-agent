@@ -138,7 +138,7 @@ class FakeIntent:
     def __init__(self):
         self.calls = []
 
-    def analyze(self, context):
+    def analyze(self, context, output_budget=None):
         self.calls.append(context)
         return {"observations": []}
 

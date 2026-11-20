@@ -25,6 +25,9 @@ from .request_budget import estimate_tokens, split_items_for_request
 
 MIN_OUTPUT_TOKEN_BUDGET = 1024
 MAX_OUTPUT_TOKEN_BUDGET = 2048
+# 意向观察列表的输出体积与材料项数成正比：每项观察约需 220 token 的
+# JSON（引文/维度/态度/置信度），512 为包裹结构预留。
+INTENT_OUTPUT_TOKENS_PER_ITEM = 220
 
 
 def _max_output_token_budget() -> int:
@@ -58,7 +61,7 @@ class IntentModelAdapter(ABC):
     model_name: str
 
     @abstractmethod
-    def analyze(self, context: ModelContext) -> dict[str, Any]:
+    def analyze(self, context: ModelContext, *, output_budget: int | None = None) -> dict[str, Any]:
         raise NotImplementedError
 
 
@@ -74,7 +77,7 @@ class MockIntentModelAdapter(IntentModelAdapter):
     name = "mock"
     model_name = "mock-intent-v1"
 
-    def analyze(self, context: ModelContext) -> dict[str, Any]:
+    def analyze(self, context: ModelContext, *, output_budget: int | None = None) -> dict[str, Any]:
         return {
             "mode": "模拟分析",
             "model": self.model_name,
@@ -354,6 +357,11 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         ), ensure_ascii=False)
         return estimate_tokens(prompt) + budget + 128 <= int(self._num_ctx * 0.85)
 
+    def _intent_output_budget(self, items: list[dict[str, Any]]) -> int:
+        """意向观察输出需求：每项材料约 220 token，512 为结构预留（不封顶，
+        由调用方与服务输出上限比较后决定是否继续切分）。"""
+        return len(items) * INTENT_OUTPUT_TOKENS_PER_ITEM + 512
+
     def split_context(self, context: ModelContext) -> list[ModelContext]:
         def make_context(items: list[dict[str, Any]]) -> ModelContext:
             return ModelContext(
@@ -365,9 +373,14 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
 
         def fits(items: list[dict[str, Any]]) -> bool:
             messages = self._build_messages(make_context(items))
+            # 意向观察列表的输出体积与材料项数成正比：预算必须覆盖输出
+            # 需求且不超过服务输出上限，装不下的批次继续切分。
+            budget_needed = self._intent_output_budget(items)
+            if budget_needed > _max_output_token_budget():
+                return False
             # Grammar rejection may switch this same batch to a JSON hint.
             # Reserve both request shapes before assigning any source text.
-            return all(self.request_fits(messages, use_format=use_format) for use_format in (True, False))
+            return all(self.request_fits(messages, budget=budget_needed, use_format=use_format) for use_format in (True, False))
 
         try:
             batches = split_items_for_request(
@@ -733,10 +746,10 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         )
         return result.model_dump(mode="json")
 
-    def analyze(self, context: ModelContext) -> dict[str, Any]:
+    def analyze(self, context: ModelContext, *, output_budget: int | None = None) -> dict[str, Any]:
         messages = self._build_messages(context)
         prompt_text = messages[-1]["content"] if messages else ""
-        budget = self._output_token_budget(prompt_text)
+        budget = output_budget if output_budget is not None else self._output_token_budget(prompt_text)
         errors: list[str] = []
 
         self._request_started = time.monotonic()
