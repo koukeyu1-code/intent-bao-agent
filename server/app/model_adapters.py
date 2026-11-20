@@ -333,10 +333,18 @@ class OllamaIntentModelAdapter(IntentModelAdapter):
         self,
         messages: list[dict[str, str]],
         *,
-        budget: int = MAX_OUTPUT_TOKEN_BUDGET,
+        budget: int | None = None,
         generation_schema: dict[str, Any] | None = None,
         use_format: bool = True,
     ) -> bool:
+        if budget is None:
+            # 默认与生成阶段同一预算口径（_output_token_budget）。此前固定按
+            # 2048 预估，而生成校验按动态预算（可经
+            # INTENT_BAO_LLM_MAX_OUTPUT_TOKENS 提高到 6144+）判定：批次预估
+            # 阶段被打得过大，到生成时才报"超过模型上下文"。统一后，装不下
+            # 的批次会在分批阶段被切碎，而不是在生成时失败。
+            prompt_text = messages[-1]["content"] if messages else ""
+            budget = self._output_token_budget(prompt_text)
         # Estimate the actual complete request, rather than just material text.
         prompt = json.dumps(self._build_chat_request_body(
             self._prepare_request_messages(messages, use_format=use_format),
