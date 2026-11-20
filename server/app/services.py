@@ -1294,13 +1294,32 @@ def _run_identity_stage(
                 })
                 session.commit()
 
-            if hasattr(stage_adapter, "set_runtime_hooks"):
-                stage_adapter.set_runtime_hooks(
-                    check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
-                    on_progress=heartbeat)
+            def run_identity_batch(batch_items):
+                if hasattr(stage_adapter, "set_runtime_hooks"):
+                    stage_adapter.set_runtime_hooks(
+                        check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
+                        on_progress=heartbeat)
+                try:
+                    return stage_adapter.recommend_identities(
+                        segments=batch_items, attendees=attendees, master_data=master_data)
+                finally:
+                    if hasattr(stage_adapter, "set_runtime_hooks"):
+                        stage_adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
+
+            def run_identity_batch_splitting(batch_items):
+                # done_reason=length：该批次的身份推荐输出超出 num_predict，
+                # 按片段二分重试并合并推荐，直至每片都能完整生成。
+                try:
+                    return run_identity_batch(batch_items)
+                except ModelAdapterError as exc:
+                    if exc.category != "output_limit" or len(batch_items) <= 1:
+                        raise
+                    mid = len(batch_items) // 2
+                    return (run_identity_batch_splitting(batch_items[:mid])
+                            + run_identity_batch_splitting(batch_items[mid:]))
+
             try:
-                recommendations.extend(stage_adapter.recommend_identities(
-                    segments=batch, attendees=attendees, master_data=master_data))
+                recommendations.extend(run_identity_batch_splitting(batch))
             finally:
                 if hasattr(stage_adapter, "set_runtime_hooks"):
                     stage_adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
@@ -2953,24 +2972,48 @@ def execute_analysis_run(
                     })
                     session.commit()
 
-                if hasattr(adapter, "set_runtime_hooks"):
-                    adapter.set_runtime_hooks(
-                        check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
-                        on_progress=heartbeat,
-                    )
-                try:
-                    batch_result = adapter.analyze(
-                        ModelContext(
-                            package_id=package.id, customer_id=package.customer_id,
-                            material_summaries=batch, master_data=master_data,
-                        ),
-                        # 输出预算与分批口径一致：观察列表按材料项数估算，
-                        # 避免 num_predict 截断（output_limit 硬失败）。
-                        output_budget=len(batch) * INTENT_OUTPUT_TOKENS_PER_ITEM + 512,
-                    )
-                finally:
+                def run_intent_batch(batch_items):
                     if hasattr(adapter, "set_runtime_hooks"):
-                        adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
+                        adapter.set_runtime_hooks(
+                            check_cancelled=lambda: _raise_if_analysis_cancel_requested(session, run),
+                            on_progress=heartbeat,
+                        )
+                    try:
+                        return adapter.analyze(
+                            ModelContext(
+                                package_id=package.id, customer_id=package.customer_id,
+                                material_summaries=batch_items, master_data=master_data,
+                            ),
+                            # 输出预算与分批口径一致：观察列表按材料项数估算，
+                            # 避免 num_predict 截断（output_limit 硬失败）。
+                            output_budget=len(batch_items) * INTENT_OUTPUT_TOKENS_PER_ITEM + 512,
+                        )
+                    finally:
+                        if hasattr(adapter, "set_runtime_hooks"):
+                            adapter.set_runtime_hooks(check_cancelled=None, on_progress=None)
+
+                def run_intent_batch_splitting(batch_items):
+                    # done_reason=length 说明该批次的观察输出超出 num_predict：
+                    # 按材料项二分重试并合并观察，直至每片都能完整生成。
+                    # 对每项输出的估算误差免疫。
+                    try:
+                        return run_intent_batch(batch_items)
+                    except ModelAdapterError as exc:
+                        if exc.category != "output_limit" or len(batch_items) <= 1:
+                            raise
+                        mid = len(batch_items) // 2
+                        left = run_intent_batch_splitting(batch_items[:mid])
+                        right = run_intent_batch_splitting(batch_items[mid:])
+                        merged = dict(left)
+                        merged["observations"] = (
+                            list(left.get("observations") or [])
+                            + list(right.get("observations") or [])
+                        )
+                        if left.get("usage") or right.get("usage"):
+                            merged["usage"] = {**(left.get("usage") or {}), **(right.get("usage") or {})}
+                        return merged
+
+                batch_result = run_intent_batch_splitting(batch)
                 _raise_if_analysis_cancel_requested(session, run)
                 _update_task(session, run, "意向抽取", status="处理中",
                              progress=5 + int(90 * batch_index / total_batches),

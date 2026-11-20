@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from app import models as m, services
 from app.audio_adapters import AsrError, AsrResult
+from app.model_adapters import ModelAdapterError
 from app.diarization import SpeakerTurn
 from test_media_completeness import (
     pipeline, FakeAsr, FakeIntent, _install_asr, _install_diarization, _transcript,
@@ -124,6 +125,35 @@ def test_three_consecutive_timeouts_still_stop_the_material(pipeline, monkeypatc
     assert result["transcription"]["failed"] == 1
     assert result["transcription"]["skipped"] == 3
     assert result["failed_segments"][0]["stopped_early"] is True
+
+
+def test_intent_output_limit_splits_batch_and_merges(pipeline, monkeypatch):
+    """回归：意向批次输出超出 num_predict（output_limit）时，按材料项
+    二分重试并合并观察，而不是整场分析硬失败。"""
+    for index in range(4):
+        pipeline.add_file(f"intent-split-{index}.wav")
+    _install_diarization(monkeypatch)
+    _install_asr(monkeypatch, FakeAsr(lambda path, **_kw: _transcript()))
+    calls = []
+
+    class SplitLimitIntent(FakeIntent):
+        def analyze(self, context, output_budget=None):
+            size = len(context.material_summaries)
+            calls.append(size)
+            if size > 2:
+                raise ModelAdapterError("达到输出上限", category="output_limit")
+            return {"observations": [{"material_id": context.material_summaries[0]["id"]}]}
+
+    intent = SplitLimitIntent()
+    assert pipeline.execute(intent).status == "已完成"
+    # 初始整批 6 项触发 output_limit；二分后每片 ≤ 2 项成功生成
+    # 12 项材料按输出需求切成 2 批（每批 6 项）；每批：6 触发上限 →
+    # 3 仍超限 → 二分为 1+2 成功。两批共 14 次调用全部按此形态。
+    assert calls.count(6) == 2
+    assert calls.count(3) == 4
+    assert calls.count(1) == 4
+    assert calls.count(2) == 4
+    assert max(calls) == 6
 
 
 def test_completed_retry_reuses_success_and_retries_empty_interval(pipeline, monkeypatch):
